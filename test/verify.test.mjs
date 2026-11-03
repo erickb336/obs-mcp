@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, test } from 'node:test';
 import { audioTools } from '../dist/platform.js';
-import { errorLines, judge, limitsFrom, measure, parseMetadata, parseProbe, resolveInFolder, timecode, verifyFile, visible } from '../dist/verify.js';
+import { errorLines, judge, limitsFrom, measure, packetEnd, parseMetadata, parseProbe, resolveInFolder, timecode, verifyFile, visible } from '../dist/verify.js';
 import { startFakeObs } from './fake-obs.mjs';
 import { FFMPEG_VERSION, FORGED, makeFixtures, SKIP } from './fixtures.mjs';
 import { closedPort, connect, obsConfigDir, testEnv } from './helpers.mjs';
@@ -287,6 +287,33 @@ test('F-T5-10: a video stream with no stated length whose packets cannot be read
   const r = await verifyFile(standInFile(), 'take.mkv', [], env);
   assert.deepEqual(r.claims.find((c) => c.claim === 'The file has a video stream for the full timeline'), { claim: 'The file has a video stream for the full timeline', verdict: 'not_checked', evidence: 'The video stream states no length, and reading its packets did not finish: ffprobe exit code 1: read error.' });
   assert.equal(r.state, 'not_checked');
+});
+
+test('F-T22-1: packetEnd keeps the latest packet end, also when a later line has an earlier time (B-frames), and skips a line with no time', () => {
+  const lines = ['0.000000,0.016667', '0.050000,0.016667', '0.016667,0.016667', 'N/A,0.016667', '', '0.033333,N/A'];
+  assert.equal(lines.reduce((end, l) => packetEnd(l, end), -Infinity), 0.066667);
+  assert.equal(packetEnd('N/A,N/A', -Infinity), -Infinity);
+});
+
+test('F-T22-1: an MKV with 7.5 h of 60 fps packets (35 MB of packet lines) reads to its end in bounded memory: pass, or a warning when the video ends early', { skip: process.platform === 'win32' && 'the stand-in tools are shell scripts' }, async () => {
+  // SIMULATED: the stand-in ffprobe prints one line per packet, about 1,620,000 packets at 60 fps, more than the 32 MiB
+  // output limit. Every 4th packet comes one frame early, as with B-frames. The last of the packets ends the video.
+  const check = async (packets) => {
+    const probe = `{"format":{"duration":"27000"},"streams":[{"codec_type":"video"},{"codec_type":"audio","sample_rate":"48000"}]}`;
+    const lines = `awk 'BEGIN{for(i=0;i<${packets};i++){printf "%.6f,0.016667\\n", (i%4==3 ? i-2 : i)/60}}'`;
+    const env = standIn(`case "$0" in *ffprobe) case "$*" in *packet*) ${lines};; *) echo '${probe}';; esac;; *) printf 'ffmpeg version stand-in\\nlavfi.astats.Overall.Number_of_samples=1296000000\\n';; esac`);
+    const r = await verifyFile(standInFile(), 'take.mkv', [], env);
+    return [r.video_duration, r.claims.find((c) => c.claim === 'The file has a video stream for the full timeline')];
+  };
+  assert.deepEqual(await check(1_620_001), ['07:30:00.0', { claim: 'The file has a video stream for the full timeline', verdict: 'pass', evidence: 'Video 07:30:00.0 of 07:30:00.0, from its packets: the video stream states no length.' }]);
+  assert.deepEqual(await check(1_512_001), ['07:00:00.0', { claim: 'The file has a video stream for the full timeline', verdict: 'warn', evidence: 'Video 07:00:00.0 of 07:30:00.0, from its packets: the video stream states no length.' }]);
+});
+
+test('F-T22-1: a packet line that never ends stops at the output limit: not_checked, never pass', { skip: process.platform === 'win32' && 'the stand-in tools are shell scripts' }, async () => {
+  const probe = `{"format":{"duration":"10"},"streams":[{"codec_type":"video"},{"codec_type":"audio","sample_rate":"48000"}]}`;
+  const env = standIn(`case "$0" in *ffprobe) case "$*" in *packet*) yes 1 | tr -d '\\n' | head -c 40000000;; *) echo '${probe}';; esac;; *) printf 'ffmpeg version stand-in\\nlavfi.astats.Overall.Number_of_samples=480000\\n';; esac`);
+  const r = await verifyFile(standInFile(), 'take.mkv', [], env);
+  assert.deepEqual(r.claims.find((c) => c.claim === 'The file has a video stream for the full timeline'), { claim: 'The file has a video stream for the full timeline', verdict: 'not_checked', evidence: 'The video stream states no length, and reading its packets did not finish: ffprobe stopped: its output passed 33554432 bytes.' });
 });
 
 test('F-T5-15: a log with more than 100,000 silent intervals on a track leaves the sound not checked, and the check ends fast', { skip: process.platform === 'win32' && 'the stand-in tools are shell scripts' }, async () => {
