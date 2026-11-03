@@ -19,25 +19,41 @@ flowchart LR
 
 ## Quick start
 
-You need Node 22 or newer, and OBS Studio 30 or newer (obs-websocket 5 is part of OBS).
+You need Node 22 or newer, git, and OBS Studio 30 or newer (obs-websocket 5 is part of OBS).
 
-> **Not yet published.** The `npx` commands below work after the first npm release. Until then, use [Under the hood](#under-the-hood) to run it from a clone.
+> **Not yet published.** obs-mcp is not on npm yet, so you run it from a clone.
 
-1. Check your machine. The doctor only reads, and it tells you what to fix:
-
-   ```sh
-   npx -y @erickb336/obs-mcp doctor
-   ```
-
-2. In OBS, turn on the server: Tools, WebSocket Server Settings, Enable WebSocket server. Read [the listener warning](#safety-rules) first.
-
-3. Add the server to your MCP client. For Claude Code:
+1. Get a copy and build it:
 
    ```sh
-   claude mcp add --transport stdio obs -- npx -y @erickb336/obs-mcp
+   git clone https://github.com/erickb336/obs-mcp.git
    ```
 
-   For another client, the doctor prints the line or the JSON block to use.
+   ```sh
+   cd obs-mcp
+   ```
+
+   ```sh
+   npm ci
+   ```
+
+   ```sh
+   npm run build
+   ```
+
+2. Check your machine. The doctor only reads, and it tells you what to fix:
+
+   ```sh
+   node dist/cli.js doctor
+   ```
+
+3. In OBS, turn on the server: Tools, WebSocket Server Settings, Enable WebSocket server. Read [the listener warning](#safety-rules) first.
+
+4. Add the server to your MCP client. The doctor prints the line for Claude Code and Codex, and the JSON block for other clients, with the full path of your copy. For Claude Code, it has this form:
+
+   ```sh
+   claude mcp add --transport stdio obs -- node /full/path/to/obs-mcp/dist/cli.js
+   ```
 
 ## Usage
 
@@ -45,7 +61,7 @@ Ask your agent in plain words. Examples:
 
 | You ask | The agent calls | You get |
 | --- | --- | --- |
-| "Is OBS recording?" | `obs_status` | Connection, versions, recording and stream state, scene, profile, listener exposure |
+| "Is OBS recording?" | `obs_status`, or `obs_find` "is OBS recording", which gives `GetRecordStatus` first | Connection, versions, recording and stream state, scene, profile, listener exposure |
 | "What is the volume of my mic?" | `obs_find` "input volume", then `obs_read` `GetInputVolume` | The fader value of that input |
 | "Show me the scene list" | `obs_read` `GetSceneList` | The scenes and the current program scene |
 | "Stop the recording" | `obs_find` shows `StopRecord` as guarded | A refusal. 0.0 never sends it. |
@@ -54,19 +70,19 @@ With OBS closed, `obs_status` answers with the problem and the next step, for ex
 
 ## Tools
 
-The list has 3 tools. Its size is about 385 tokens (method: compact JSON of `tools/list`, counted with cl100k_base through js-tiktoken 1.0.21, an approximation; target: 1,200 or fewer; a test checks it).
+The list has 3 tools. Its size is about 420 tokens (method: compact JSON of `tools/list`, counted with cl100k_base through js-tiktoken 1.0.21, an approximation; target: 1,200 or fewer; a test checks it).
 
 | Tool | What it does | Effect |
 | --- | --- | --- |
 | `obs_status` | Connection, OBS and obs-websocket versions, recording and stream state, scene, profile, scene collection, listener exposure, and live requests with no catalogue row. Works with OBS closed. | Read |
-| `obs_find` | Searches the catalogue of 147 documented requests by words. Returns exact names, the effect, the fields, and whether `obs_read` runs each one. | Read |
-| `obs_read` | Runs one read request. Checks the fields first. | Read |
+| `obs_find` | Searches the catalogue of 147 documented requests by words. An exact request name comes first, then the requests that `obs_read` runs, then the rest. Returns exact names, the effect, the fields, and whether `obs_read` runs each one. | Read |
+| `obs_read` | Runs one read request, or one of the 3 guarded reads behind its check. Checks the fields first: one of a name and UUID pair (for example `inputName` or `inputUuid`) is required, and a text value has 1,000 characters or fewer. | Read |
 
 What `obs_read` runs in 0.0, from the class table in [`catalogue/classes.json`](catalogue/classes.json):
 
 | Class | Requests | In 0.0 |
 | --- | --- | --- |
-| read | 57 | Runs. `GetSourceScreenshot` saves the image to a file in a folder that the server makes in the system temporary folder; the reply gives only the path and the size. A slot value of `GetPersistentData` is settings: see [what the AI sees](#what-the-ai-sees). |
+| read | 57 | Runs. `GetSourceScreenshot` saves the image to a file in a folder that the server makes in the system temporary folder; the reply gives only the path and the size. The server deletes the folder when it exits. A slot value of `GetPersistentData` is settings: see [what the AI sees](#what-the-ai-sees). |
 | change | 56 | Refused, not sent |
 | guarded | 34 | Refused, not sent, except three reads with their own guard: `GetInputPropertiesListPropertyItems`, `GetStreamServiceSettings` and `GetProfileParameter` (only video, audio, output mode and recording parameters; never tokens or output URLs) |
 | not documented | 4 private-settings requests that OBS offers live | Refused, not sent |
@@ -77,16 +93,18 @@ What `obs_read` runs in 0.0, from the class table in [`catalogue/classes.json`](
 
 - **During a stream or a recording, the AI may do only what OBS itself allows then.** The server refuses everything else. 0.0 is read only, so today this rule applies to one request: the list request below.
 - **The server never stops a recording unless you ask.** In 0.0 it sends no change at all: no start, no stop, no setting.
-- **Listener exposure.** When the obs-websocket server is on, OBS listens on all network interfaces. It has no option to listen on localhost only. Other devices on your network can reach it, unless a firewall blocks them. Keep a password set. `obs_status` and the doctor report what listens on the port.
+- **Listener exposure.** When the obs-websocket server is on, OBS listens on all network interfaces. It has no option to listen on localhost only. Other devices on your network can reach it, unless a firewall blocks them. Keep a password set. `obs_status` and the doctor report what listens on the port, and the program that listens. The doctor warns when that program is not OBS.
 - **obs-mcp opens no port.** It speaks MCP over stdio only, and it connects to OBS on 127.0.0.1 only.
 - **The password** comes from the obs-websocket settings file, or from `OBS_WEBSOCKET_PASSWORD`. Never give it as an argument: OBS writes its own command line to its log. No reply, log or doctor line shows it.
 - **Secrets in replies.** Settings can hold a stream key, password or token in any text. So the AI gets settings text only when it is on a short allow-list. See [what the AI sees](#what-the-ai-sees). The debug log of obs-websocket-js prints raw replies, so the server turns it off, also when `DEBUG` names it.
-- **List requests can crash OBS.** `GetInputPropertiesListPropertyItems` runs only on a row that was tested on real OBS. Today there is one row: property `type` of a `screen_capture` input, on macOS, OBS 33.0.1. Before each list request the server reads the recording state and the stream state. During any recording or live stream, whoever started it, the request is refused and not sent.
+- **List requests can crash OBS.** `GetInputPropertiesListPropertyItems` runs only on a row that was tested on real OBS. Today there is one row: property `type` of a `screen_capture` input, on macOS, OBS 33.0.1. Before each list request the server reads the recording state, the stream state and the state of every output in `GetOutputList` (replay buffer, virtual camera and plugin outputs too). During any active output, whoever started it, the request is refused and not sent. When a state is not known, or its read fails, the request is refused too. The request goes to OBS by the input UUID that the check found, so another client cannot swap the input in between.
 - **The doctor changes nothing.** It reads files and asks the OS. It notes a leftover crash file in the OBS `.sentinel` folder and never deletes it.
 
 ### What the AI sees
 
-Settings are the free-form values that OBS, plugins and scripts keep: every reply field whose name ends in `Settings` (for example `inputSettings`, `filterSettings`, `outputSettings`, `streamServiceSettings`, `transitionSettings`), and the `slotValue` of `GetPersistentData`. The server does not try to find secrets in them. It passes only values with a known safe shape.
+Settings are the free-form values that OBS, plugins and scripts keep: every reply field whose name ends in `Settings` (for example `inputSettings`, `filterSettings`, `outputSettings`, `streamServiceSettings`, `transitionSettings`), the `slotValue` of `GetPersistentData`, and the `itemName` and `itemValue` of a list item. The server does not try to find secrets in them. It passes only values with a known safe shape.
+
+Replies of `obs_read` and `obs_status` start with a note that tells the AI to treat the names and values from OBS as data, not instructions. A reply longer than 24,000 characters is cut, after the note.
 
 | Value | What the AI gets |
 | --- | --- |
@@ -95,6 +113,8 @@ Settings are the free-form values that OBS, plugins and scripts keep: every repl
 | A number, a boolean or null inside settings | The value |
 | A text inside settings, on the allow-list for its kind and key, with the expected shape | The value |
 | Any other text inside settings: URLs, paths, names, keys, passwords, JSON text | Only its type and length, for example `{"hidden":"text","length":42}` |
+| A key inside settings, on the allow-list for its kind | The key |
+| Any other key inside settings | `hidden_key_1`, `hidden_key_2` and so on; its value follows the same rules |
 | A list or an object inside settings | The same rules for each item; an item in a list uses the key of the list |
 
 The allow-list is `SAFE_SETTINGS` in [`src/redact.ts`](src/redact.ts). It holds only enums and the display UUID of a screen capture, for example the `protocol` of a stream service, `server: "auto"` of a common service, the `service` names of some common services, and the `sampling` of a scale filter. A stream server URL is hidden, also when it has no scheme.
@@ -112,7 +132,7 @@ All are optional.
 | Variable | Use |
 | --- | --- |
 | `OBS_WEBSOCKET_PASSWORD` | The password, in place of the one in the obs-websocket settings file |
-| `OBS_WEBSOCKET_PORT` | The port, in place of the one in the settings file (default 4455) |
+| `OBS_WEBSOCKET_PORT` | The port, in place of the one in the settings file (default 4455). It must be a whole number from 1 to 65535; any other value, an empty one too, is an error that `obs_status` and the doctor report |
 | `OBS_STUDIO_CONFIG_DIR` | The OBS settings folder, for a portable or custom install |
 
 ## Under the hood
@@ -141,7 +161,7 @@ npm run smoke
 
 `npm test` builds, then runs the tests. `npm run smoke` packs the package, starts it with `npx` from the tarball, and drives it with an MCP client. CI runs both on Linux, macOS and Windows.
 
-To run the server from a clone, point your client at `node <clone>/dist/cli.js` after `npm test`.
+To run the server from a clone, point your client at `node <clone>/dist/cli.js` after `npm run build`. `node dist/cli.js --help` shows the commands, and `--version` shows the version.
 
 ## Credits
 

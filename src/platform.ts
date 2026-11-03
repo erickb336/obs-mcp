@@ -2,17 +2,21 @@
 // Paths come from the OS conventions that OBS itself uses, or from discovery, never from one machine.
 import { execFileSync } from 'node:child_process';
 import { existsSync, readdirSync, statSync, readFileSync } from 'node:fs';
+import type { Listener } from './obs.js';
 import { homedir } from 'node:os';
-import { join, delimiter, win32 } from 'node:path';
+import { join, delimiter, isAbsolute, win32 } from 'node:path';
 
 const OS = process.platform;
-/** Runs an OS tool. Returns its output, also on a non-zero exit, or null when the tool is missing or hangs. */
-function probe(cmd: string, args: string[]): string | null {
+/**
+ * Runs an OS tool. Returns its output, or null when the tool is missing, hangs or fails. emptyExit is the exit code
+ * by which the tool says "nothing found" (lsof exits 1 with no output and no error text); it gives empty output.
+ */
+export function probe(cmd: string, args: string[], emptyExit?: number): string | null {
   try {
-    return execFileSync(cmd, args, { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] });
+    return execFileSync(cmd, args, { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'] });
   } catch (e) {
-    const err = e as { code?: string; stdout?: string };
-    return err.code === 'ENOENT' || err.code === 'ETIMEDOUT' ? null : (err.stdout ?? '');
+    const err = e as { status?: number | null; stdout?: string; stderr?: string };
+    return emptyExit !== undefined && err.status === emptyExit && !err.stderr?.trim() && !err.stdout?.trim() ? '' : null;
   }
 }
 const run = (cmd: string, args: string[]) => probe(cmd, args) ?? '';
@@ -28,23 +32,41 @@ export function obsConfigDir(env: NodeJS.ProcessEnv = process.env): string {
   return !existsSync(native) && existsSync(flatpak) ? flatpak : native;
 }
 
-/** Where OBS is installed, by discovery. Returns null when no install is found. */
-export function findObs(env: NodeJS.ProcessEnv = process.env): { path: string; version?: string } | null {
-  if (OS === 'darwin') {
+const isFile = (p: string) => {
+  try {
+    return statSync(p).isFile();
+  } catch {
+    return false;
+  }
+};
+
+/** A file named name in a folder of PATH. An empty PATH segment (the current folder) never counts, and a folder is not a program. */
+export function onPath(env: NodeJS.ProcessEnv, name: string): string | undefined {
+  return (env.PATH ?? '').split(delimiter).filter((d) => isAbsolute(d)).map((d) => join(d, name)).find(isFile);
+}
+
+/** Where OBS is installed, by discovery. Returns null when no install is found. os is a parameter for tests. */
+export function findObs(env: NodeJS.ProcessEnv = process.env, os: string = OS): { path: string; version?: string } | null {
+  if (os === 'darwin') {
     const found = run('mdfind', ["kMDItemCFBundleIdentifier == 'com.obsproject.obs-studio'"]).split('\n').filter(Boolean);
     const app = [...found, '/Applications/OBS.app', join(homedir(), 'Applications', 'OBS.app')].find((p) => existsSync(p));
     if (!app) return null;
     const version = run('plutil', ['-extract', 'CFBundleShortVersionString', 'raw', '-o', '-', join(app, 'Contents', 'Info.plist')]).trim();
     return { path: app, version: version || undefined };
   }
-  if (OS === 'win32') {
+  if (os === 'win32') {
     const roots = [env.ProgramFiles, env['ProgramFiles(x86)'], env.ProgramW6432].filter(Boolean) as string[];
-    const exe = roots.map((r) => join(r, 'obs-studio', 'bin', '64bit', 'obs64.exe')).find((p) => existsSync(p));
+    // The installer puts OBS in obs-studio; Steam puts it in its library folder.
+    const exe = roots
+      .flatMap((r) => [join(r, 'obs-studio'), join(r, 'Steam', 'steamapps', 'common', 'OBS Studio')])
+      .map((d) => join(d, 'bin', '64bit', 'obs64.exe'))
+      .find(isFile);
     return exe ? { path: exe } : null;
   }
-  const onPath = (env.PATH ?? '').split(delimiter).map((d) => join(d, 'obs')).find((p) => existsSync(p));
-  const flatpak = ['/var/lib/flatpak/app/com.obsproject.Studio', join(homedir(), '.local', 'share', 'flatpak', 'app', 'com.obsproject.Studio')].find((p) => existsSync(p));
-  const path = onPath ?? flatpak;
+  const flatpakApp = (root: string) => join(root, 'com.obsproject.Studio', 'current', 'active', 'files', 'bin', 'obs');
+  const path =
+    onPath(env, 'obs') ??
+    ['/snap/bin/obs-studio', flatpakApp('/var/lib/flatpak/app'), flatpakApp(join(homedir(), '.local', 'share', 'flatpak', 'app'))].find(isFile);
   return path ? { path } : null;
 }
 
@@ -61,37 +83,46 @@ export function versionFromLog(obsConfigDir: string): string | undefined {
   return /\bOBS (\d+\.\d+\.\d+)\b/.exec(head)?.[1];
 }
 
-/** Local addresses on which a TCP port listens, read by the OS tool. null when the tool gave no reading. */
-export function listenAddresses(port: number): string[] | null {
+/** The listeners on a TCP port, with their program names, read by the OS tool. null when the tool gave no reading. */
+export function listeners(port: number): Listener[] | null {
   if (OS === 'win32') {
-    const out = probe(netstatPath(), ['-an', '-p', 'TCP']);
-    return out === null ? null : netstatListeners(out, port);
+    const out = probe(windowsTool('netstat.exe'), ['-ano', '-p', 'TCP']);
+    if (out === null) return null;
+    const name = (pid: string) => (/^\d+$/.test(pid) ? tasklistName(probe(windowsTool('tasklist.exe'), ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH']) ?? '') : undefined);
+    return netstatListeners(out, port).map(({ address, pid }) => ({ address, process: name(pid) }));
   }
   if (OS === 'darwin') {
-    // lsof exits 1 with no output when nothing listens.
-    const out = probe('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN']);
+    // lsof exits 1 with no output when nothing listens. "+c 0" gives the full program name.
+    const out = probe('lsof', ['+c', '0', '-nP', `-iTCP:${port}`, '-sTCP:LISTEN'], 1);
     if (out === null) return null;
-    return out.split('\n').map((l) => /\s(\S+:\d+) \(LISTEN\)/.exec(l)?.[1]).filter((a): a is string => !!a);
+    return out.split('\n').flatMap((l) => {
+      const address = /\s(\S+:\d+) \(LISTEN\)/.exec(l)?.[1];
+      return address ? [{ address, process: l.split(/\s+/)[0].replaceAll('\\x20', ' ') }] : [];
+    });
   }
-  const out = probe('ss', ['-Hltn', `sport = :${port}`]);
+  const out = probe('ss', ['-Hltnp', `sport = :${port}`]);
   if (out === null) return null;
-  return out.split('\n').filter(Boolean).map((l) => l.trim().split(/\s+/)[3]).filter(Boolean);
+  // ss shows users:(("obs",pid=1234,fd=30)) only for the processes of this user.
+  return out.split('\n').filter(Boolean).map((l) => ({ address: l.trim().split(/\s+/)[3], process: /users:\(\("([^"]+)"/.exec(l)?.[1] })).filter((x) => x.address);
 }
 
-/** The full path of Windows netstat, so that a netstat.exe in the current folder or on PATH never runs instead. */
-export const netstatPath = (env: NodeJS.ProcessEnv = process.env) => win32.join(env.SystemRoot || 'C:\\Windows', 'System32', 'netstat.exe');
+/** The full path of a tool in the Windows folder, so that a copy in the current folder or on PATH never runs instead. */
+export const windowsTool = (name: string, env: NodeJS.ProcessEnv = process.env) => win32.join(env.SystemRoot || 'C:\\Windows', 'System32', name);
 
 /**
- * The local addresses in Windows "netstat -an" output that listen on a TCP port. The state word changes with the
+ * The listeners in Windows "netstat -ano" output on a TCP port, with the process id. The state word changes with the
  * display language, so a listener is found by its foreign address, which is 0.0.0.0:0 or [::]:0 only on a listener.
  */
-export function netstatListeners(out: string, port: number): string[] {
+export function netstatListeners(out: string, port: number): { address: string; pid: string }[] {
   return out
     .split('\n')
     .map((l) => l.trim().split(/\s+/))
     .filter(([proto, local, foreign]) => proto === 'TCP' && local?.endsWith(`:${port}`) && /^(0\.0\.0\.0|\[::\]):0$/.test(foreign ?? ''))
-    .map(([, local]) => local);
+    .map((cols) => ({ address: cols[1], pid: cols[cols.length - 1] }));
 }
+
+/** The program name in Windows "tasklist /FO CSV /NH" output, for example "obs64.exe". */
+export const tasklistName = (out: string) => /^"([^"]+)"/.exec(out.trim())?.[1];
 
 /** Leftover run files in the OBS .sentinel folder. OBS leaves one when a session did not close normally. */
 export function crashSentinels(obsConfigDir: string): string[] {

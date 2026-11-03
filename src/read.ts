@@ -1,5 +1,5 @@
 // The read path of obs_read: which requests run, and the guard of each one that needs a guard.
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { brief, checkFields, entry, readRule, READ_GUARDED, search } from './catalogue.js';
@@ -28,9 +28,10 @@ export const SAFE_PROFILE_PARAMETERS = new Map(Object.entries({
     'Track1Bitrate', 'Track2Bitrate', 'Track3Bitrate', 'Track4Bitrate', 'Track5Bitrate', 'Track6Bitrate'],
 }));
 
-const refuse =(refused: string, extra: Record<string, unknown> = {}): ReadResult => ({ ok: false, refused, ...extra });
+const refuse = (refused: string, extra: Record<string, unknown> = {}): ReadResult => ({ ok: false, refused, ...extra });
 
 export async function read(obs: Obs, request: string, params: Record<string, unknown> = {}): Promise<ReadResult> {
+  if (!request.trim()) return refuse('No request name was given, so nothing was sent. Find the exact name with obs_find.');
   const e = entry(request);
   if (!e) {
     const name = request.length > 80 ? `${request.slice(0, 80)}...` : request;
@@ -54,8 +55,9 @@ export async function read(obs: Obs, request: string, params: Record<string, unk
     const v = await obs.connect();
     if (!v.availableRequests.includes(e.request)) return refuse(`This OBS does not offer ${e.request}. It was added in obs-websocket ${e.initialVersion}.`);
     if (e.request === 'GetInputPropertiesListPropertyItems') {
-      const why = await listGuard(obs, params);
-      if (why) return refuse(`${e.request}: ${why} It was not sent.`);
+      const guard = await listGuard(obs, params);
+      if (typeof guard === 'string') return refuse(`${e.request}: ${guard} It was not sent.`);
+      params = guard;
     }
     const reply = await obs.call(e.request, params);
     if (e.request === 'GetSourceScreenshot') return { ok: true, data: saveScreenshot(reply, params) };
@@ -66,24 +68,47 @@ export async function read(obs: Obs, request: string, params: Record<string, unk
   }
 }
 
-/** Returns why a list request must not run, or null. Reads the recording and stream state just before, whoever started them. */
-async function listGuard(obs: Obs, params: Record<string, unknown>): Promise<string | null> {
+/**
+ * Returns why a list request must not run, or the params to send. It reads the state of every output just before,
+ * whoever started them: recording, stream, replay buffer, virtual camera and plugin outputs. A state that is not
+ * known, or a read that fails, refuses the request. The request goes out by the input UUID that the check resolved,
+ * so another client cannot swap the input between the check and the request.
+ */
+async function listGuard(obs: Obs, params: Record<string, unknown>): Promise<string | Record<string, unknown>> {
   // With both fields, the guard could clear one input while OBS resolves the other.
   if (params.inputName !== undefined && params.inputUuid !== undefined) return 'give inputName or inputUuid, not both.';
-  const [record, stream] = await Promise.all([obs.call('GetRecordStatus'), obs.call('GetStreamStatus')]);
-  if (record.outputActive) return 'a recording is active, and a list request can crash OBS.';
-  if (stream.outputActive) return 'a stream is live, and a list request can crash OBS.';
-  const input = params.inputUuid !== undefined ? { inputUuid: params.inputUuid } : { inputName: params.inputName };
-  const { inputKind } = await obs.call('GetInputSettings', input);
+  const unknown = 'the state of the OBS outputs is not known, and a list request can crash OBS during an output.';
+  let record, stream, outputs, inputs;
+  try {
+    [record, stream, { outputs }, { inputs }] = await Promise.all(['GetRecordStatus', 'GetStreamStatus', 'GetOutputList', 'GetInputList'].map((r) => obs.call(r)));
+  } catch (e) {
+    return `${unknown} (${(e as Error).message})`;
+  }
+  if (record.outputActive !== false) return record.outputActive === true ? 'a recording is active, and a list request can crash OBS.' : unknown;
+  if (stream.outputActive !== false) return stream.outputActive === true ? 'a stream is live, and a list request can crash OBS.' : unknown;
+  if (!Array.isArray(outputs)) return unknown;
+  for (const o of outputs as Record<string, unknown>[]) {
+    if (o?.outputActive === false) continue;
+    return o?.outputActive === true ? `the output ${JSON.stringify(String(o.outputName).slice(0, 80))} is active, and a list request can crash OBS during an output.` : unknown;
+  }
+  const by = params.inputUuid !== undefined ? 'inputUuid' : 'inputName';
+  const input = Array.isArray(inputs) ? (inputs as Record<string, unknown>[]).find((i) => i?.[by] === params[by]) : undefined;
+  if (typeof input?.inputUuid !== 'string') return `no input with that ${by} was found.`;
   const v = obs.version!;
   const row = CLEARED_LIST_ROWS.find(
-    (r) => r.os === v.platform && r.obsVersion === v.obsVersion && r.inputKind === inputKind && r.propertyName === params.propertyName,
+    (r) => r.os === v.platform && r.obsVersion === v.obsVersion && r.inputKind === input.inputKind && r.propertyName === params.propertyName,
   );
-  return row ? null : `no cleared row for (${v.platform}, OBS ${v.obsVersion}, ${String(inputKind)}, ${String(params.propertyName)}). A list request can crash OBS, so only rows tested on real OBS run.`;
+  if (!row) return `no cleared row for (${v.platform}, OBS ${v.obsVersion}, ${String(input.inputKind)}, ${String(params.propertyName)}). A list request can crash OBS, so only rows tested on real OBS run.`;
+  return { inputUuid: input.inputUuid, propertyName: params.propertyName };
 }
 
 // Screenshots go to a folder that the server owns. The image never goes to the model, and the model cannot set the path.
+// The server deletes the folder when it exits.
 let shotDir: string | undefined;
+export function deleteScreenshots() {
+  if (shotDir) rmSync(shotDir, { recursive: true, force: true });
+  shotDir = undefined;
+}
 let shotCount = 0;
 function saveScreenshot(reply: Record<string, unknown>, params: Record<string, unknown>) {
   const data = String(reply.imageData ?? '');

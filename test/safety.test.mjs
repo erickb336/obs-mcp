@@ -3,11 +3,11 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { startFakeObs } from './fake-obs.mjs';
-import { closedPort, connect, obsConfigDir, runDoctor, sampleParams, testEnv } from './helpers.mjs';
+import { CLI, closedPort, connect, obsConfigDir, runDoctor, sampleParams, testEnv } from './helpers.mjs';
 
 const CATALOGUE = JSON.parse(readFileSync(new URL('../dist/catalogue.json', import.meta.url), 'utf8'));
 const PASSWORD = 'fake-obs-password-K9w4';
@@ -132,7 +132,7 @@ test('doctor with OBS closed reports it plainly, keeps the crash sentinel and ch
 });
 
 test('doctor says when the WebSocket server is off, and skips the connection', async () => {
-  const r = await runDoctor(testEnv(obsConfigDir({ server_enabled: false, server_port: await closedPort() }), 0, { OBS_WEBSOCKET_PORT: '' }));
+  const r = await runDoctor(testEnv(obsConfigDir({ server_enabled: false, server_port: await closedPort() }), null));
   assert.match(r.stdout, /server +FAIL +The OBS WebSocket server is off\./);
   assert.match(r.stdout, /connection +skip +Needs the WebSocket server\./);
 });
@@ -145,6 +145,55 @@ test('doctor passes the connection and auth checks against the fake OBS', async 
   assert.match(r.stdout, /connection +pass +Connected to OBS 33\.0\.1, obs-websocket 5\.7\.6, at ws:\/\/127\.0\.0\.1:\d+\. Authentication passed\./);
   assert.match(r.stdout, /password +info +Password source: obs-websocket settings file\. The value is never shown\./);
   assert.deepEqual(fake.log, ['GetVersion']);
+  // F-T12-22, F-T12-27: the fake OBS is a node process on 127.0.0.1. The listener line names it, warns, and says "only".
+  const listener = /\n  listener +(\S+) +(.*)\n/.exec(r.stdout);
+  assert.ok(listener, r.stdout);
+  if (process.platform !== 'win32' || /Program: node/.test(listener[2])) {
+    assert.equal(listener[1], 'warn', listener[0]);
+    assert.match(listener[2], new RegExp(`^Port ${fake.port} listens on 127\\.0\\.0\\.1:${fake.port} only\\. Program: node(\\.exe)?\\. node(\\.exe)? is not OBS, and obs-mcp connects to it as OBS\\.`));
+  }
+  assert.doesNotMatch(listener[2], /all network interfaces/);
+  // F-T12-24: the client lines run this copy by its path, not an unpublished npm package.
+  assert.ok(r.stdout.includes(`claude mcp add --transport stdio obs -- node ${JSON.stringify(CLI)}`), r.stdout);
+  assert.doesNotMatch(r.stdout, /npx/);
+});
+
+test('F-T12-25: after a wrong password, the doctor says to check the password, not to open OBS', async () => {
+  const fake = await startFakeObs({ password: PASSWORD });
+  const dir = obsConfigDir({ server_enabled: true, server_port: fake.port, auth_required: true, server_password: 'not-the-password' });
+  const r = await runDoctor(testEnv(dir, fake.port));
+  await fake.close();
+  assert.match(r.stdout, /connection +FAIL +OBS refused the password \(authentication failed\)\.\n +next: Check the password that obs-mcp reads from the obs-websocket settings file\. In OBS: Tools, WebSocket Server Settings, Show Connect Info shows the password\./);
+  assert.doesNotMatch(r.stdout, /next: Open OBS/);
+});
+
+test('F-T12-26: a broken settings file is named, with a fix step in plain words', async () => {
+  const dir = obsConfigDir(null);
+  const file = join(dir, 'plugin_config', 'obs-websocket', 'config.json');
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, '{"server_enabled": tr');
+  const r = await runDoctor(testEnv(dir, await closedPort()));
+  assert.ok(r.stdout.includes(`server      FAIL  The obs-websocket settings file ${file} is not valid JSON.\n              next: Open OBS, then Tools, WebSocket Server Settings, check the settings and press OK: OBS then writes the file again.`), r.stdout);
+  assert.doesNotMatch(r.stdout, /SyntaxError/);
+});
+
+test('F-T12-34: an OBS_WEBSOCKET_PORT that is not a whole number from 1 to 65535 fails the doctor, and no connection is tried', async () => {
+  const dir = obsConfigDir({ server_enabled: true, server_port: 4455, auth_required: true, server_password: PASSWORD });
+  for (const port of ['99999', '-1', 'abc', '0', '', '4455.5', ' 4455']) {
+    const r = await runDoctor(testEnv(dir, port));
+    assert.equal(r.code, 1, port);
+    assert.ok(r.stdout.includes(`port        FAIL  OBS_WEBSOCKET_PORT is "${port}". It must be a whole number from 1 to 65535.`), `${port}: ${r.stdout}`);
+    assert.match(r.stdout, /connection +skip +Needs a valid OBS_WEBSOCKET_PORT\./);
+  }
+  const ok = await runDoctor(testEnv(dir, await closedPort()));
+  assert.doesNotMatch(ok.stdout, /\n  port /);
+});
+
+test('F-T12-35: --help and --version print to stdout and exit 0', () => {
+  const run = (arg) => execFileSync(process.execPath, [CLI, arg], { encoding: 'utf8' });
+  assert.match(run('--help'), /^Usage:\n  obs-mcp            start the MCP server on stdio\n/);
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  assert.equal(run('--version'), `${pkg.version}\n`);
 });
 
 test('a password given as an argument is refused, and not echoed', () => {

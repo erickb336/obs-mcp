@@ -96,19 +96,34 @@ export function search(query: string, limit = 5): Entry[] {
     .map((x) => x.e);
 }
 
-/** Returns an error text when params do not match the request's fields, or null. */
+/** The longest text value that a request may carry. OBS names are short; a longer value is a mistake or an attack. */
+export const MAX_TEXT = 1000;
+
+/**
+ * Returns an error text when params do not match the request's fields, or null. The protocol marks both fields of a
+ * name and UUID pair (inputName and inputUuid, sceneName and sceneUuid, ...) as optional, but OBS needs one of them.
+ */
 export function checkFields(e: Entry, params: Record<string, unknown>): string | null {
   const known = new Set(e.fields.map((f) => f.name.split('.')[0]));
   const unknown = Object.keys(params).filter((k) => !known.has(k));
   const missing = e.fields.filter((f) => !f.optional && !f.name.includes('.') && params[f.name] === undefined).map((f) => f.name);
+  const pairs = e.fields
+    .filter((f) => f.optional && f.name.endsWith('Name') && known.has(f.name.replace(/Name$/, 'Uuid')))
+    .map((f) => [f.name, f.name.replace(/Name$/, 'Uuid')])
+    .filter(([n, u]) => params[n] === undefined && params[u] === undefined)
+    .map(([n, u]) => `${n} or ${u}`);
   const wrongType = e.fields
     .filter((f) => params[f.name] !== undefined && f.type !== 'Any' && typeof params[f.name] !== JS_TYPE[f.type])
     .map((f) => `${f.name} must be ${f.type}`);
-  if (!unknown.length && !missing.length && !wrongType.length) return null;
-  return [
+  const tooLong = Object.entries(params)
+    .filter(([, v]) => typeof v === 'string' && v.length > MAX_TEXT)
+    .map(([k, v]) => `${k} has ${(v as string).length} characters; the limit is ${MAX_TEXT}`);
+  const all = [
     unknown.length && `unknown fields: ${unknown.join(', ')}`,
-    missing.length && `missing fields: ${missing.join(', ')}`,
+    (missing.length || pairs.length) && `missing fields: ${[...missing, ...pairs].join(', ')}`,
     wrongType.length && wrongType.join('; '),
-  ].filter(Boolean).join('. ');
+    tooLong.length && tooLong.join('; '),
+  ].filter(Boolean);
+  return all.length ? all.join('. ') : null;
 }
 const JS_TYPE: Record<string, string> = { String: 'string', Number: 'number', Boolean: 'boolean', Object: 'object' };

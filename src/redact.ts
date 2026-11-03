@@ -3,10 +3,14 @@
 // Settings are free-form: OBS, plugins and scripts keep any value in them, stream keys, passwords and tokens too.
 // So a value inside settings passes only when its shape is known to be safe: a number, a boolean, null, or a string
 // that the allow-list below accepts for its (kind, key). Every other string becomes {"hidden":"text","length":n}.
+// A key inside settings is text too: a key that is not on the allow-list for the kind becomes "hidden_key_<n>".
 // No string is searched for secrets: the server does not try to recognise a secret, so it cannot miss one.
 
-/** A reply field that holds free-form settings: inputSettings, filterSettings, transitionSettings and the like. */
-const isSettings = (key: string) => key.endsWith('Settings') || key === 'slotValue' || key === 'responseData';
+/**
+ * A reply field that holds free-form values: inputSettings, filterSettings, transitionSettings and the like, a
+ * persistent data slot, and the name and value of a list item (a list item can name a window, an app or a device).
+ */
+const isSettings = (key: string) => key.endsWith('Settings') || ['slotValue', 'responseData', 'itemName', 'itemValue'].includes(key);
 
 type Shape = readonly string[] | 'uuid';
 const PROTOCOLS = ['RTMP', 'RTMPS', 'SRT', 'RIST', 'WHIP', 'HLS'];
@@ -47,11 +51,17 @@ function safe(kind: string, key: string, s: string): boolean {
   return shape === 'uuid' ? s.length === 36 && UUID.test(s) : shape.includes(s);
 }
 
-/** A value inside settings. Arrays and objects recurse, and an array item keeps the key of its parent. */
+/**
+ * A value inside settings. Arrays and objects recurse, and an array item keeps the key of its parent. A key that is
+ * not on the allow-list for the kind is hidden: its value stays, under the key "hidden_key_<n>", and follows the rules.
+ */
 function settings(v: unknown, kind: string, key: string): unknown {
   if (typeof v === 'string') return safe(kind, key, v) ? v : { hidden: 'text', length: v.length };
   if (Array.isArray(v)) return v.map((x) => settings(x, kind, key));
-  if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, settings(x, kind, k)]));
+  if (v && typeof v === 'object') {
+    let n = 0;
+    return Object.fromEntries(Object.entries(v).map(([k, x]) => [SAFE_SETTINGS.get(kind)?.has(k) ? k : `hidden_key_${++n}`, settings(x, kind, k)]));
+  }
   return v;
 }
 

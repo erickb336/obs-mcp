@@ -12,8 +12,6 @@ const debug = createRequire(import.meta.resolve('obs-websocket-js/json'))('debug
 debug.enable(`${debug.disable()},-obs-websocket-js,-obs-websocket-js:*`);
 
 const DEFAULT_PORT = 4455;
-const CONNECT_MS = 3000;
-const CALL_MS = 10000;
 
 /** What the obs-websocket settings file says. The password value is kept apart, so that no report can print it. */
 export type ServerSettings = {
@@ -37,44 +35,75 @@ function readSettingsFile(obsConfigDir: string): { settings: ServerSettings; pas
       password: j.auth_required === true && typeof j.server_password === 'string' ? j.server_password : undefined,
     };
   } catch (e) {
-    return { settings: { file, found: true, error: `cannot read: ${(e as Error).name}` } };
+    const why = e instanceof SyntaxError ? 'is not valid JSON' : `cannot be read (${(e as { code?: string }).code ?? (e as Error).name})`;
+    return { settings: { file, found: true, error: `The obs-websocket settings file ${file} ${why}.` } };
   }
 }
+
+/** The fix step for a settings file that cannot be read. */
+export const SETTINGS_FILE_FIX =
+  'Open OBS, then Tools, WebSocket Server Settings, check the settings and press OK: OBS then writes the file again. Doctor never changes the file.';
 
 /** Where the connection settings come from. The password comes from the environment or the settings file, never from an argument. */
 export function connectionTarget(obsConfigDir: string, env: NodeJS.ProcessEnv = process.env) {
   const { settings, password: filePassword } = readSettingsFile(obsConfigDir);
-  const envPort = Number(env.OBS_WEBSOCKET_PORT) || undefined;
-  const port = envPort ?? settings.port ?? DEFAULT_PORT;
+  // A set OBS_WEBSOCKET_PORT must be a whole number from 1 to 65535. Any other value, an empty one too, is an error, not a silent default.
+  const raw = env.OBS_WEBSOCKET_PORT;
+  const valid = raw !== undefined && /^\d{1,5}$/.test(raw) && Number(raw) >= 1 && Number(raw) <= 65535;
+  const portError = raw !== undefined && !valid
+    ? `OBS_WEBSOCKET_PORT is "${raw.length > 20 ? `${raw.slice(0, 20)}...` : raw}". It must be a whole number from 1 to 65535. Fix it, or remove it to use the port in the obs-websocket settings file.`
+    : undefined;
+  const port = valid ? Number(raw) : (settings.port ?? DEFAULT_PORT);
   const password = env.OBS_WEBSOCKET_PASSWORD || filePassword;
   const passwordFrom = env.OBS_WEBSOCKET_PASSWORD ? 'environment variable OBS_WEBSOCKET_PASSWORD' : filePassword ? 'obs-websocket settings file' : 'none';
   // Loopback only: the server never connects to another host.
-  return { settings, url: `ws://127.0.0.1:${port}`, port, password, passwordFrom };
+  return { settings, url: `ws://127.0.0.1:${port}`, port, portError, password, passwordFrom };
 }
 
-/** The exposure of the OBS WebSocket port, in words, from the addresses that the platform layer read. */
-export function listenerWords(port: number, addresses: string[] | null): string {
-  if (addresses === null) return `No reading of port ${port}: the OS tool that lists listeners is not available.`;
-  if (!addresses.length) return `Nothing listens on port ${port} now.`;
+/** A listener on the OBS WebSocket port, as the platform layer read it. process is the program name, when the OS tool gives it. */
+export type Listener = { address: string; process?: string };
+
+/** OBS runs as "OBS" (macOS), "obs" (Linux) or "obs64.exe" (Windows). */
+const isObsProcess = (name: string) => /^obs(64|32)?(\.exe)?$/i.test(name);
+
+/**
+ * The listener check, in words: the exposure of the port and the program that listens. listeners is null when the OS
+ * tool gave no reading. connected says that OBS answered on the port, so an empty or missing reading is not a problem.
+ */
+export function listenerCheck(port: number, listeners: Listener[] | null, connected: boolean): { result: 'info' | 'warn'; text: string } {
+  if (!listeners?.length) {
+    const why = listeners === null ? 'the OS tool that lists listeners gave no reading' : 'the OS tool lists no listener there';
+    return { result: 'info', text: connected ? `OBS answers on port ${port}, but ${why}, so its exposure is unknown.` : listeners === null ? `Port ${port}: unknown, because ${why}.` : `Nothing listens on port ${port} now.` };
+  }
+  const addresses = [...new Set(listeners.map((l) => l.address))];
   const all = addresses.some((a) => /^(\*|0\.0\.0\.0|\[::\]|::|\[::0\]):\d+$/.test(a));
-  return all
-    ? `Port ${port} listens on all network interfaces (${addresses.join(', ')}). Other devices on your network can reach OBS there, unless a firewall blocks them. obs-websocket has no option to listen on localhost only; its password is the only control in OBS.`
+  const names = [...new Set(listeners.map((l) => l.process).filter((p): p is string => !!p))];
+  const others = names.filter((n) => !isObsProcess(n));
+  const where = all
+    ? `Port ${port} listens on all network interfaces (${addresses.join(', ')}). Other devices on your network can reach it, unless a firewall blocks them. obs-websocket has no option to listen on localhost only; its password is the only control in OBS.`
     : `Port ${port} listens on ${addresses.join(', ')} only.`;
+  const who = names.length ? ` Program: ${names.join(', ')}.` : ' Program: unknown.';
+  if (!others.length) return { result: 'info', text: where + who };
+  return { result: 'warn', text: `${where}${who} ${others.join(', ')} is not OBS, and obs-mcp connects to it as OBS. Close that program, or give OBS another port and set OBS_WEBSOCKET_PORT to it.` };
 }
 
+const OPEN_OBS = 'Open OBS and turn on its WebSocket server: Tools, WebSocket Server Settings, Enable WebSocket server.';
+
+/** A failure with plain words. next is the step that fixes it; doctor and obs_status both show it. */
 export class ObsError extends Error {
-  constructor(message: string, readonly code?: number) {
+  constructor(message: string, readonly code?: number, readonly next = OPEN_OBS) {
     super(message);
   }
 }
 
-/** Plain words for a failed connection. Never includes the password. */
-function explainConnect(e: unknown, port: number): string {
-  const err = e as { code?: number; message?: string };
-  if (e instanceof ObsError) return e.message;
-  if (err.code === 4009) return 'OBS refused the password (authentication failed). Check the password in OBS: Tools, WebSocket Server Settings.';
-  if (err.code === 4008) return 'OBS asks for a password, and none was found. Set OBS_WEBSOCKET_PASSWORD, or check the obs-websocket settings file.';
-  return `No answer from OBS on 127.0.0.1:${port}. OBS is closed, its WebSocket server is off, or it uses another port.`;
+/** Plain words and the next step for a failed connection. Never includes the password. */
+function connectError(e: unknown, t: ReturnType<typeof connectionTarget>): ObsError {
+  if (e instanceof ObsError) return e;
+  const code = (e as { code?: number }).code;
+  const showPassword = 'In OBS: Tools, WebSocket Server Settings, Show Connect Info shows the password.';
+  if (code === 4009) return new ObsError('OBS refused the password (authentication failed).', code, `Check the password that obs-mcp reads from the ${t.passwordFrom}. ${showPassword}`);
+  if (code === 4008) return new ObsError('OBS asks for a password, and none was found.', code, `Set OBS_WEBSOCKET_PASSWORD to it, or check the obs-websocket settings file. ${showPassword}`);
+  return new ObsError(`No answer from OBS on 127.0.0.1:${t.port}. OBS is closed, its WebSocket server is off, or it uses another port.`, code);
 }
 
 /** Plain words for a request that failed after the connection was up. */
@@ -100,7 +129,11 @@ export class Obs {
   private opening?: Promise<Version>;
   version?: Version;
 
-  constructor(private target: () => ReturnType<typeof connectionTarget>) {}
+  /** connectMs limits the connection and its GetVersion; callMs limits each request. */
+  constructor(
+    private target: () => ReturnType<typeof connectionTarget>,
+    private limits = { connectMs: 3000, callMs: 10000 },
+  ) {}
 
   connect(): Promise<Version> {
     this.opening ??= this.open().catch((e) => {
@@ -112,17 +145,23 @@ export class Obs {
 
   private async open(): Promise<Version> {
     const t = this.target();
+    if (t.portError) throw new ObsError(t.portError, undefined, 'Fix OBS_WEBSOCKET_PORT, or remove it.');
     const ws = new OBSWebSocket();
+    const ms = this.limits.connectMs;
     let timer: NodeJS.Timeout | undefined;
     try {
-      await Promise.race([
-        ws.connect(t.url, t.password, { rpcVersion: 1, eventSubscriptions: EventSubscription.None }),
-        new Promise((_, reject) => (timer = setTimeout(() => reject(new ObsError(`No reply from OBS in ${CONNECT_MS} ms.`)), CONNECT_MS))),
+      // The limit covers GetVersion too: a program that accepts the connection and never answers does not hang the server.
+      const opened = async () => {
+        await ws.connect(t.url, t.password, { rpcVersion: 1, eventSubscriptions: EventSubscription.None });
+        return (await ws.call('GetVersion')) as unknown as Version;
+      };
+      this.version = await Promise.race([
+        opened(),
+        new Promise<never>((_, reject) => (timer = setTimeout(() => reject(new ObsError(`No reply from OBS on 127.0.0.1:${t.port} in ${ms} ms. The program on that port accepted the connection, then did not answer.`)), ms))),
       ]);
-      this.version = (await ws.call('GetVersion')) as unknown as Version;
     } catch (e) {
       await ws.disconnect().catch(() => {});
-      throw new ObsError(explainConnect(e, t.port), (e as { code?: number }).code);
+      throw connectError(e, t);
     } finally {
       clearTimeout(timer);
     }
@@ -141,13 +180,14 @@ export class Obs {
   async call(request: string, params?: Record<string, unknown>): Promise<Record<string, unknown>> {
     await this.connect();
     const ws = this.ws!;
+    const ms = this.limits.callMs;
     let timer: NodeJS.Timeout | undefined;
     let onClose: ((e: { code?: number }) => void) | undefined;
     try {
       return await Promise.race([
         ws.call(request as never, params as never) as Promise<Record<string, unknown>>,
         new Promise<never>((_, reject) => {
-          timer = setTimeout(() => reject(new ObsError(`No reply from OBS to ${request} in ${CALL_MS} ms.`)), CALL_MS);
+          timer = setTimeout(() => reject(new ObsError(`No reply from OBS to ${request} in ${ms} ms.`)), ms);
           onClose = (e) => reject(new ObsError(explainCall({ code: e.code, message: 'OBS closed the connection.' }), e.code));
           ws.once('ConnectionClosed', onClose);
         }),

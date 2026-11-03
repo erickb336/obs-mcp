@@ -30,8 +30,10 @@ export async function closedPort() {
   return port;
 }
 
+/** port null leaves OBS_WEBSOCKET_PORT unset, so the port comes from the settings file. */
 export function testEnv(dir, port, extra = {}) {
   const env = { ...process.env, OBS_STUDIO_CONFIG_DIR: dir, OBS_WEBSOCKET_PORT: String(port), ...extra };
+  if (port === null && !('OBS_WEBSOCKET_PORT' in extra)) delete env.OBS_WEBSOCKET_PORT;
   if (!('OBS_WEBSOCKET_PASSWORD' in extra)) delete env.OBS_WEBSOCKET_PASSWORD;
   return env;
 }
@@ -59,8 +61,10 @@ export function runDoctor(env) {
   });
 }
 
-/** Sample params that satisfy the required fields of a catalogue entry. */
+/** Sample params that satisfy the required fields of a catalogue entry, and the name of each name and UUID pair. */
 export function sampleParams(entry) {
   const v = { String: 'sample', Number: 1, Boolean: true, Object: {}, Any: 'sample' };
-  return Object.fromEntries(entry.fields.filter((f) => !f.optional && !f.name.includes('.')).map((f) => [f.name, v[f.type]]));
+  const names = new Set(entry.fields.map((f) => f.name));
+  const needed = (f) => !f.name.includes('.') && (!f.optional || (f.name.endsWith('Name') && names.has(f.name.replace(/Name$/, 'Uuid'))));
+  return Object.fromEntries(entry.fields.filter(needed).map((f) => [f.name, v[f.type]]));
 }
