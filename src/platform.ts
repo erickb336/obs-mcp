@@ -1,10 +1,10 @@
 // The platform layer: every OS-specific path and probe lives here, and nowhere else.
 // Paths come from the OS conventions that OBS itself uses, or from discovery, never from one machine.
 import { execFileSync } from 'node:child_process';
-import { existsSync, readdirSync, statSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readlinkSync, statSync, readFileSync } from 'node:fs';
 import type { Listener } from './obs.js';
 import { homedir } from 'node:os';
-import { join, delimiter, isAbsolute, win32 } from 'node:path';
+import { basename, join, delimiter, isAbsolute, win32 } from 'node:path';
 
 const OS = process.platform;
 /**
@@ -102,8 +102,22 @@ export function listeners(port: number): Listener[] | null {
   }
   const out = probe('ss', ['-Hltnp', `sport = :${port}`]);
   if (out === null) return null;
-  // ss shows users:(("obs",pid=1234,fd=30)) only for the processes of this user.
-  return out.split('\n').filter(Boolean).map((l) => ({ address: l.trim().split(/\s+/)[3], process: /users:\(\("([^"]+)"/.exec(l)?.[1] })).filter((x) => x.address);
+  // ss shows users:(("name",pid=1234,fd=30)) only for the processes of this user. The name there is the thread name,
+  // which a program can change (Node calls its thread "MainThread"), so the program file of the pid comes first.
+  return out
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => ({ address: l.trim().split(/\s+/)[3], process: programOf(/pid=(\d+)/.exec(l)?.[1]) ?? /users:\(\("([^"]+)"/.exec(l)?.[1] }))
+    .filter((x) => x.address);
+}
+
+/** The file name of the program that runs as a Linux pid, for example "obs", or undefined when /proc does not give it. */
+function programOf(pid: string | undefined): string | undefined {
+  try {
+    return pid ? basename(readlinkSync(`/proc/${pid}/exe`)) : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** The full path of a tool in the Windows folder, so that a copy in the current folder or on PATH never runs instead. */
