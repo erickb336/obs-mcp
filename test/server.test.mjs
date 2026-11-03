@@ -15,7 +15,7 @@ const PASSWORD = 'fake-obs-password-7Qx2';
 
 for (const era of ['legacy', 'modern']) {
   describe(`tools on the ${era} protocol era`, () => {
-    test('tools/list has the 3 tools, all read-only, within 1,200 tokens', async () => {
+    test('tools/list has the 4 tools, all read-only, within 1,200 tokens', async () => {
       // Method: compact JSON of the tools array, tokens by cl100k_base through js-tiktoken 1.0.21.
       // cl100k_base is an approximation: it is not the tokenizer of any Claude model.
       const s = await connect(testEnv(obsConfigDir(null), await closedPort()), { era });
@@ -24,7 +24,7 @@ for (const era of ['legacy', 'modern']) {
       await s.close();
       if (era === 'modern') assert.equal(version, '2026-07-28');
       else assert.notEqual(version, '2026-07-28');
-      assert.deepEqual(tools.map((t) => t.name).sort(), ['obs_find', 'obs_read', 'obs_status']);
+      assert.deepEqual(tools.map((t) => t.name).sort(), ['obs_find', 'obs_read', 'obs_status', 'obs_verify_file']);
       assert.ok(tools.every((t) => t.annotations.readOnlyHint === true));
       // F-T12-40: obs_read says what it does with guarded requests, as obs_find's in_0_0 does.
       assert.match(tools.find((t) => t.name === 'obs_read').description, /It runs the reads, and 3 guarded reads behind a check; it refuses changes and the other guarded requests/);

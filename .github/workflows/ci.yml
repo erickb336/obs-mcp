@@ -29,6 +29,14 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ matrix.node }}
+      # The file check tests make SIMULATED media with ffmpeg. On Linux, CI installs the ffmpeg 6.1 package of the runner's
+      # Ubuntu; on macOS and Windows those tests skip with the reason, and the parser tests still run.
+      - name: Install ffmpeg 6.1 (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends 'ffmpeg=7:6.1.*'
+          ffmpeg -hide_banner -version | head -1
       - run: npm ci
       - name: Catalogue parity check
         run: npm run parity
