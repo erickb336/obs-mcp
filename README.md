@@ -187,8 +187,25 @@ All are optional.
 | `src/` | The server, the doctor, the OBS layer and the platform layer |
 | `catalogue/classes.json` | One class row for each documented request |
 | `protocol/` | The pinned protocol description and its source |
-| `scripts/` | The catalogue generator and the packed-package smoke test |
-| `test/` | Tests, a simulated OBS that closes the socket (code 1006) on an untested list request, and a script that makes SIMULATED media with ffmpeg for the file check. `test/real-files.test.mjs` checks real recordings of your own: it runs only when `OBS_MCP_REAL_DIR` names their folder |
+| `scripts/` | The catalogue generator, the packed-package smoke test, the trace capture, the trace scrub and the timing loop |
+| `test/` | Tests, the fake OBS, and a script that makes SIMULATED media with ffmpeg for the file check. `test/real-files.test.mjs` checks real recordings of your own: it runs only when `OBS_MCP_REAL_DIR` names their folder |
+| `test/traces/` | The stored traces that the fake OBS replays. Each file says its `source`: all of them are `simulated` now |
+
+### The fake OBS and its traces
+
+All tests run against a fake OBS (`test/fake-obs.mjs`). It replays the stored traces: a request, its data and the output state give the status code, the reply, the events and the change of state of the trace. A request with no trace gets sample values in the shape of the protocol. The fake closes the socket with code 1006 on a list request that is not tested on real OBS, as real OBS does when it crashes. It counts each recording that stops.
+
+The traces in this release are SIMULATED: written by hand from the protocol and from facts measured on real OBS 33.0.1 (for example, `SetVideoSettings` gives code 500 during any output, and `STOPPED` comes about 1 s after `StopRecord`). A capture from real OBS replaces them later.
+
+| Tool | What it does |
+| --- | --- |
+| `node scripts/capture-traces.mjs --url ws://127.0.0.1:4455 --out trace.json` | Records requests, replies and events. It reads the password from `OBS_WEBSOCKET_PASSWORD` or a hidden prompt. It stops when a stream or recording is active, never sends a list request that crashed OBS, never starts a stream, and starts or stops a recording only with `--allow-record`. It writes the trace only after the scrub. |
+| `node scripts/trace-scrub.mjs --check test/traces/*.json` | Fails when a trace holds a password, an auth value, a stream key, a URL, a host name, an address, a user name, a home path or a file path. `npm test` runs the same scan on every stored trace. |
+| `node scripts/timing-loop.mjs` | Measures the time that the server adds to each request over loopback, against the fake OBS. Add `--url ws://127.0.0.1:4455` to measure a running OBS. |
+
+The stop rule has its own test (`test/sweep.test.mjs`): during a simulated take, it sends each of the 147 requests through the server, and the two list requests that crash OBS. Result: 0 stops and 0 crashes. The same requests sent straight to the fake OBS stop the take 6 times, so the test can see a stop.
+
+### Run the checks
 
 Run the checks from a clone:
 
