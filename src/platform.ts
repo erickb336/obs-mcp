@@ -65,8 +65,7 @@ export function versionFromLog(obsConfigDir: string): string | undefined {
 export function listenAddresses(port: number): string[] | null {
   if (OS === 'win32') {
     const out = probe('netstat', ['-an', '-p', 'TCP']);
-    if (out === null) return null;
-    return out.split('\n').filter((l) => /LISTENING/.test(l)).map((l) => l.trim().split(/\s+/)[1]).filter((a) => a?.endsWith(`:${port}`));
+    return out === null ? null : netstatListeners(out, port);
   }
   if (OS === 'darwin') {
     // lsof exits 1 with no output when nothing listens.
@@ -77,6 +76,18 @@ export function listenAddresses(port: number): string[] | null {
   const out = probe('ss', ['-Hltn', `sport = :${port}`]);
   if (out === null) return null;
   return out.split('\n').filter(Boolean).map((l) => l.trim().split(/\s+/)[3]).filter(Boolean);
+}
+
+/**
+ * The local addresses in Windows "netstat -an" output that listen on a TCP port. The state word changes with the
+ * display language, so a listener is found by its foreign address, which is 0.0.0.0:0 or [::]:0 only on a listener.
+ */
+export function netstatListeners(out: string, port: number): string[] {
+  return out
+    .split('\n')
+    .map((l) => l.trim().split(/\s+/))
+    .filter(([proto, local, foreign]) => proto === 'TCP' && local?.endsWith(`:${port}`) && /^(0\.0\.0\.0|\[::\]):0$/.test(foreign ?? ''))
+    .map(([, local]) => local);
 }
 
 /** Leftover run files in the OBS .sentinel folder. OBS leaves one when a session did not close normally. */
