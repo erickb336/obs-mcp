@@ -70,6 +70,16 @@ export function makeFixtures() {
     f[`lateEnd-${ext}`] = make(dir, `SIMULATED-late-end-dropout.${ext}`, [video(20), late('0.3*sin(440*2*PI*t)*lt(t\\,12)', 17)]);
     f[`offset-${ext}`] = make(dir, `SIMULATED-offset-5s.${ext}`, [video(20), sine(440, 20)], ['-output_ts_offset', '5']);
   }
+  // F-T24-1: 20 s files in each container whose track 1 has no audio packets from 5 s to 12 s ("hole7-") or from 5 s to
+  // 5.8 s ("hole08-"). Track 2 is a full tone: the backup. A stream copy drops the packets (-bsf:a:0 noise=drop=...), so
+  // no encoder can close the hole, in any ffmpeg version.
+  for (const ext of ['mov', 'mp4', 'mkv', 'flv', 'ts']) {
+    const full = make(dir, `SIMULATED-full.${ext}`, [video(20), sine(440, 20), sine(660, 20)]);
+    for (const [key, to] of [['hole7', 12], ['hole08', 5.8]]) {
+      f[`${key}-${ext}`] = join(dir, `SIMULATED-${key}.${ext}`);
+      execFileSync(tools.ffmpeg, ['-hide_banner', '-loglevel', 'error', '-y', '-i', full, '-map', '0', '-c', 'copy', '-bsf:a:0', `noise=drop=between((pts-startpts)*tb\\,5\\,${to})`, f[`${key}-${ext}`]]);
+    }
+  }
   Object.assign(f, forgedMkv(dir));
   // A 20 s MOV with 1% of its bytes, from the middle on, set to fixed pseudo-random values: damaged audio data inside.
   f.damaged = make(dir, 'SIMULATED-damaged.mov', [video(20), sine(440, 20)]);
