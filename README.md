@@ -66,9 +66,9 @@ What `obs_read` runs in 0.0, from the class table in [`catalogue/classes.json`](
 
 | Class | Requests | In 0.0 |
 | --- | --- | --- |
-| read | 58 | Runs. `GetSourceScreenshot` saves the image to a file in a folder that the server makes in the system temporary folder; the reply gives only the path and the size. |
+| read | 57 | Runs. `GetSourceScreenshot` saves the image to a file in a folder that the server makes in the system temporary folder; the reply gives only the path and the size. `GetPersistentData` passes a number, a boolean or null; any other slot value becomes `[redacted]`. |
 | change | 56 | Refused, not sent |
-| guarded | 33 | Refused, not sent, except two reads with their own guard: `GetInputPropertiesListPropertyItems` and `GetStreamServiceSettings` |
+| guarded | 34 | Refused, not sent, except three reads with their own guard: `GetInputPropertiesListPropertyItems`, `GetStreamServiceSettings` and `GetProfileParameter` (only video, audio, output mode and recording parameters; never tokens or output URLs) |
 | not documented | 4 private-settings requests that OBS offers live | Refused, not sent |
 
 `SaveSourceScreenshot` is a change, so it is refused in 0.0.
@@ -79,7 +79,7 @@ What `obs_read` runs in 0.0, from the class table in [`catalogue/classes.json`](
 - **Listener exposure.** When the obs-websocket server is on, OBS listens on all network interfaces. It has no option to listen on localhost only. Other devices on your network can reach it, unless a firewall blocks them. Keep a password set. `obs_status` and the doctor report what listens on the port.
 - **obs-mcp opens no port.** It speaks MCP over stdio only, and it connects to OBS on 127.0.0.1 only.
 - **The password** comes from the obs-websocket settings file, or from `OBS_WEBSOCKET_PASSWORD`. Never give it as an argument: OBS writes its own command line to its log. No reply, log or doctor line shows it.
-- **Secrets in replies.** Values with a secret name (password, key, token) become `[redacted]`. A URL loses its user name, query and fragment. `GetStreamServiceSettings` passes only `service`, `server` (without its path) and `protocol`.
+- **Secrets in replies.** Values with a secret name (password, key, token) become `[redacted]`. A URL keeps only its scheme and host, because a path or query can hold a stream key (for example `rtmp://host/app/<key>` or `srt://host?streamid=<key>`). `GetStreamServiceSettings` passes only `service`, `server` and `protocol`.
 - **List requests can crash OBS.** `GetInputPropertiesListPropertyItems` runs only on a row that was tested on real OBS. Today there is one row: property `type` of a `screen_capture` input, on macOS, OBS 33.0.1. Before each list request the server reads the recording state; during any recording, whoever started it, the request is refused.
 - **The doctor changes nothing.** It reads files and asks the OS. It notes a leftover crash file in the OBS `.sentinel` folder and never deletes it.
 

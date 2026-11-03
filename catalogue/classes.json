@@ -9,7 +9,7 @@
   "SetCurrentProfile": ["guarded","consent","0.3"],
   "CreateProfile": ["guarded","consent","0.3"],
   "RemoveProfile": ["guarded","consent","0.3"],
-  "GetProfileParameter": ["read"],
+  "GetProfileParameter": ["guarded","read by parameter allow-list","0.3"],
   "SetProfileParameter": ["guarded","consent","0.3"],
   "GetVideoSettings": ["read"],
   "SetVideoSettings": ["guarded","consent","0.3"],

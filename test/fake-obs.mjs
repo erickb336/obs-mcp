@@ -13,12 +13,19 @@ const SAMPLE = { String: 'sample', Number: 1, Boolean: false, Object: {}, Any: n
 const sample = (type) => (type.startsWith('Array') ? [] : SAMPLE[type]);
 
 /**
- * options: password, recording (bool), platform, obsVersion, inputs ({name: kind}), streamKey, crashOn (request name).
+ * options: password, recording (bool), platform, obsVersion, inputs ({name: kind}), streamKey, token, crashOn (request name).
+ * Each input has the UUID "uuid-<name>". Like OBS, the fake resolves inputName first and inputUuid only when no name is given.
  * Returns { port, log, close() }. log holds every request type that reached the fake, in order.
  */
 export async function startFakeObs(options = {}) {
   const o = { platform: 'macos', obsVersion: '33.0.1', inputs: { Display: 'screen_capture', 'App audio': 'sck_audio_capture' }, ...options };
   const log = [];
+  const key = () => o.streamKey ?? 'sample-stream-key';
+  const token = () => o.token ?? 'sample-refresh-token';
+  const inputOf = (d) => d?.inputName ?? (typeof d?.inputUuid === 'string' ? d.inputUuid.replace(/^uuid-/, '') : undefined);
+  // Settings with a key in a URL path or query, as RTMP, SRT and RIST outputs, filters and media sources hold them.
+  const keyUrls = () => ({ server: `rtmp://live.example.com/app/${key()}`, srt_url: `srt://ingest.example.com:9000?streamid=${key()}`, rist_url: `rist://ingest.example.com:8000?secret=${key()}`, widget: `https://alerts.example.com/widget/${key()}` });
+  const profile = () => ({ 'Twitch/RefreshToken': token(), 'AdvOut/FFURL': `rtmp://live.example.com/app/${key()}`, 'Video/BaseCX': '1920' });
   const wss = new WebSocketServer({ host: '127.0.0.1', port: 0 });
   await new Promise((r) => wss.once('listening', r));
 
@@ -29,10 +36,18 @@ export async function startFakeObs(options = {}) {
       case 'GetRecordStatus':
         return { outputActive: !!o.recording, outputPaused: false, outputTimecode: '00:00:00.000', outputDuration: 0, outputBytes: 0 };
       case 'GetInputSettings': {
-        return { inputKind: o.inputs[data?.inputName] ?? 'sample_kind', inputSettings: { url: 'https://example.com/overlay?token=abc123', show_cursor: true } };
+        return { inputKind: o.inputs[inputOf(data)] ?? 'sample_kind', inputSettings: { url: 'https://example.com/overlay?token=abc123', show_cursor: true, ...keyUrls() } };
       }
       case 'GetStreamServiceSettings':
         return { streamServiceType: 'rtmp_custom', streamServiceSettings: { server: 'rtmp://live.example.com/app/secretpath?k=1', key: o.streamKey ?? 'sample-stream-key', use_auth: true, username: 'someone', password: o.password ?? 'none' } };
+      case 'GetOutputSettings':
+        return { outputSettings: keyUrls() };
+      case 'GetSourceFilter':
+        return { filterEnabled: true, filterIndex: 0, filterKind: 'sample_kind', filterSettings: keyUrls() };
+      case 'GetProfileParameter':
+        return { parameterValue: profile()[`${data?.parameterCategory}/${data?.parameterName}`] ?? null, defaultParameterValue: null };
+      case 'GetPersistentData':
+        return { slotValue: data?.slotName === 'count' ? 3 : token() };
       case 'GetSourceScreenshot':
         return { imageData: `data:image/png;base64,${Buffer.from('not really a png').toString('base64')}` };
       case 'GetInputPropertiesListPropertyItems':
@@ -59,7 +74,7 @@ export async function startFakeObs(options = {}) {
       log.push(requestType);
       if (requestType === o.crashOn) return ws.terminate();
       if (requestType === 'GetInputPropertiesListPropertyItems') {
-        const cleared = o.inputs[requestData?.inputName] === 'screen_capture' && requestData?.propertyName === 'type';
+        const cleared = o.inputs[inputOf(requestData)] === 'screen_capture' && requestData?.propertyName === 'type';
         if (!cleared) return ws.terminate();
       }
       const known = DOCUMENTED.has(requestType) || PRIVATE_REQUESTS.includes(requestType);

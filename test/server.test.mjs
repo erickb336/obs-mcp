@@ -80,9 +80,9 @@ describe('against the fake OBS', () => {
     assert.deepEqual(fake.log.filter((n) => CLASS[n] !== 'read'), []);
   });
 
-  test('every change and guarded request is refused and never sent, except the two guarded reads', async () => {
+  test('every change and guarded request is refused and never sent, except the three guarded reads', async () => {
     fake.log.length = 0;
-    const others = CATALOGUE.filter((e) => e.class !== 'read' && !['GetInputPropertiesListPropertyItems', 'GetStreamServiceSettings'].includes(e.request));
+    const others = CATALOGUE.filter((e) => e.class !== 'read' && !['GetInputPropertiesListPropertyItems', 'GetStreamServiceSettings', 'GetProfileParameter'].includes(e.request));
     assert.equal(others.length, 87);
     for (const e of others) {
       const r = await s.call('obs_read', { request: e.request, params: sampleParams(e) });
@@ -122,6 +122,69 @@ describe('against the fake OBS', () => {
   test('GetStreamServiceSettings returns only allowed fields', async () => {
     const r = await s.call('obs_read', { request: 'GetStreamServiceSettings' });
     assert.deepEqual(r.json.data.streamServiceSettings, { server: 'rtmp://live.example.com [cut]' });
+  });
+
+  test('F-T12-1: a list request with both inputName and inputUuid is refused, so an uncleared input never reaches OBS', async () => {
+    fake.log.length = 0;
+    // inputUuid names the cleared Display, inputName the uncleared App audio. OBS resolves the name first.
+    const r = await s.call('obs_read', { request: 'GetInputPropertiesListPropertyItems', params: { inputName: 'App audio', inputUuid: 'uuid-Display', propertyName: 'type' } });
+    assert.equal(r.isError, true, r.text);
+    assert.match(r.json.refused, /give inputName or inputUuid, not both/);
+    assert.equal(fake.log.includes('GetInputPropertiesListPropertyItems'), false);
+    const byUuid = await s.call('obs_read', { request: 'GetInputPropertiesListPropertyItems', params: { inputUuid: 'uuid-Display', propertyName: 'type' } });
+    assert.equal(byUuid.isError, false, byUuid.text);
+  });
+
+  test('F-T12-3: GetProfileParameter runs only on an allowed (category, name) pair; a token pair is refused and not sent', async () => {
+    fake.log.length = 0;
+    const ok = await s.call('obs_read', { request: 'GetProfileParameter', params: { parameterCategory: 'Video', parameterName: 'BaseCX' } });
+    assert.equal(ok.isError, false, ok.text);
+    assert.equal(ok.json.data.parameterValue, '1920');
+    for (const [parameterCategory, parameterName] of [['Twitch', 'RefreshToken'], ['AdvOut', 'FFURL'], ['YouTube', 'Token']]) {
+      const r = await s.call('obs_read', { request: 'GetProfileParameter', params: { parameterCategory, parameterName } });
+      assert.equal(r.isError, true, r.text);
+      assert.match(r.json.refused, new RegExp(`^GetProfileParameter: \\(${parameterCategory}, ${parameterName}\\) is not on the list of safe profile parameters`));
+    }
+    assert.deepEqual(fake.log, ['GetProfileParameter']);
+  });
+
+  test('F-T12-4: a key in the path or query of an RTMP, SRT, RIST or web URL does not pass', async () => {
+    for (const [request, params, field] of [
+      ['GetInputSettings', { inputName: 'Display' }, 'inputSettings'],
+      ['GetOutputSettings', { outputName: 'adv_stream' }, 'outputSettings'],
+      ['GetSourceFilter', { sourceName: 'Display', filterName: 'Stream' }, 'filterSettings'],
+    ]) {
+      const r = await s.call('obs_read', { request, params });
+      assert.equal(r.isError, false, r.text);
+      const { server, srt_url, rist_url, widget } = r.json.data[field];
+      assert.deepEqual({ server, srt_url, rist_url, widget }, {
+        server: 'rtmp://live.example.com [cut]',
+        srt_url: 'srt://ingest.example.com:9000 [cut]',
+        rist_url: 'rist://ingest.example.com:8000 [cut]',
+        widget: 'https://alerts.example.com [cut]',
+      });
+      assert.equal(r.text.includes('live_fakestreamkey_123'), false);
+    }
+  });
+
+  test('F-T12-5: GetPersistentData redacts a text value and passes a number', async () => {
+    const realm = 'OBS_WEBSOCKET_DATA_REALM_GLOBAL';
+    const text = await s.call('obs_read', { request: 'GetPersistentData', params: { realm, slotName: 'auth' } });
+    assert.equal(text.isError, false, text.text);
+    assert.equal(text.json.data.slotValue, '[redacted]');
+    assert.equal(text.text.includes('sample-refresh-token'), false);
+    const num = await s.call('obs_read', { request: 'GetPersistentData', params: { realm, slotName: 'count' } });
+    assert.equal(num.json.data.slotValue, 3);
+  });
+
+  test('F-T12-7: obs_find and obs_read with Object.prototype names give a normal result', async () => {
+    for (const word of ['constructor', '__proto__', 'toString', 'hasOwnProperty', 'valueOf']) {
+      const f = await s.call('obs_find', { query: word });
+      assert.equal(f.isError, false, `${word}: ${f.text}`);
+      assert.ok(Array.isArray(f.json), `${word}: ${f.text}`);
+      const r = await s.call('obs_read', { request: word });
+      assert.match(r.json?.refused ?? r.text, new RegExp(`^${word} is not in the catalogue`), `${word}: ${r.text}`);
+    }
   });
 
   test('GetSourceScreenshot saves the image to a server-owned file and sends no image data', async () => {

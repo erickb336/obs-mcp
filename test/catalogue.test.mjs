@@ -14,10 +14,10 @@ const protocol = JSON.parse(readFileSync(PROTOCOL, 'utf8'));
 const classes = JSON.parse(readFileSync(at('catalogue/classes.json'), 'utf8'));
 const SCRIPT = at('scripts/catalogue.mjs');
 
-test('the class table has one row per documented request: 58 read, 56 change, 33 guarded', () => {
+test('the class table has one row per documented request: 57 read, 56 change, 34 guarded', () => {
   const catalogue = buildCatalogue(protocol, classes);
   assert.equal(catalogue.length, 147);
-  assert.deepEqual(countClasses(catalogue), { read: 58, change: 56, guarded: 33 });
+  assert.deepEqual(countClasses(catalogue), { read: 57, change: 56, guarded: 34 });
 });
 
 test('a request with no class row fails the build, and the error names it', () => {

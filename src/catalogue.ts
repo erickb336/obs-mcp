@@ -19,7 +19,7 @@ const BY_NAME = new Map(CATALOGUE.map((e) => [e.request, e]));
 export const entry = (name: string) => BY_NAME.get(name);
 
 // Guarded requests that obs_read runs in 0.0, each behind its own check in read.ts.
-export const READ_GUARDED = new Set(['GetInputPropertiesListPropertyItems', 'GetStreamServiceSettings']);
+export const READ_GUARDED = new Set(['GetInputPropertiesListPropertyItems', 'GetStreamServiceSettings', 'GetProfileParameter']);
 
 /** What obs_read does with a request in this release. */
 export function readRule(e: Entry): string {
@@ -44,14 +44,15 @@ const STOP = new Set('a an the of to for in on and or is are it this that with b
 const words = (s: string) =>
   s.replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase().split(/[^a-z0-9]+/).filter((w) => w && !STOP.has(w));
 const stem = (w: string) => w.replace(/(ing|es|s)$/, '');
-const SYNONYMS: Record<string, string[]> = {
+// A Map, not an object, so that a query word such as "constructor" finds no inherited value.
+const SYNONYMS = new Map(Object.entries({
   mic: ['input'], microphone: ['input'], source: ['input', 'sceneitem'], camera: ['virtualcam', 'input'], webcam: ['input'],
   loud: ['volume'], loudness: ['volume'], gain: ['volume'], silence: ['mute'], unmute: ['mute'], hide: ['enabled', 'item'],
   show: ['enabled', 'item'], move: ['transform', 'position'], resize: ['transform', 'scale'], crop: ['transform'],
   switch: ['current', 'program'], live: ['program'], folder: ['directory'], path: ['directory'], video: ['record', 'settings'],
   clip: ['replay'], delay: ['offset', 'sync'], track: ['tracks'], layer: ['index', 'order'], order: ['index'],
   rename: ['name'], delete: ['remove'], add: ['create'], make: ['create'], recording: ['record'],
-};
+}));
 
 const DOCS = CATALOGUE.map((e) => {
   const name = words(e.request).map(stem);
@@ -67,7 +68,7 @@ const AVG = DOCS.reduce((s, d) => s + d.len, 0) / DOCS.length;
 export function search(query: string, limit = 5): Entry[] {
   const base = words(query);
   const terms = new Set(base.map(stem));
-  for (const w of base) for (const s of SYNONYMS[w] ?? []) terms.add(stem(s));
+  for (const w of base) for (const s of SYNONYMS.get(w) ?? []) terms.add(stem(s));
   const N = DOCS.length;
   return DOCS.map((d) => {
     let s = 0;

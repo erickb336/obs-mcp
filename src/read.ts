@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { brief, checkFields, entry, readRule, READ_GUARDED, search } from './catalogue.js';
 import { Obs, ObsError } from './obs.js';
-import { redact, streamServiceView } from './redact.js';
+import { persistentView, redact, streamServiceView } from './redact.js';
 
 export type ReadResult = { ok: true; data: unknown } | { ok: false; refused: string; [k: string]: unknown };
 
@@ -15,7 +15,20 @@ export type ReadResult = { ok: true; data: unknown } | { ok: false; refused: str
  */
 export const CLEARED_LIST_ROWS = [{ os: 'macos', obsVersion: '33.0.1', inputKind: 'screen_capture', propertyName: 'type' }];
 
-const refuse = (refused: string, extra: Record<string, unknown> = {}): ReadResult => ({ ok: false, refused, ...extra });
+/**
+ * GetProfileParameter runs only on these (category, name) pairs. A profile also holds service tokens (for example
+ * RefreshToken) and output URLs with a stream key (for example FFURL), so any other pair is refused and not sent.
+ */
+export const SAFE_PROFILE_PARAMETERS = new Map(Object.entries({
+  Output: ['Mode'],
+  Video: ['BaseCX', 'BaseCY', 'OutputCX', 'OutputCY', 'FPSType', 'FPSCommon', 'FPSInt', 'FPSNum', 'FPSDen', 'ScaleType', 'ColorFormat', 'ColorSpace', 'ColorRange'],
+  Audio: ['SampleRate', 'ChannelSetup'],
+  SimpleOutput: ['FilePath', 'RecFormat2', 'RecQuality', 'RecEncoder', 'StreamEncoder', 'VBitrate', 'ABitrate', 'RecRB', 'RecRBTime', 'RecRBSize'],
+  AdvOut: ['RecType', 'RecFilePath', 'RecFormat2', 'RecEncoder', 'Encoder', 'RecTracks', 'TrackIndex', 'RecRB', 'RecRBTime', 'RecRBSize',
+    'Track1Bitrate', 'Track2Bitrate', 'Track3Bitrate', 'Track4Bitrate', 'Track5Bitrate', 'Track6Bitrate'],
+}));
+
+const refuse =(refused: string, extra: Record<string, unknown> = {}): ReadResult => ({ ok: false, refused, ...extra });
 
 export async function read(obs: Obs, request: string, params: Record<string, unknown> = {}): Promise<ReadResult> {
   const e = entry(request);
@@ -27,6 +40,14 @@ export async function read(obs: Obs, request: string, params: Record<string, unk
   if (e.class !== 'read' && !READ_GUARDED.has(e.request)) return refuse(`${e.request}: ${readRule(e)}. It was not sent.`);
   const bad = checkFields(e, params);
   if (bad) return refuse(`${e.request}: ${bad}. It was not sent.`, { fields: brief(e).fields });
+  if (e.request === 'GetProfileParameter') {
+    const { parameterCategory: c, parameterName: n } = params as Record<string, string>;
+    if (!SAFE_PROFILE_PARAMETERS.get(c)?.includes(n)) {
+      return refuse(`${e.request}: (${c}, ${n}) is not on the list of safe profile parameters, because a profile can hold tokens and stream keys. It was not sent.`, {
+        safe: Object.fromEntries(SAFE_PROFILE_PARAMETERS),
+      });
+    }
+  }
 
   try {
     const v = await obs.connect();
@@ -38,6 +59,7 @@ export async function read(obs: Obs, request: string, params: Record<string, unk
     const reply = await obs.call(e.request, params);
     if (e.request === 'GetStreamServiceSettings') return { ok: true, data: streamServiceView(reply) };
     if (e.request === 'GetSourceScreenshot') return { ok: true, data: saveScreenshot(reply, params) };
+    if (e.request === 'GetPersistentData') return { ok: true, data: persistentView(reply) };
     return { ok: true, data: redact(reply) };
   } catch (err) {
     if (err instanceof ObsError) return refuse(err.message);
@@ -47,6 +69,8 @@ export async function read(obs: Obs, request: string, params: Record<string, unk
 
 /** Returns why a list request must not run, or null. Reads the recording state just before, whoever started the recording. */
 async function listGuard(obs: Obs, params: Record<string, unknown>): Promise<string | null> {
+  // With both fields, the guard could clear one input while OBS resolves the other.
+  if (params.inputName !== undefined && params.inputUuid !== undefined) return 'give inputName or inputUuid, not both.';
   const status = await obs.call('GetRecordStatus');
   if (status.outputActive) return 'a recording is active, and a list request can crash OBS.';
   const input = params.inputUuid !== undefined ? { inputUuid: params.inputUuid } : { inputName: params.inputName };

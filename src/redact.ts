@@ -3,12 +3,12 @@
 const SECRET_KEY = /password|passwd|passphrase|secret|token|bearer|auth|cookie|credential|api_?key|stream_?key|^key$/i;
 const URL_LIKE = /^(https?|rtmps?|srt|rist|wss?):\/\//i;
 
-/** Cuts the user name, password, query and fragment from a URL, because each can hold a key. */
-export function cutUrl(s: string, keepPath = true): string {
+/** Keeps only the scheme and host of a URL. The user name, password, path, query and fragment can each hold a key. */
+export function cutUrl(s: string): string {
   try {
     const u = new URL(s);
-    const cut = !!(u.username || u.password || u.search || u.hash || (!keepPath && u.pathname.length > 1));
-    return `${u.protocol}//${u.host}${keepPath ? u.pathname : ''}${cut ? ' [cut]' : ''}`;
+    const cut = !!(u.username || u.password || u.search || u.hash || u.pathname.length > 1);
+    return `${u.protocol}//${u.host}${cut ? ' [cut]' : ''}`;
   } catch {
     return '[redacted]';
   }
@@ -27,10 +27,15 @@ export function redact(v: unknown, key = ''): unknown {
 const STREAM_FIELDS = ['service', 'server', 'protocol'];
 export function streamServiceView(reply: Record<string, unknown>) {
   const s = (reply.streamServiceSettings ?? {}) as Record<string, unknown>;
-  const kept = Object.fromEntries(
-    STREAM_FIELDS.filter((k) => typeof s[k] === 'string').map((k) => [k, k === 'server' && URL_LIKE.test(s[k] as string) ? cutUrl(s[k] as string, false) : s[k]]),
-  );
+  const kept = Object.fromEntries(STREAM_FIELDS.filter((k) => typeof s[k] === 'string').map((k) => [k, redact(s[k])]));
   return { streamServiceType: reply.streamServiceType, streamServiceSettings: kept, note: `Only these fields pass: ${STREAM_FIELDS.join(', ')}. Keys, passwords and user names never pass.` };
+}
+
+// GetPersistentData: scripts and plugins keep any value in a slot, tokens too. Only a number, a boolean or null passes.
+export function persistentView(reply: Record<string, unknown>) {
+  const v = reply.slotValue;
+  const safe = v === null || typeof v === 'number' || typeof v === 'boolean';
+  return { slotValue: safe ? v : '[redacted]', ...(safe ? {} : { note: `The slot holds a ${Array.isArray(v) ? 'array' : typeof v}. Only a number, a boolean or null passes, because a slot can hold a token.` }) };
 }
 
 const MAX_CHARS = 24000;

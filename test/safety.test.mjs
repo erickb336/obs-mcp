@@ -12,6 +12,7 @@ import { closedPort, connect, obsConfigDir, runDoctor, sampleParams, testEnv } f
 const CATALOGUE = JSON.parse(readFileSync(new URL('../dist/catalogue.json', import.meta.url), 'utf8'));
 const PASSWORD = 'fake-obs-password-K9w4';
 const STREAM_KEY = 'live_123456789_fakeStreamKeyK9w4';
+const TOKEN = 'fake-refresh-token-K9w4';
 
 // Patterns for a secret, not only the known values: a secret-named field with a value, a password argument,
 // a stream key in the form that services use, and a URL with a user name or a query.
@@ -20,20 +21,24 @@ const SECRET_PATTERNS = [
   /--websocket_password[ =]\S+/,
   /\blive_\d{6,}_[A-Za-z0-9]{8,}/,
   /\b[a-z]+:\/\/[^\s"/]*@/i,
-  /\b(rtmps?|https?|srt):\/\/[^\s"]*\?[^\s"]*/i,
+  /\b(rtmps?|https?|srt|rist):\/\/[^\s"]*\?[^\s"]*/i,
+  /\b(rtmps?|srt|rist):\/\/[^\s"/]+\/[^\s"]+/i,
 ];
-const leaks = (text) =>
-  [PASSWORD, STREAM_KEY].filter((v) => text.includes(v)).concat(SECRET_PATTERNS.map((p) => p.exec(text)?.[0]).filter(Boolean));
+const leaks = (text) => [
+  ...new Set([PASSWORD, STREAM_KEY, TOKEN].filter((v) => text.includes(v)).concat(SECRET_PATTERNS.map((p) => p.exec(text)?.[0]).filter(Boolean))),
+];
 
 test('the secret scan pattern finds a planted secret, so a pass below means something', () => {
   assert.deepEqual(leaks(`{"key":"abc","note":"x"}`), ['"key":"abc"']);
   assert.deepEqual(leaks(`run --websocket_password ${PASSWORD}`), [PASSWORD, `--websocket_password ${PASSWORD}`]);
   assert.deepEqual(leaks('key live_987654321_abcdefgh12 and rtmp://a.example/app?k=1'), ['live_987654321_abcdefgh12', 'rtmp://a.example/app?k=1']);
-  assert.deepEqual(leaks('live_requests_with_no_catalogue_row'), []);
+  assert.deepEqual(leaks('srt://h.example:9000?streamid=s1 rist://h.example/k2'), ['srt://h.example:9000?streamid=s1', 'rist://h.example/k2']);
+  assert.deepEqual(leaks(`"parameterValue":"${TOKEN}"`), [TOKEN]);
+  assert.deepEqual(leaks('live_requests_with_no_catalogue_row rtmp://live.example.com [cut]'), []);
 });
 
 test('no reply, server log or doctor output holds a password or a key (A8)', async () => {
-  const fake = await startFakeObs({ password: PASSWORD, streamKey: STREAM_KEY });
+  const fake = await startFakeObs({ password: PASSWORD, streamKey: STREAM_KEY, token: TOKEN });
   const dir = obsConfigDir({ server_enabled: true, server_port: fake.port, auth_required: true, server_password: PASSWORD });
   const env = testEnv(dir, fake.port);
   const s = await connect(env);
@@ -41,6 +46,10 @@ test('no reply, server log or doctor output holds a password or a key (A8)', asy
   await s.call('obs_find', { query: 'stream service settings key' });
   for (const e of CATALOGUE) await s.call('obs_read', { request: e.request, params: sampleParams(e) });
   await s.call('obs_read', { request: 'GetInputSettings', params: { inputName: 'Display' } });
+  for (const [parameterCategory, parameterName] of [['Twitch', 'RefreshToken'], ['AdvOut', 'FFURL'], ['Video', 'BaseCX']]) {
+    await s.call('obs_read', { request: 'GetProfileParameter', params: { parameterCategory, parameterName } });
+  }
+  await s.call('obs_read', { request: 'GetPersistentData', params: { realm: 'OBS_WEBSOCKET_DATA_REALM_PROFILE', slotName: 'auth' } });
   const argv = process.platform === 'win32' ? '' : execFileSync('ps', ['-o', 'args=', '-p', String(s.pid())], { encoding: 'utf8' });
   await s.close();
   const doctorRun = await runDoctor(env);
