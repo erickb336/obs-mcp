@@ -68,7 +68,14 @@ const DF = new Map<string, number>();
 for (const d of DOCS) for (const w of d.tf.keys()) DF.set(w, (DF.get(w) ?? 0) + 1);
 const AVG = DOCS.reduce((s, d) => s + d.len, 0) / DOCS.length;
 
+/**
+ * Ranks an exact request name first, then the requests that obs_read runs, then the rest. Within each rank, the
+ * score orders them. So "GetInputVolume" finds GetInputVolume before SetInputVolume, and a question about a state
+ * finds the read that answers it before the change and guarded requests with the same words.
+ */
 export function search(query: string, limit = 5): Entry[] {
+  const exact = query.replace(/\s+/g, '').toLowerCase();
+  const rank = (e: Entry) => (e.request.toLowerCase() === exact ? 2 : e.class === 'read' || READ_GUARDED.has(e.request) ? 1 : 0);
   const base = words(query);
   const terms = new Set(base.map(stem));
   for (const w of base) for (const s of SYNONYMS.get(w) ?? []) terms.add(stem(s));
@@ -81,10 +88,10 @@ export function search(query: string, limit = 5): Entry[] {
       const df = DF.get(t)!;
       s += (Math.log(1 + (N - df + 0.5) / (df + 0.5)) * f * 2.2) / (f + 1.2 * (0.25 + (0.75 * d.len) / AVG));
     }
-    return { e: d.e, s };
+    return { e: d.e, s, r: rank(d.e) };
   })
     .filter((x) => x.s > 0)
-    .sort((a, b) => b.s - a.s)
+    .sort((a, b) => b.r - a.r || b.s - a.s)
     .slice(0, limit)
     .map((x) => x.e);
 }
