@@ -14,15 +14,26 @@ import { connect, obsConfigDir, testEnv } from '../test/helpers.mjs';
 
 const TARGET_MS = 20;
 const READS = ['GetVersion', 'GetStats', 'GetRecordStatus', 'GetSceneList', 'GetInputList'];
-const { values } = parseArgs({ options: { url: { type: 'string' }, count: { type: 'string', default: '500' }, warmup: { type: 'string', default: '50' } } });
+const fail = (message) => {
+  console.error(`timing-loop: ${message}`);
+  process.exit(1);
+};
+let values;
+try {
+  values = parseArgs({ options: { url: { type: 'string' }, count: { type: 'string', default: '500' }, warmup: { type: 'string', default: '50' } } }).values;
+} catch {
+  fail('unknown argument. Options: --url, --count, --warmup.');
+}
 const count = Number(values.count);
 const warmup = Number(values.warmup);
+if (!Number.isInteger(count) || count < 1) fail('--count must be a whole number of 1 or more.');
+if (!Number.isInteger(warmup) || warmup < 0) fail('--warmup must be a whole number of 0 or more.');
 
 let port;
 let fake;
 if (values.url) {
-  const u = new URL(values.url);
-  if (u.protocol !== 'ws:' || u.hostname !== '127.0.0.1') throw new Error('The URL must be ws://127.0.0.1:<port>: the server connects to loopback only.');
+  const u = URL.canParse(values.url) ? new URL(values.url) : undefined;
+  if (u?.protocol !== 'ws:' || u.hostname !== '127.0.0.1') fail('the URL must be ws://127.0.0.1:<port>: the server connects to loopback only.');
   port = Number(u.port || 4455);
 } else {
   fake = await startFakeObs();
@@ -30,9 +41,14 @@ if (values.url) {
 }
 const password = values.url ? process.env.OBS_WEBSOCKET_PASSWORD : undefined;
 const env = testEnv(obsConfigDir(null), port, password ? { OBS_WEBSOCKET_PASSWORD: password } : {});
-const server = await connect(env);
+// The direct socket connects first, so that a closed port or a wrong password ends here with the reason.
 const direct = new OBSWebSocket();
-await direct.connect(`ws://127.0.0.1:${port}`, password);
+try {
+  await direct.connect(`ws://127.0.0.1:${port}`, password);
+} catch (e) {
+  fail(`no connection to OBS on 127.0.0.1:${port}: ${e.message || `close code ${e.code}`}.`);
+}
+const server = await connect(env);
 
 const time = async (fn) => {
   const t = performance.now();
@@ -44,13 +60,18 @@ const viaServer = async (request) => {
   if (r.isError) throw new Error(`${request}: ${r.text}`);
 };
 const rows = [];
-for (let i = 0; i < warmup + count; i++) {
-  const request = READS[i % READS.length];
-  const row = {};
-  for (const path of i % 2 ? ['server', 'direct'] : ['direct', 'server']) {
-    row[path] = await time(() => (path === 'server' ? viaServer(request) : direct.call(request)));
+try {
+  for (let i = 0; i < warmup + count; i++) {
+    const request = READS[i % READS.length];
+    const row = {};
+    for (const path of i % 2 ? ['server', 'direct'] : ['direct', 'server']) {
+      row[path] = await time(() => (path === 'server' ? viaServer(request) : direct.call(request)));
+    }
+    if (i >= warmup) rows.push(row);
   }
-  if (i >= warmup) rows.push(row);
+} catch (e) {
+  await server.close();
+  fail(`a timed request failed: ${e.message}`);
 }
 await direct.disconnect();
 await server.close();
