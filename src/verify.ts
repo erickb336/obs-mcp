@@ -1,6 +1,6 @@
 // The file check: what a saved recording holds, per audio track and over the full timeline.
 // It only reads. It never changes, moves or deletes the file, whatever the result.
-// ffprobe gives the streams and their durations. One ffmpeg pass gives, for each audio track, its level (astats) and
+// ffprobe gives the streams and their durations. One ffmpeg pass on each audio track gives its level (astats) and
 // every silent interval (silencedetect). Without ffmpeg, afinfo (macOS) gives the tracks, and the sound is not checked.
 // The file path, the expected sources and every line that ffmpeg prints are untrusted input.
 import { spawn } from 'node:child_process';
@@ -80,7 +80,7 @@ function checkExpect(expect: Expected[]) {
 }
 
 /** Runs a tool with an argument array, never a shell, with a time limit and an output limit. */
-function run(cmd: string, args: string[], timeoutMs: number): Promise<{ code: number | null; out: string; err: string; stopped?: string }> {
+function run(cmd: string, args: string[], timeoutMs: number, limitS = timeoutMs / 1000): Promise<{ code: number | null; out: string; err: string; stopped?: string }> {
   return new Promise((resolve) => {
     const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
     const out: Buffer[] = [];
@@ -96,7 +96,7 @@ function run(cmd: string, args: string[], timeoutMs: number): Promise<{ code: nu
       child.stderr.destroy();
       finish(null);
     };
-    const timer = setTimeout(() => stop(`it ran longer than ${timeoutMs / 1000} s (OBS_MCP_VERIFY_TIMEOUT_S)`), timeoutMs);
+    const timer = setTimeout(() => stop(`the check passed its time limit of ${limitS} s (OBS_MCP_VERIFY_TIMEOUT_S)`), timeoutMs);
     const keep = (to: Buffer[]) => (d: Buffer) => {
       bytes += d.length;
       if (bytes > MAX_OUTPUT) stop(`its output passed ${MAX_OUTPUT} bytes`);
@@ -135,17 +135,21 @@ export function parseProbe(json: string): Probe {
   };
 }
 
-/** What one ffmpeg pass says about each track (1-based): level, decoded samples and silent intervals; and the error lines. */
-export type Log = { tracks: Map<number, { peakDb?: number; rmsDb?: number; samples?: number; silences: { start: number; end?: number }[] }>; errors: string[] };
+/** What the ffmpeg pass of one track says: level, decoded samples and silent intervals. */
+export type TrackLog = { peakDb?: number; rmsDb?: number; samples?: number; silences: { start: number; end?: number }[] };
 
 const db = (s: string) => (s.trim() === '-inf' ? -Infinity : num(s.trim()));
 
-/** Parses the stderr of the ffmpeg pass of verifyFile: filters named astats@tN and silencedetect@tN, one pair for track N. */
-export function parseLog(text: string, file = ''): Log {
-  const tracks: Log['tracks'] = new Map();
+/**
+ * Parses the stderr of the ffmpeg pass of one track, with the astats and silencedetect filters. The line prefix differs
+ * by version: "[silencedetect @ 0x..]" in ffmpeg 8, "[Parsed_silencedetect_1 @ 0x..]" or the instance name in ffmpeg 9.
+ * So each track has its own pass, and a line counts by its filter name only.
+ */
+export function parseLog(text: string, file = ''): { track: TrackLog; errors: string[] } {
+  const t: TrackLog = { silences: [] };
   const errors: string[] = [];
   for (const line of text.split(/\r?\n/)) {
-    const m = /^\[(astats|silencedetect)@t(\d+) @ [^\]]*\] (.*)$/.exec(line);
+    const m = /^\[(?:Parsed_)?(astats|silencedetect)[^\] ]* @ [^\]]*\] (.*)$/.exec(line);
     if (!m) {
       // ffmpeg starts an error line with "[" or "Error"; metadata from the file is indented, so a tag text never counts.
       // The test reads the line without the file path, so that a file name such as "truncated.mov" is not an error.
@@ -154,13 +158,10 @@ export function parseLog(text: string, file = ''): Log {
       if (/^(\[|Error)/.test(line) && /error|invalid|corrupt|partial file|truncat|moov atom|missing/i.test(bare) && errors.length < 5) errors.push(line.replace(/ @ 0x[0-9a-f]+/gi, '').split(file || '\0').join(basename(file)).slice(0, 200));
       continue;
     }
-    const n = Number(m[2]);
-    const t = tracks.get(n) ?? { silences: [] };
-    tracks.set(n, t);
-    const kv = /^([^:]+): (.*)$/.exec(m[3]);
+    const kv = /^([^:]+): (.*)$/.exec(m[2]);
     if (m[1] === 'silencedetect') {
-      const start = /^silence_start: (\S+)/.exec(m[3]);
-      const end = /^silence_end: (\S+)/.exec(m[3]);
+      const start = /^silence_start: (\S+)/.exec(m[2]);
+      const end = /^silence_end: (\S+)/.exec(m[2]);
       if (start && num(start[1]) !== undefined) t.silences.push({ start: Number(start[1]) });
       else if (end && num(end[1]) !== undefined) {
         const open = t.silences.at(-1);
@@ -172,7 +173,7 @@ export function parseLog(text: string, file = ''): Log {
       if (kv[1] === 'Number of samples') t.samples = num(kv[2]);
     }
   }
-  return { tracks, errors };
+  return { track: t, errors };
 }
 
 /** One audio track, measured: its end on the timeline, its levels and its silent intervals over the full timeline. */
@@ -205,10 +206,10 @@ function intersect(a: Interval[], b: Interval[]): Interval[] {
 }
 
 /** Puts the probe and the ffmpeg log together, per track, on the timeline of the container. */
-export function measure(probe: Probe, log: Log): Measure[] {
+export function measure(probe: Probe, logs: TrackLog[]): Measure[] {
   const duration = probe.durationS ?? 0;
   return probe.audio.map((a, i) => {
-    const t = log.tracks.get(i + 1) ?? { silences: [] };
+    const t = logs[i] ?? { silences: [] };
     const start = a.startS && a.startS > 0 ? a.startS : 0;
     const decoded = t.samples !== undefined && a.sampleRate ? t.samples / a.sampleRate : (a.durationS ?? duration);
     const endS = Math.min(duration, start + decoded);
@@ -340,19 +341,27 @@ export async function verifyFile(path: string, name: string, expect: Expected[] 
   const fileFacts = [`Duration ${timecode(duration)}`, `${n} audio track${n === 1 ? '' : 's'}`, probe.video ? 'a video stream' : 'no video stream'];
   const fileProblems: string[] = [];
   if (n) {
+    // One pass per track, one after another, all within one time limit: see parseLog for why a pass holds one track.
     const d = Math.min(...Object.values(limits.gap).map((g) => g.warn), MIN_SOUND_S);
-    const graph = probe.audio.map((_, i) => `[0:a:${i}]astats@t${i + 1}=metadata=0:measure_perchannel=none,silencedetect@t${i + 1}=noise=${limits.silenceDb}dB:d=${d}[o${i + 1}]`).join(';');
-    const maps = probe.audio.flatMap((_, i) => ['-map', `[o${i + 1}]`]);
-    const f = await run(tools.ffmpeg, ['-hide_banner', '-nostdin', '-nostats', '-protocol_whitelist', 'file', '-i', input, '-filter_complex', graph, ...maps, '-f', 'null', '-'], timeoutMs);
-    const log = parseLog(f.err, path);
-    measures = measure(probe, log);
-    if (f.stopped || f.code !== 0) {
-      soundChecked = false;
-      fileProblems.push(f.stopped ? `ffmpeg stopped: ${f.stopped}` : `ffmpeg exit code ${f.code}: ${log.errors.join(' | ') || clean(f.err.split('\n').slice(-4).join('\n'))}`);
-    } else {
+    const deadline = Date.now() + timeoutMs;
+    const logs: TrackLog[] = [];
+    const errors: string[] = [];
+    for (let i = 0; i < n && soundChecked; i++) {
+      const filter = `astats=metadata=0:measure_perchannel=none,silencedetect=noise=${limits.silenceDb}dB:d=${d}`;
+      const f = await run(tools.ffmpeg, ['-hide_banner', '-nostdin', '-nostats', '-protocol_whitelist', 'file', '-i', input, '-map', `0:a:${i}`, '-af', filter, '-f', 'null', '-'], Math.max(1, deadline - Date.now()), limits.timeoutS);
+      const log = parseLog(f.err, path);
+      logs.push(log.track);
+      for (const e of log.errors) if (errors.length < 5 && !errors.includes(e)) errors.push(e);
+      if (f.stopped || f.code !== 0) {
+        soundChecked = false;
+        fileProblems.push(f.stopped ? `ffmpeg stopped on track ${i + 1}: ${f.stopped}` : `ffmpeg exit code ${f.code} on track ${i + 1}: ${log.errors.join(' | ') || clean(f.err.split('\n').slice(-4).join('\n'))}`);
+      }
+    }
+    measures = measure(probe, logs);
+    if (soundChecked) {
       const short = measures.filter((m) => m.declaredS !== undefined && m.declaredS - (m.endS - (probe!.audio[m.track - 1].startS ?? 0)) >= 1);
       for (const m of short) fileProblems.push(`Track ${m.track} says ${m.declaredS!.toFixed(1)} s, but its audio data ends at ${timecode(m.endS)}`);
-      if (log.errors.length) fileProblems.push(`ffmpeg reported: ${log.errors.join(' | ')}`);
+      if (errors.length) fileProblems.push(`ffmpeg reported: ${errors.join(' | ')}`);
     }
   }
   claims.push({

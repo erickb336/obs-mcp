@@ -2,7 +2,6 @@
 // settings. Part 2 runs ffmpeg on SIMULATED files that test/fixtures.mjs makes; it skips, with the reason, when ffmpeg
 // is not on PATH. No file here comes from OBS: the real-file test is test/real-files.test.mjs, and it is opt-in.
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -14,22 +13,30 @@ import { startFakeObs } from './fake-obs.mjs';
 import { FFMPEG_VERSION, makeFixtures, SKIP } from './fixtures.mjs';
 import { closedPort, connect, obsConfigDir, testEnv } from './helpers.mjs';
 
-// Captured from ffmpeg 9.0.2 on a SIMULATED 60 s file: track 1 has sound, track 2 goes silent at 25 s and stays
-// silent to the end, so silencedetect gives the end at the end of the file. Addresses are as ffmpeg prints them.
-const LOG_9 = `Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'file:/rec/take.mov':
+// Captured on SIMULATED 60 s files, one ffmpeg pass per track. Track 1 has sound. Track 2 goes silent at 25 s and
+// stays silent to the end, so silencedetect gives the end at the end of the file. ffmpeg 9.0.2 names the filter
+// "Parsed_silencedetect_1"; ffmpeg 8.0.1 (Ubuntu 26.04, captured in CI) gives only "silencedetect". Addresses as printed.
+const TRACK_1_FFMPEG_9 = `Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'file:/rec/take.mov':
   Metadata:
     title           : an error in the title is not an error line
 Stream mapping:
-[silencedetect@t2 @ 0x76630212c0] silence_start: 25.0
-[astats@t1 @ 0x7663021200] Peak level dB: -6.020600
-[astats@t1 @ 0x7663021200] RMS level dB: -9.031275
-[astats@t1 @ 0x7663021200] Number of samples: 2880000
-[silencedetect@t2 @ 0x7663021440] silence_end: 60 | silence_duration: 35
-[astats@t2 @ 0x7663021380] Peak level dB: -31.500000
-[astats@t2 @ 0x7663021380] RMS level dB: -40.100000
-[astats@t2 @ 0x7663021380] Number of samples: 2880000
+[Parsed_astats_0 @ 0x7663021200] Overall
+[Parsed_astats_0 @ 0x7663021200] Peak level dB: -6.020600
+[Parsed_astats_0 @ 0x7663021200] RMS level dB: -9.031275
+[Parsed_astats_0 @ 0x7663021200] Number of samples: 2880000
 [out#0/null @ 0x78b1048600] video:0KiB audio:2816KiB subtitle:0KiB other streams:0KiB global headers:0KiB muxing overhead: unknown
 `;
+const TRACK_2_FFMPEG_8 = `Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'file:/rec/take.mov':
+Stream mapping:
+Output #0, null, to 'pipe:':
+[silencedetect @ 0x7700b00026c0] silence_start: 25.000854
+[silencedetect @ 0x7700b00026c0] silence_end: 60 | silence_duration: 34.999146
+[Parsed_astats_0 @ 0x7700b0002340] Overall
+[Parsed_astats_0 @ 0x7700b0002340] Peak level dB: -31.500000
+[Parsed_astats_0 @ 0x7700b0002340] RMS level dB: -40.100000
+[Parsed_astats_0 @ 0x7700b0002340] Number of samples: 2880000
+`;
+const LOGS = [parseLog(TRACK_1_FFMPEG_9, '/rec/take.mov').track, parseLog(TRACK_2_FFMPEG_8, '/rec/take.mov').track];
 const PROBE_60 = JSON.stringify({
   streams: [
     { codec_type: 'video', duration: '60.000000', start_time: '0.000000' },
@@ -42,17 +49,17 @@ const limits = limitsFrom({});
 const verdicts = (claims) => Object.fromEntries(claims.map((c) => [c.claim, c.verdict]));
 
 describe('parser and rules, on captured ffmpeg text (no ffmpeg needed)', () => {
-  test('parseLog reads level, samples and silent intervals per track, and ignores a metadata line that says "error"', () => {
-    const log = parseLog(LOG_9, '/rec/take.mov');
-    assert.deepEqual(log.tracks.get(1), { silences: [], peakDb: -6.0206, rmsDb: -9.031275, samples: 2880000 });
-    assert.deepEqual(log.tracks.get(2), { silences: [{ start: 25, end: 60 }], peakDb: -31.5, rmsDb: -40.1, samples: 2880000 });
-    assert.deepEqual(log.errors, []);
+  test('parseLog reads level, samples and silent intervals in the ffmpeg 9 and 8 formats, and ignores a metadata line that says "error"', () => {
+    assert.deepEqual(parseLog(TRACK_1_FFMPEG_9, '/rec/take.mov'), { track: { silences: [], peakDb: -6.0206, rmsDb: -9.031275, samples: 2880000 }, errors: [] });
+    assert.deepEqual(parseLog(TRACK_2_FFMPEG_8, '/rec/take.mov'), { track: { silences: [{ start: 25.000854, end: 60 }], peakDb: -31.5, rmsDb: -40.1, samples: 2880000 }, errors: [] });
+    // The instance-name format of ffmpeg 9.
+    assert.deepEqual(parseLog('[silencedetect@t1 @ 0x1] silence_start: 3\n').track.silences, [{ start: 3 }]);
   });
 
   test('a dropout that the overall peak does not show fails a voice, with the timecode of the gap', () => {
     // This is the case in the design: track 2 peak -31.5 dB looks fine, and the track is silent from 25 s to 60 s.
     const probe = parseProbe(PROBE_60);
-    const claims = judge(probe, measure(probe, parseLog(LOG_9)), [{ name: 'Remote', kind: 'voice', track: 2 }], limits);
+    const claims = judge(probe, measure(probe, LOGS), [{ name: 'Remote', kind: 'voice', track: 2 }], limits);
     const remote = claims.find((c) => c.claim === 'Source "Remote" (voice) has sound on track 2');
     assert.equal(remote.verdict, 'fail');
     assert.deepEqual(remote.gaps, [{ from: '00:00:25.0', to: '00:01:00.0', seconds: 35, why: 'silent' }]);
@@ -61,27 +68,28 @@ describe('parser and rules, on captured ffmpeg text (no ffmpeg needed)', () => {
 
   test('a silence with no end in the log ends where the track ends; a track that ends early leaves "no audio data"', () => {
     const probe = parseProbe(JSON.stringify({ streams: [{ codec_type: 'audio', sample_rate: '48000', duration: '20' }], format: { duration: '30' } }));
-    const log = parseLog('[silencedetect@t1 @ 0x1] silence_start: 15\n[astats@t1 @ 0x2] Number of samples: 960000\n[astats@t1 @ 0x2] Peak level dB: -10\n');
-    const [m] = measure(probe, log);
+    const log = parseLog('[silencedetect @ 0x1] silence_start: 15\n[Parsed_astats_0 @ 0x2] Number of samples: 960000\n[Parsed_astats_0 @ 0x2] Peak level dB: -10\n');
+    const [m] = measure(probe, [log.track]);
     assert.deepEqual(m.silences, [{ start: 15, end: 30, why: 'no audio data' }]);
     assert.equal(m.soundS, 15);
   });
 
   test('a backup track with sound turns a silent source into a warning that names the backup', () => {
     const probe = parseProbe(PROBE_60);
-    const log = parseLog('[silencedetect@t1 @ 0x1] silence_start: 0\n[silencedetect@t1 @ 0x1] silence_end: 60 | silence_duration: 60\n[astats@t2 @ 0x2] Peak level dB: -20\n');
-    const [own] = judge(probe, measure(probe, log), [{ name: 'Remote', kind: 'voice', track: 1, backup: 2 }], limits);
+    const silent = parseLog('[silencedetect @ 0x1] silence_start: 0\n[silencedetect @ 0x1] silence_end: 60 | silence_duration: 60\n').track;
+    const sound = parseLog('[Parsed_astats_0 @ 0x2] Peak level dB: -20\n').track;
+    const [own] = judge(probe, measure(probe, [silent, sound]), [{ name: 'Remote', kind: 'voice', track: 1, backup: 2 }], limits);
     assert.equal(own.verdict, 'warn');
     assert.match(own.evidence, /^Track 1 fails alone, and backup track 2 has sound there/);
     // Both silent: the backup does not save it.
-    const both = parseLog('[silencedetect@t1 @ 0x1] silence_start: 0\n[silencedetect@t2 @ 0x1] silence_start: 0\n');
-    assert.equal(judge(probe, measure(probe, both), [{ name: 'Remote', kind: 'voice', track: 1, backup: 2 }], limits)[0].verdict, 'fail');
+    const open = parseLog('[silencedetect @ 0x1] silence_start: 0\n').track;
+    assert.equal(judge(probe, measure(probe, [open, open]), [{ name: 'Remote', kind: 'voice', track: 1, backup: 2 }], limits)[0].verdict, 'fail');
   });
 
   test('kinds: a 3 s gap fails continuous, warns nothing for voice, and any needs only some sound', () => {
     const probe = parseProbe(JSON.stringify({ streams: [{ codec_type: 'audio', sample_rate: '48000', duration: '60' }], format: { duration: '60' } }));
-    const log = parseLog('[silencedetect@t1 @ 0x1] silence_start: 10\n[silencedetect@t1 @ 0x1] silence_end: 13 | silence_duration: 3\n[astats@t1 @ 0x2] Peak level dB: -20\n');
-    const m = measure(probe, log);
+    const log = parseLog('[silencedetect @ 0x1] silence_start: 10\n[silencedetect @ 0x1] silence_end: 13 | silence_duration: 3\n[Parsed_astats_0 @ 0x2] Peak level dB: -20\n');
+    const m = measure(probe, [log.track]);
     const v = (kind) => judge(probe, m, [{ name: 'S', kind, track: 1 }], limits)[0].verdict;
     assert.deepEqual([v('continuous'), v('voice'), v('any')], ['fail', 'pass', 'pass']);
   });
@@ -116,7 +124,7 @@ test('a tool that hangs or floods its output is stopped, and the result is not_c
   const file = join(mkdtempSync(join(tmpdir(), 'obs-mcp-take-')), 'take.mov');
   writeFileSync(file, 'x');
   const hang = await verifyFile(file, 'take.mov', [], { OBS_MCP_FFMPEG: tool('sleep 30'), OBS_MCP_VERIFY_TIMEOUT_S: '1' });
-  assert.deepEqual([hang.state, hang.claims[0].evidence], ['not_checked', 'ffprobe stopped: it ran longer than 1 s (OBS_MCP_VERIFY_TIMEOUT_S). Nothing in the file was checked.']);
+  assert.deepEqual([hang.state, hang.claims[0].evidence], ['not_checked', 'ffprobe stopped: the check passed its time limit of 1 s (OBS_MCP_VERIFY_TIMEOUT_S). Nothing in the file was checked.']);
   const flood = await verifyFile(file, 'take.mov', [], { OBS_MCP_FFMPEG: tool('yes | head -c 40000000') });
   assert.deepEqual([flood.state, flood.claims[0].evidence], ['not_checked', 'ffprobe stopped: its output passed 33554432 bytes. Nothing in the file was checked.']);
 });
@@ -157,10 +165,6 @@ describe('SIMULATED files made by ffmpeg', { skip: SKIP }, () => {
   console.log(`SIMULATED fixtures made and checked with ${FFMPEG_VERSION}`);
   const { f } = makeFixtures();
   const check = (key, expect) => verifyFile(f[key], key, expect);
-  if (process.env.CI) {
-    const r = spawnSync(audioTools().ffmpeg, ['-hide_banner', '-nostdin', '-nostats', '-i', f.gap, '-filter_complex', '[0:a:0]astats@t1=metadata=0:measure_perchannel=none,silencedetect@t1=noise=-50dB:d=0.5[o1]', '-map', '[o1]', '-f', 'null', '-'], { encoding: 'utf8' });
-    console.log(`DEBUG-CI stderr:\n${r.stderr.split('\n').filter((l) => !/^\s/.test(l)).join('\n').slice(0, 4000)}`);
-  }
 
   test('SIMULATED healthy file with 2 tracks: verified, with each track and the video measured', async () => {
     const r = await check('healthy', [{ name: 'Mic', kind: 'voice', track: 1 }, { name: 'Music', kind: 'continuous', track: 2 }]);
