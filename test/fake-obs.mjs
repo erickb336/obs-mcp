@@ -16,7 +16,7 @@ const sample = (type) => (type.startsWith('Array') ? [] : SAMPLE[type]);
  * options: password, recording (bool), streaming (bool), port (default: any free port), platform, obsVersion, inputs ({name: kind}), streamKey, token, crashOn (request name),
  * outputs (the GetOutputList items; by default four outputs, record and stream active when recording and streaming are on),
  * silentOn (request names that never get an answer), failOn (request names that get a failed status),
- * plant (bool: see plantReply below; each planted secret is listed in `planted` as { secret, field }).
+ * recordDirectory (the GetRecordDirectory folder), plant (bool: see plantReply below; each planted secret is listed in `planted` as { secret, field }).
  * Each input has the UUID "uuid-<name>". Like OBS, the fake resolves inputName first and inputUuid only when no name is given.
  * Returns { port, log, sent, planted, connections, close() }. log holds every request type that reached the fake, in order;
  * sent holds { requestType, requestData } for each; connections() is the count of WebSocket connections that the fake accepted.
@@ -77,6 +77,8 @@ export async function startFakeObs(options = {}) {
         return { inputs: Object.entries(o.inputs).map(([inputName, inputKind]) => ({ inputName, inputUuid: `uuid-${inputName}`, inputKind, unversionedInputKind: inputKind, inputKindCaps: 0 })) };
       case 'GetVersion':
         return { obsVersion: o.obsVersion, obsWebSocketVersion: '5.7.6', rpcVersion: 1, availableRequests: [...DOCUMENTED.keys(), ...PRIVATE_REQUESTS], supportedImageFormats: ['png', 'jpg'], platform: o.platform, platformDescription: `${o.platform} (simulated)` };
+      case 'GetRecordDirectory':
+        return { recordDirectory: o.recordDirectory ?? 'sample' };
       case 'GetRecordStatus':
         return { outputActive: !!o.recording, outputPaused: false, outputTimecode: '00:00:00.000', outputDuration: 0, outputBytes: 0 };
       case 'GetStreamStatus':

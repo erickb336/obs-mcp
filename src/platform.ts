@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, readdirSync, readlinkSync, statSync, readFileSync } from 'node:fs';
 import type { Listener } from './obs.js';
 import { homedir } from 'node:os';
-import { basename, join, delimiter, isAbsolute, win32 } from 'node:path';
+import { basename, dirname, join, delimiter, isAbsolute, win32 } from 'node:path';
 
 const OS = process.platform;
 /**
@@ -43,6 +43,16 @@ const isFile = (p: string) => {
 /** A file named name in a folder of PATH. An empty PATH segment (the current folder) never counts, and a folder is not a program. */
 export function onPath(env: NodeJS.ProcessEnv, name: string): string | undefined {
   return (env.PATH ?? '').split(delimiter).filter((d) => isAbsolute(d)).map((d) => join(d, name)).find(isFile);
+}
+
+/** The audio tools of the file check. OBS_MCP_FFMPEG names ffmpeg, with ffprobe beside it; otherwise both come from PATH. afinfo is a macOS fallback. */
+export function audioTools(env: NodeJS.ProcessEnv = process.env, os: string = OS): { ffmpeg?: string; ffprobe?: string; afinfo?: string; install: string } {
+  const exe = (n: string) => (os === 'win32' ? `${n}.exe` : n);
+  const set = env.OBS_MCP_FFMPEG;
+  const ffmpeg = set ? (isAbsolute(set) && isFile(set) ? set : undefined) : onPath(env, exe('ffmpeg'));
+  const ffprobe = set ? [join(dirname(set), exe('ffprobe'))].find((p) => ffmpeg && isFile(p)) : onPath(env, exe('ffprobe'));
+  const install = os === 'darwin' ? 'brew install ffmpeg' : os === 'win32' ? 'winget install --id Gyan.FFmpeg' : 'Install the ffmpeg package of your distribution, for example: sudo apt install ffmpeg';
+  return { ffmpeg, ffprobe, afinfo: os === 'darwin' ? onPath(env, 'afinfo') : undefined, install };
 }
 
 /** Where OBS is installed, by discovery. Returns null when no install is found. os is a parameter for tests. */

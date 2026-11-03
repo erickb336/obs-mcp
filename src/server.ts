@@ -1,4 +1,4 @@
-// The MCP server: three read-only tools over stdio. The process opens no listening socket.
+// The MCP server: four read-only tools over stdio. The process opens no listening socket.
 import { McpServer } from '@modelcontextprotocol/server';
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
 import { fileURLToPath } from 'node:url';
@@ -8,6 +8,7 @@ import { connectionTarget, listenerCheck, Obs, ObsError, SETTINGS_FILE_FIX } fro
 import { listeners, obsConfigDir } from './platform.js';
 import { deleteScreenshots, read } from './read.js';
 import { capped } from './redact.js';
+import { resolveInFolder, verifyFile, VerifyError, visible } from './verify.js';
 
 export const VERSION = '0.0.0';
 const READ_ONLY = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
@@ -97,7 +98,53 @@ function createServer() {
       return r.ok ? text({ note: UNTRUSTED, request, data: r.data }) : text(r, true);
     },
   );
+  server.registerTool(
+    'obs_verify_file',
+    {
+      description:
+        'Check a saved recording in the OBS recording folder: each audio track has sound, every silent gap with its timecode, video, and a cut-short file. Optional expect names the source on each track. A track number counts the audio tracks in the file: track 1 is the first audio track in the file, not OBS track 1, because OBS writes only the tracks that are on. Reads only: never changes or deletes the file.',
+      inputSchema: z.object({
+        path: z.string().max(4096).describe('File name in the recording folder, or a full path inside it'),
+        expect: z
+          .array(
+            z.object({
+              name: z.string().min(1).max(100),
+              kind: z.enum(['voice', 'continuous', 'any']).describe('voice allows pauses; continuous allows almost no gap; any needs some sound'),
+              track: z.number().int().min(1).max(64).describe('The Nth audio track in the file; OBS writes only the tracks that are on'),
+              backup: z.number().int().min(1).max(64).optional().describe('Another track that holds the same source'),
+            }),
+          )
+          .max(64)
+          .optional(),
+      }),
+      annotations: READ_ONLY,
+    },
+    async ({ path, expect }) => {
+      // A name from the folder or from the input can hold an invisible character: the reply and each error show it escaped.
+      try {
+        const file = resolveInFolder(await recordingFolder(), path);
+        return text(visible(await verifyFile(file.path, file.name, expect)));
+      } catch (e) {
+        if (e instanceof VerifyError) return text({ problem: visible(e.message) }, true);
+        if (e instanceof Error) e.message = visible(e.message);
+        throw e;
+      }
+    },
+  );
   return server;
+}
+
+/** The recording folder: OBS_MCP_RECORDING_DIR when set, otherwise the folder that OBS records to. */
+async function recordingFolder(): Promise<string> {
+  if (process.env.OBS_MCP_RECORDING_DIR) return process.env.OBS_MCP_RECORDING_DIR;
+  try {
+    const dir = (await obs.call('GetRecordDirectory')).recordDirectory;
+    if (typeof dir === 'string' && dir) return dir;
+  } catch (e) {
+    if (!(e instanceof ObsError)) throw e;
+    throw new VerifyError(`The recording folder comes from OBS, and OBS gave no answer: ${e.message} Open OBS, or set OBS_MCP_RECORDING_DIR.`);
+  }
+  throw new VerifyError('OBS gave no recording folder. Set OBS_MCP_RECORDING_DIR.');
 }
 
 export function startServer() {

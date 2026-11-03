@@ -12,14 +12,14 @@ Contents: [Quick start](#quick-start) · [Usage](#usage) · [Tools](#tools) · [
 
 ```mermaid
 flowchart LR
-  A[MCP client] -- stdio --> S[obs-mcp<br/>obs_status, obs_find, obs_read]
+  A[MCP client] -- stdio --> S[obs-mcp<br/>obs_status, obs_find, obs_read, obs_verify_file]
   S -- reads only, 127.0.0.1 --> O[OBS + obs-websocket 5]
   S -. refuses changes, guarded and unknown requests .-> X[not sent]
 ```
 
 ## Quick start
 
-You need Node 22 or newer, git, and OBS Studio 30 or newer (obs-websocket 5 is part of OBS).
+You need Node 22 or newer, git, and OBS Studio 30 or newer (obs-websocket 5 is part of OBS). The file check also needs ffmpeg; without it, the check says "Sound not checked".
 
 > **Not yet published.** obs-mcp is not on npm yet, so you run it from a clone.
 
@@ -64,19 +64,57 @@ Ask your agent in plain words. Examples:
 | "Is OBS recording?" | `obs_status`, or `obs_find` "is OBS recording", which gives `GetRecordStatus` first | Connection, versions, recording and stream state, scene, profile, listener exposure |
 | "What is the volume of my mic?" | `obs_find` "input volume", then `obs_read` `GetInputVolume` | The fader value of that input |
 | "Show me the scene list" | `obs_read` `GetSceneList` | The scenes and the current program scene |
+| "Did my last recording get both voices?" | `obs_verify_file` with the file name, and the expected sources: for example the mic on track 1 and the call on track 2 | One verdict per source, with the timecode of each silent gap |
 | "Stop the recording" | `obs_find` shows `StopRecord` as guarded | A refusal. 0.0 never sends it. |
 
 With OBS closed, `obs_status` answers with the problem and the next step, for example: "No answer from OBS on 127.0.0.1:4455. OBS is closed, its WebSocket server is off, or it uses another port."
 
 ## Tools
 
-The list has 3 tools. Its size is about 420 tokens (method: compact JSON of `tools/list`, counted with cl100k_base through js-tiktoken 1.0.21, an approximation; target: 1,200 or fewer; a test checks it).
+The list has 4 tools. Its size is about 690 tokens (method: compact JSON of `tools/list`, counted with cl100k_base through js-tiktoken 1.0.21, an approximation; target: 1,200 or fewer; a test checks it).
 
 | Tool | What it does | Effect |
 | --- | --- | --- |
 | `obs_status` | Connection, OBS and obs-websocket versions, recording and stream state, scene, profile, scene collection, listener exposure, and live requests with no catalogue row. Works with OBS closed. | Read |
 | `obs_find` | Searches the catalogue of 147 documented requests by words. An exact request name comes first, then the requests that `obs_read` runs, then the rest. Returns exact names, the effect, the fields, and whether `obs_read` runs each one. | Read |
 | `obs_read` | Runs one read request, or one of the 3 guarded reads behind its check. Checks the fields first: one of a name and UUID pair (for example `inputName` or `inputUuid`) is required, and a text value has 1,000 characters or fewer. | Read |
+| `obs_verify_file` | Checks a saved recording in the recording folder: each audio track, over the full timeline. See [the file check](#the-file-check). | Read |
+
+### The file check
+
+`obs_verify_file` takes a file name in the recording folder, and optional expected sources. Each expected source has a name, a kind, a track and an optional backup track. The check only reads the file: it never changes, moves or deletes it, whatever the result.
+
+A track number is the Nth audio track in the file; OBS writes only the tracks that are on. For example, if only OBS tracks 1 and 3 are on, OBS track 3 is track 2 in the file.
+
+The check reads the file types that OBS records: `.mov`, `.mp4`, `.m4v`, `.mkv`, `.flv` and `.ts`. It refuses other types, for example an `.m3u8` playlist, and ffmpeg reads each file as the type of its name only.
+
+| It reports | How |
+| --- | --- |
+| A file that cannot be read, or is cut short (for example a MOV without its index, a track with no audio data, a track whose audio data ends 1 s or more before its stated length, or, in an MKV, which states no length per track, 1 s or more before the end of the file) | ffprobe and ffmpeg errors, and decoded length against stated length or file length. ffmpeg error lines alone, with each track complete, are a warning: the log of ffmpeg can hold text from the file, so it never fails a file by itself |
+| Duration, the video stream and where it ends (a warning when it ends 2 s or more before the file). MKV and FLV state no video length: then the check reads the video packets. If that read does not finish, the video claim is `not_checked` | ffprobe |
+| Each audio track: peak, RMS, sound time, and every silent interval of 0.5 s or more (less when a gap limit is set below 0.5 s) with its timecodes. The claim about a track names its silent intervals too, also the ones below the limits. Sound time counts only audio data that is not silent | One ffmpeg pass: `astats` and `silencedetect` on each track |
+| A channel of a stereo track that is silent while another channel has sound (a warning) | The peak of each channel, from `astats` |
+| One verdict per claim: per expected source, or per track when you name none | The rules below |
+
+The result has one state: `verified`, `verified_with_warnings`, `failed` or `not_checked`.
+
+| Kind | Fails when | Warns when |
+| --- | --- | --- |
+| `voice` | No sound, or a silent gap of 30 s or more | A gap of 10 s or more |
+| `continuous` | No sound, or a gap of 2 s or more | A gap of 0.5 s or more |
+| `any` | No sound | Never, for gaps |
+
+Each timecode counts from the start of the file, in each file type, also on a track that starts later than the others. (In a TS file, the clock of the streams starts near 1.4 s. The check counts from the start of the file there too.) A missing track or a file with no audio stream fails. A missing backup track warns. A low level (peak below -40 dB) or a peak that may clip warns. If a source fails alone and its backup track has sound at those times, the result is a warning that names the backup track. **The gap limits have no basis in a real take yet.** They are settings with conservative defaults (see [Settings](#settings)).
+
+The check needs ffmpeg and ffprobe. Without them, the result is `not_checked` and says "Sound not checked", with the install line for your system. On macOS, `afinfo` then counts the audio tracks and their durations in a MOV or MP4. afinfo cannot read MKV, FLV or TS, or a MOV or MP4 with no audio or damaged audio: the result is then `not_checked`, not `failed`.
+
+The sound is `not_checked`, with the reason, for a track with a sample rate below 8000 Hz (OBS records at 44.1 kHz or 48 kHz): there the check cannot time a silent interval. A track that states no sample rate is `not_checked` too: in a TS file, a track with no audio data is one.
+
+The file must be inside the recording folder: the folder that OBS records to, or `OBS_MCP_RECORDING_DIR`. The check refuses a path with `..`, a path or a link that leads out of the folder, and anything that is not a regular file. It refuses a path outside the folder by its text, before it reads anything at that path: so a UNC path (`\\host\share`) or an automount never reaches the network, and the refusal is the same whether the file exists or not. ffmpeg runs with an argument list, never a shell, reads only local files, and stops at one time limit for the whole check.
+
+The check never refuses a name for its characters, and it opens the file by its real name. A reply never holds an invisible character: each name in a reply or an error shows every control, format, private-use, unassigned or surrogate code point, U+2028, U+2029, every tag character (U+E0000 to U+E007F) and every variation selector as `\u{hex}`. For example, a text direction control U+202E shows as `\u{202E}`, and an emoji sequence shows its joiners as `\u{200D}`. A backslash that starts `\u{` in a real name shows as `\u{5C}`, so each `\u{...}` in a reply is an escape; any other backslash stays as it is.
+
+Two limits remain, and both need write access to the recording folder. A hard link in the folder to a file outside it is a regular file in the folder, so the check reads it. A file that another program swaps after the path check is read as it is when ffmpeg opens it.
 
 What `obs_read` runs in 0.0, from the class table in [`catalogue/classes.json`](catalogue/classes.json):
 
@@ -123,7 +161,8 @@ The allow-list is `SAFE_SETTINGS` in [`src/redact.ts`](src/redact.ts). It holds 
 
 - A generator builds the catalogue from a pinned [`protocol.json`](protocol/SOURCE.md) of obs-websocket 5.7.6 and the class table. The build fails when a request has no row in the table.
 - At connect, the server reads `GetVersion` and reports live requests that are not in the catalogue. It refuses them.
-- All OS-specific code (settings folder, OBS discovery, listener reading) is in [`src/platform.ts`](src/platform.ts). The OBS layer has none.
+- All OS-specific code (settings folder, OBS discovery, listener reading, the audio tools of the file check) is in [`src/platform.ts`](src/platform.ts). The OBS layer has none.
+- The file check is in [`src/verify.ts`](src/verify.ts). It does not use the OBS connection, except to ask for the recording folder.
 
 ## Settings
 
@@ -134,6 +173,12 @@ All are optional.
 | `OBS_WEBSOCKET_PASSWORD` | The password, in place of the one in the obs-websocket settings file |
 | `OBS_WEBSOCKET_PORT` | The port, in place of the one in the settings file (default 4455). It must be a whole number from 1 to 65535; any other value, an empty one too, is an error that `obs_status` and the doctor report |
 | `OBS_STUDIO_CONFIG_DIR` | The OBS settings folder, for a portable or custom install |
+| `OBS_MCP_RECORDING_DIR` | The recording folder for `obs_verify_file`, in place of the folder that OBS gives. It lets the check work with OBS closed |
+| `OBS_MCP_FFMPEG` | The full path of ffmpeg, with ffprobe in the same folder. Without it, both come from `PATH` |
+| `OBS_MCP_VOICE_GAP_S` | The gap limit of a `voice` source, in seconds (default 30) |
+| `OBS_MCP_CONTINUOUS_GAP_S` | The gap limit of a `continuous` source, in seconds (default 2) |
+| `OBS_MCP_SILENCE_DB` | The level below which a track is silent, in dB (default -50) |
+| `OBS_MCP_VERIFY_TIMEOUT_S` | The time limit of one check, ffprobe and every ffmpeg pass together, in seconds (default 900) |
 
 ## Under the hood
 
@@ -143,7 +188,7 @@ All are optional.
 | `catalogue/classes.json` | One class row for each documented request |
 | `protocol/` | The pinned protocol description and its source |
 | `scripts/` | The catalogue generator and the packed-package smoke test |
-| `test/` | Tests, and a simulated OBS that closes the socket (code 1006) on an untested list request |
+| `test/` | Tests, a simulated OBS that closes the socket (code 1006) on an untested list request, and a script that makes SIMULATED media with ffmpeg for the file check. `test/real-files.test.mjs` checks real recordings of your own: it runs only when `OBS_MCP_REAL_DIR` names their folder |
 
 Run the checks from a clone:
 
