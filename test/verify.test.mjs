@@ -81,12 +81,12 @@ describe('parser and rules, on captured ffmpeg text (no ffmpeg needed)', () => {
     const log = parseLog('[Parsed_silencedetect_1 @ 0x1] silence_start: 0\n[Parsed_astats_0 @ 0x2] Peak level dB: -inf\n[Parsed_astats_0 @ 0x2] Number of samples: 718752\n[Parsed_silencedetect_1 @ 0x1] silence_end: 14.974 | silence_duration: 14.974\n');
     const [m] = measure(probe, [log.track]);
     assert.equal(m.soundS, 0);
-    assert.match(judge(probe, [m], [], limits)[0].evidence, /^Silent\. Track 1: peak -inf dB, RMS unknown, sound 0\.0 s of 15\.0 s\.$/);
+    assert.match(judge(probe, [m], [], limits)[0].evidence, /^Silent\. Track 1: peak -inf dB, RMS unknown, sound 0\.0 s of 15\.0 s, 1 silent interval: 00:00:00\.0 to 00:00:15\.0\.$/);
   });
 
   test('F-T5-8: parseLog reads the peak of each channel apart from the overall peak', () => {
     const text = ['Channel: 1', 'Peak level dB: -5.362297', 'Channel: 2', 'Peak level dB: -inf', 'Overall', 'Peak level dB: -5.362297', 'RMS level dB: -11.2', 'Number of samples: 480000'].map((l) => `[Parsed_astats_0 @ 0x1] ${l}`).join('\n');
-    assert.deepEqual(parseLog(text).track, { silences: [], channelPeaksDb: [-5.362297, -Infinity], peakDb: -5.362297, rmsDb: -11.2, samples: 480000 });
+    assert.deepEqual(parseLog(text, '', 2).track, { silences: [], channelPeaksDb: [-5.362297, -Infinity], peakDb: -5.362297, rmsDb: -11.2, samples: 480000 });
   });
 
   test('a backup track with sound turns a silent source into a warning that names the backup', () => {
@@ -119,6 +119,82 @@ describe('parser and rules, on captured ffmpeg text (no ffmpeg needed)', () => {
     assert.equal(limitsFrom({ OBS_MCP_VOICE_GAP_S: '5' }).gap.voice.fail, 5);
     assert.equal(limitsFrom({ OBS_MCP_VOICE_GAP_S: '5' }).gap.voice.warn, 5);
     assert.throws(() => limitsFrom({ OBS_MCP_SILENCE_DB: 'loud' }), /OBS_MCP_SILENCE_DB is "loud"\. It must be a number from -120 to -1/);
+  });
+
+  test('F-T5-13: on an MPEG-TS probe, a stream start counts from the container start: no false gap, and the track is not cut short', () => {
+    // The numbers of a SIMULATED 20 s TS from ffprobe 9.0.2: the container and the audio start at 1.445333 s.
+    const probe = parseProbe(JSON.stringify({
+      streams: [
+        { codec_type: 'video', duration: '20.000000', start_time: '1.466667' },
+        { codec_type: 'audio', sample_rate: '48000', channels: 1, duration: '19.733333', start_time: '1.445333' },
+        { codec_type: 'audio', sample_rate: '48000', channels: 1, duration: '19.968000', start_time: '1.445333' },
+      ],
+      format: { duration: '20.021334', start_time: '1.445333' },
+    }));
+    // ffmpeg moves its timeline to the container start, so a dropout at the end of the file is at 14 s to 20 s in the log.
+    const log = parseLog('[Parsed_silencedetect_1 @ 0x1] silence_start: 14.022333\n[Parsed_astats_0 @ 0x2] Number of samples: 961536\n[Parsed_astats_0 @ 0x2] Peak level dB: -5\n[Parsed_silencedetect_1 @ 0x1] silence_end: 20.032 | silence_duration: 6.009667\n').track;
+    const sound = parseLog('[Parsed_astats_0 @ 0x2] Number of samples: 961536\n[Parsed_astats_0 @ 0x2] Peak level dB: -5\n').track;
+    const [a, b] = measure(probe, [log, sound]);
+    assert.deepEqual([a.endS, a.silences], [20.021334, [{ start: 14.022333, end: 20.021334, why: 'silent' }]]);
+    assert.deepEqual([b.endS, b.silences, b.expectedEndS], [20.021334, [], 19.968]);
+    assert.ok(a.expectedEndS < a.endS + 1, `expected end ${a.expectedEndS}`);
+    assert.deepEqual(judge(probe, [a, b], [{ name: 'Music', kind: 'continuous', track: 1 }], limits)[0].gaps, [{ from: '00:00:14.0', to: '00:00:20.0', seconds: 6, why: 'silent' }]);
+  });
+
+  test('F-T5-11: one silent track is "The only audio track is silent"; sound on one or two tracks has the right plural', () => {
+    const probe = parseProbe(JSON.stringify({ streams: [{ codec_type: 'audio', sample_rate: '48000', duration: '10' }, { codec_type: 'audio', sample_rate: '48000', duration: '10' }], format: { duration: '10' } }));
+    const silent = parseLog('[silencedetect @ 0x1] silence_start: 0\n').track;
+    const sound = parseLog('[Parsed_astats_0 @ 0x2] Peak level dB: -20\n').track;
+    const last = (logs) => judge({ ...probe, audio: probe.audio.slice(0, logs.length) }, measure({ ...probe, audio: probe.audio.slice(0, logs.length) }, logs), [], limits).at(-1).evidence;
+    assert.deepEqual([last([silent]), last([silent, silent]), last([sound, silent]), last([sound, sound])], ['The only audio track is silent.', 'All 2 audio tracks are silent.', 'Sound on track 1.', 'Sound on tracks 1, 2.']);
+  });
+
+  test('F-T5-12: the rule text of a voice gives the limit and the warning, and lists no "gaps from"', () => {
+    const probe = parseProbe(PROBE_60);
+    const [c] = judge(probe, measure(probe, LOGS), [{ name: 'Mic', kind: 'voice', track: 1 }], limits);
+    assert.match(c.evidence, /\. Rule: gap limit 30 s, a warning from 10 s\.$/);
+  });
+
+  test('F-T5-14: a backup track that the file does not have is a warning on its source, also when the source passes', () => {
+    const probe = parseProbe(PROBE_60);
+    const [c] = judge(probe, measure(probe, LOGS), [{ name: 'Mic', kind: 'voice', track: 1, backup: 3 }], limits);
+    assert.equal(c.verdict, 'warn');
+    assert.match(c.evidence, /^Backup track 3 is missing: the file has 2 audio tracks\. Track 1: peak -6\.0 dB/);
+  });
+
+  test('F-T5-15: the backup check is linear: 100,000 silences on a track and on its backup take well under a second', () => {
+    // SIMULATED logs (no media needed): every 5 s, track 1 is silent 2.5 s from 0 s, and its backup 2.5 s from 2.2 s.
+    const log = (offset) => {
+      const lines = [];
+      for (let i = 0; i < 100000; i++) lines.push(`[silencedetect @ 0x1] silence_start: ${5 * i + offset}`, `[silencedetect @ 0x1] silence_end: ${5 * i + offset + 2.5} | silence_duration: 2.5`);
+      return parseLog(lines.join('\n')).track;
+    };
+    const [own, backup] = [log(0), log(2.2)];
+    const probe = parseProbe(JSON.stringify({ streams: [{ codec_type: 'audio', sample_rate: '48000', duration: '500000' }, { codec_type: 'audio', sample_rate: '48000', duration: '500000' }], format: { duration: '500000' } }));
+    const t = Date.now();
+    const [c] = judge(probe, measure(probe, [own, backup]), [{ name: 'Mic', kind: 'continuous', track: 1, backup: 2 }], limits);
+    const took = Date.now() - t;
+    assert.ok(took < 1000, `judge took ${took} ms`);
+    // Track 1 fails alone (2.5 s gaps). Both are silent together 0.3 s each time, below the continuous warning of 0.5 s.
+    assert.equal(c.verdict, 'warn');
+    assert.match(c.evidence, /^Track 1 fails alone, and backup track 2 has sound there/);
+  });
+
+  test('F-T5-15: parseLog keeps at most 100,000 silent intervals of a track, and counts the rest', () => {
+    const lines = [];
+    for (let i = 0; i < 150000; i++) lines.push(`[silencedetect @ 0x1] silence_start: ${i}`, `[silencedetect @ 0x1] silence_end: ${i + 0.6} | silence_duration: 0.6`);
+    const { track } = parseLog(lines.join('\n'));
+    assert.deepEqual([track.silences.length, track.dropped, track.silences.at(-1)], [100000, 50000, { start: 99999, end: 99999.6 }]);
+  });
+
+  test('F-T5-16: a channel index counts only from 1 to the channel count of the track, so a forged index does nothing', () => {
+    const text = ['Channel: 1', 'Peak level dB: -5', 'Channel: 1000000000', 'Peak level dB: -1', 'Channel: 3', 'Peak level dB: -2', 'Channel: 2', 'Peak level dB: -inf', 'Overall', 'Peak level dB: -5'].map((l) => `[Parsed_astats_0 @ 0x1] ${l}`).join('\n');
+    const t = Date.now();
+    const { track } = parseLog(text, '', 2);
+    assert.ok(Date.now() - t < 100);
+    assert.deepEqual([track.channelPeaksDb, track.peakDb], [[-5, -Infinity], -5]);
+    // With 1 channel, channel 2 is ignored too.
+    assert.deepEqual(parseLog(text, '', 1).track.channelPeaksDb, [-5]);
   });
 
   test('without ffmpeg and without afinfo, the result says "sound not checked" and the install line', async () => {
@@ -158,6 +234,38 @@ test('F-T5-3: OBS_MCP_VERIFY_TIMEOUT_S is one deadline for the whole check, ffpr
   assert.equal(r.state, 'not_checked');
   assert.match(r.claims[0].evidence, /^ffmpeg stopped on track 1: the check passed its time limit of 2 s/);
   assert.ok(took < 3000, `the check took ${took} ms for a limit of 2 s`);
+});
+
+/** Stand-in ffmpeg and ffprobe: one shell script, with a case per tool and argument. Returns the env of the check. */
+const standIn = (body) => {
+  const bin = mkdtempSync(join(tmpdir(), 'obs-mcp-standin-'));
+  for (const name of ['ffmpeg', 'ffprobe']) writeFileSync(join(bin, name), `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+  return { OBS_MCP_FFMPEG: join(bin, 'ffmpeg') };
+};
+const standInFile = () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'obs-mcp-take-')), 'take.mkv');
+  writeFileSync(file, 'x');
+  return file;
+};
+
+test('F-T5-10: a video stream with no stated length whose packets cannot be read is not_checked, never pass', { skip: process.platform === 'win32' && 'the stand-in tools are shell scripts' }, async () => {
+  const probe = `{"format":{"duration":"10"},"streams":[{"codec_type":"video"},{"codec_type":"audio","sample_rate":"48000"}]}`;
+  const env = standIn(`case "$0" in *ffprobe) case "$*" in *packet*) echo 'read error' >&2; exit 1;; *) echo '${probe}';; esac;; *) echo 'ffmpeg version stand-in';; esac`);
+  const r = await verifyFile(standInFile(), 'take.mkv', [], env);
+  assert.deepEqual(r.claims.find((c) => c.claim === 'The file has a video stream for the full timeline'), { claim: 'The file has a video stream for the full timeline', verdict: 'not_checked', evidence: 'The video stream states no length, and reading its packets did not finish: ffprobe exit code 1: read error.' });
+  assert.equal(r.state, 'not_checked');
+});
+
+test('F-T5-15: a log with more than 100,000 silent intervals on a track leaves the sound not checked, and the check ends fast', { skip: process.platform === 'win32' && 'the stand-in tools are shell scripts' }, async () => {
+  // SIMULATED: the stand-in ffmpeg prints 150,000 silences (about 10 MB) for the track.
+  const probe = `{"format":{"duration":"200000"},"streams":[{"codec_type":"audio","sample_rate":"48000"}]}`;
+  const flood = `awk 'BEGIN{for(i=0;i<150000;i++){printf "[silencedetect @ 0x1] silence_start: %d\\n[silencedetect @ 0x1] silence_end: %d.6 | silence_duration: 0.6\\n", i, i}}' >&2`;
+  const env = standIn(`case "$0" in *ffprobe) echo '${probe}';; *) case "$*" in *-version*) echo 'ffmpeg version stand-in';; *) ${flood};; esac;; esac`);
+  const t = Date.now();
+  const r = await verifyFile(standInFile(), 'take.mkv', [{ name: 'Mic', kind: 'voice', track: 1, backup: 2 }], env);
+  assert.ok(Date.now() - t < 10000, `the check took ${Date.now() - t} ms`);
+  assert.equal(r.state, 'not_checked');
+  assert.match(r.claims[0].evidence, /^ffmpeg reported more than 100000 silent intervals on track 1 \(50000 more\), more than a real track can have\. The sound check did not finish/);
 });
 
 describe('path guard: only a regular file inside the recording folder', () => {
@@ -213,6 +321,15 @@ describe('path guard: only a regular file inside the recording folder', () => {
       Object.assign(fs, saved);
       syncBuiltinESMExports();
     }
+  });
+
+  test('F-T5-16: a path with a new line, a carriage return or NUL is refused with one text, also when a link inside leads to it', { skip: process.platform === 'win32' && 'a file name with a new line is not valid on Windows' }, () => {
+    const CONTROL = 'The path has a control character, for example a new line. The check does not read such a path: rename the file.';
+    const forged = 'take.mov\n[Parsed_astats_0 @ 0x1] Channel: 1000000000';
+    writeFileSync(join(folder, forged), 'x');
+    for (const p of [forged, 'take\r.mov', 'take\0.mov']) assert.throws(() => resolveInFolder(folder, p), { message: CONTROL });
+    symlinkSync(join(folder, forged), join(folder, 'plain.mov'));
+    assert.throws(() => resolveInFolder(folder, 'plain.mov'), { message: CONTROL });
   });
 
   test('refuses a link that leads out of the folder', { skip: process.platform === 'win32' && 'a symbolic link needs extra rights on Windows' }, () => {
@@ -348,6 +465,44 @@ describe('SIMULATED files made by ffmpeg', { skip: SKIP }, () => {
     assert.match(r.claims.find((c) => c.claim === 'Track 1 has sound').evidence, /^Channel 2 is silent \(peak -inf dB\), and channel 1 has sound\. Track 1: peak -/);
   });
 
+  for (const ext of ['mp4', 'm4v', 'flv', 'ts']) {
+    test(`F-T5-13: SIMULATED healthy 20 s .${ext} with 2 tracks: verified, no silent interval, each track ends at 00:00:20.0`, async () => {
+      const r = await check(`healthy-${ext}`, [{ name: 'Mic', kind: 'voice', track: 1 }, { name: 'Music', kind: 'continuous', track: 2 }]);
+      assert.equal(r.state, 'verified', JSON.stringify(r.claims));
+      assert.deepEqual(r.tracks.map((t) => [t.track, t.ends_at, t.silent_intervals]), [[1, '00:00:20.0', []], [2, '00:00:20.0', []]]);
+    });
+  }
+  for (const ext of ['mp4', 'flv', 'ts']) {
+    test(`F-T5-13: SIMULATED .${ext} with a dropout at the end: failed, gap 00:00:14.0 to 00:00:20.0 on track 1`, async () => {
+      const r = await check(`end-${ext}`, [{ name: 'Music', kind: 'continuous', track: 1 }]);
+      assert.equal(r.state, 'failed');
+      assert.equal(r.claims[0].verdict, 'pass', r.claims[0].evidence);
+      assert.deepEqual(r.claims.find((c) => c.claim.startsWith('Source "Music"')).gaps, [{ from: '00:00:14.0', to: '00:00:20.0', seconds: 6, why: 'silent' }]);
+    });
+  }
+
+  test('F-T5-10: SIMULATED MKV whose video stops at 10 s of 20 s: the video claim warns "Video 00:00:10.0 of 00:00:20.0"', async () => {
+    const r = await check('videoShortMkv', []);
+    assert.equal(r.state, 'verified_with_warnings');
+    const v = r.claims.find((c) => c.claim === 'The file has a video stream for the full timeline');
+    assert.deepEqual([v.verdict, v.evidence, r.video_duration], ['warn', 'Video 00:00:10.0 of 00:00:20.0, from its packets: the video stream states no length.', '00:00:10.0']);
+  });
+
+  test('F-T5-14: SIMULATED 2-track file with a source whose backup is track 3: verified_with_warnings, "Backup track 3 is missing"', async () => {
+    const r = await check('healthy', [{ name: 'Mic', kind: 'voice', track: 1, backup: 3 }]);
+    assert.equal(r.state, 'verified_with_warnings');
+    assert.match(r.claims.find((c) => c.claim.startsWith('Source "Mic"')).evidence, /^Backup track 3 is missing: the file has 2 audio tracks\. Track 1: /);
+  });
+
+  test('F-T5-19: SIMULATED 6 s gap on a voice: verified, and the source claim names the interval', async () => {
+    const r = await check('shortGap', [{ name: 'Remote', kind: 'voice', track: 1 }]);
+    assert.equal(r.state, 'verified');
+    assert.match(r.claims.find((c) => c.claim.startsWith('Source "Remote"')).evidence, /^Track 1: peak .*, sound 14\.0 s of 20\.0 s, 1 silent interval: 00:00:08\.0 to 00:00:14\.0\. Rule: gap limit 30 s, a warning from 10 s\.$/);
+    // Without expected sources, the track claim names it too.
+    const t = await check('shortGap', []);
+    assert.match(t.claims.find((c) => c.claim === 'Track 1 has sound').evidence, /1 silent interval: 00:00:08\.0 to 00:00:14\.0\.$/);
+  });
+
   test('F-T5-6: SIMULATED playlist in the folder that points to a file outside: refused, ffmpeg never reads it', async () => {
     const rec = mkdtempSync(join(tmpdir(), 'obs-mcp-playlist-'));
     const list = join(rec, 'take.m3u8');
@@ -367,7 +522,7 @@ describe('SIMULATED files made by ffmpeg', { skip: SKIP }, () => {
     const r = await verifyFile(f.stereoMkv, 'stereo.mkv', [], { PATH: bin });
     assert.equal(r.state, 'not_checked');
     assert.equal(r.claims[0].verdict, 'not_checked');
-    assert.match(r.claims[0].evidence, /^afinfo cannot read this format or this file: it reads MOV and MP4, not MKV, FLV or TS\. Nothing in the file was checked\. Sound not checked: ffmpeg and ffprobe not found .*Install: brew install ffmpeg\.$/);
+    assert.match(r.claims[0].evidence, /^afinfo cannot read this format: it reads MOV and MP4, not MKV, FLV or TS\. Nothing in the file was checked\. Sound not checked: ffmpeg and ffprobe not found .*Install: brew install ffmpeg\.$/);
   });
 
   test('SIMULATED afinfo fallback (macOS): not_checked, tracks counted, a missing track fails', { skip: !audioTools().afinfo && 'afinfo is a macOS tool and is not on PATH here' }, async () => {
@@ -383,6 +538,21 @@ describe('SIMULATED files made by ffmpeg', { skip: SKIP }, () => {
     // F-T5-9: one track is "1 audio track", not "1 audio tracks".
     const one = await verifyFile(f.quiet, 'quiet', [{ name: 'Remote', kind: 'voice', track: 2 }], env);
     assert.equal(one.claims.find((c) => c.claim.startsWith('Source "Remote"')).evidence, 'Track 2 is missing: the file has 1 audio track.');
+    // F-T5-14 and F-T5-17: a missing backup track is named.
+    const backup = await verifyFile(f.healthy, 'healthy', [{ name: 'Mic', kind: 'voice', track: 1, backup: 3 }], env);
+    assert.match(backup.claims.find((c) => c.claim.startsWith('Source "Mic"')).evidence, /^Track 1 is present, and backup track 3 is missing: the file has 2 audio tracks\. Sound not checked/);
+  });
+
+  test('F-T5-18: SIMULATED MOV with no audio, and a damaged MOV, with the afinfo fallback: not_checked, and the format is not blamed', { skip: !audioTools().afinfo && 'afinfo is a macOS tool and is not on PATH here' }, async () => {
+    const bin = mkdtempSync(join(tmpdir(), 'obs-mcp-afinfo-only-'));
+    symlinkSync(audioTools().afinfo, join(bin, 'afinfo'));
+    const garbage = join(mkdtempSync(join(tmpdir(), 'obs-mcp-garbage-')), 'garbage.mov');
+    writeFileSync(garbage, 'SIMULATED: not a movie');
+    for (const file of [f.noAudio, garbage]) {
+      const r = await verifyFile(file, 'take.mov', [], { PATH: bin });
+      assert.equal(r.state, 'not_checked');
+      assert.match(r.claims[0].evidence, /^afinfo cannot read audio in this file: it may hold no audio, be damaged or be cut short\. Nothing in the file was checked\./);
+    }
   });
 });
 

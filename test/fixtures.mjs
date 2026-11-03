@@ -1,6 +1,7 @@
 // SIMULATED media for the file check: made by ffmpeg in a temporary folder, never by OBS, and never committed.
 // Each file has a small video stream (64x64, 2 fps) and AAC audio tracks in a MOV container, as OBS records by default,
-// or in an MKV container, which states no length per track.
+// or in an MKV container, which states no length per track. Each other container that the check reads (MP4, M4V, FLV, TS)
+// has a healthy file and one with a dropout at the end. FLV takes the flv1 video codec, as it has no mpeg4.
 import { execFileSync } from 'node:child_process';
 import { copyFileSync, mkdtempSync, statSync, truncateSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -21,7 +22,8 @@ function make(dir, name, inputs, extra = []) {
   const file = join(dir, name);
   const n = inputs.length;
   const maps = Array.from({ length: n }, (_, i) => ['-map', String(i)]).flat();
-  execFileSync(tools.ffmpeg, ['-hide_banner', '-loglevel', 'error', '-y', ...inputs.flat(), ...maps, '-c:v', 'mpeg4', '-c:a', 'aac', ...extra, file]);
+  const codec = name.endsWith('.flv') ? 'flv1' : 'mpeg4';
+  execFileSync(tools.ffmpeg, ['-hide_banner', '-loglevel', 'error', '-y', ...inputs.flat(), ...maps, '-c:v', codec, '-c:a', 'aac', ...extra, file]);
   return file;
 }
 
@@ -47,7 +49,17 @@ export function makeFixtures() {
     leftOnly: make(dir, 'SIMULATED-stereo-left-only.mov', [video(10), stereo('0.3*sin(440*2*PI*t)', '0', 10)]),
     // 20 s MKV with 2 stereo tracks, both channels with sound.
     stereoMkv: make(dir, 'SIMULATED-stereo-2-tracks.mkv', [video(20), stereo('0.3*sin(440*2*PI*t)', '0.3*sin(550*2*PI*t)', 20), stereo('0.3*sin(660*2*PI*t)', '0.3*sin(770*2*PI*t)', 20)]),
+    // 20 s MKV whose video stops at 10 s, while its audio runs to 20 s.
+    videoShortMkv: make(dir, 'SIMULATED-video-stops-at-10s.mkv', [video(10), sine(440, 20)]),
   };
+  // 20 s files with 2 tracks in each other container. In TS the container starts at about 1.4 s, not at 0.
+  // "-end": track 1 goes silent at 14 s and stays silent to the end; track 2 is silent from 5 s to 8 s.
+  for (const ext of ['mp4', 'flv', 'ts']) {
+    f[`healthy-${ext}`] = make(dir, `SIMULATED-healthy.${ext}`, [video(20), sine(440, 20), sine(660, 20)]);
+    f[`end-${ext}`] = make(dir, `SIMULATED-end-dropout.${ext}`, [video(20), ['-f', 'lavfi', '-i', 'aevalsrc=0.3*sin(440*2*PI*t)*lt(t\\,14):s=48000:d=20'], ['-f', 'lavfi', '-i', 'aevalsrc=0.3*sin(660*2*PI*t)*not(between(t\\,5\\,8)):s=48000:d=20']]);
+  }
+  f['healthy-m4v'] = join(dir, 'SIMULATED-healthy.m4v');
+  copyFileSync(f['healthy-mp4'], f['healthy-m4v']);
   const cut = (from, name, fraction) => {
     const to = join(dir, name);
     copyFileSync(from, to);
