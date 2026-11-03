@@ -1,25 +1,43 @@
-// A minimal in-memory fake of OBS with obs-websocket 5 (JSON). SIMULATED: it is not real OBS.
-// It answers every documented request with sample values in the shape of protocol.json, logs each request it gets,
-// and closes the socket with no close frame (the client sees 1006) on a list request that real OBS can crash on.
+// An in-memory fake of OBS with obs-websocket 5 (JSON). SIMULATED: it is not real OBS.
+// It replays the stored traces in test/traces: a request type and request data, in an output state, give the
+// response status, code, data and events of the trace, and its effect on the output state. A request with no trace
+// gets sample values in the shape of protocol.json. It logs each request it gets, counts each recording stop, and
+// closes the socket with no close frame (the client sees 1006) on a list request that real OBS can crash on.
 import { createHash, randomBytes } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { WebSocketServer } from 'ws';
 
 const protocol = JSON.parse(readFileSync(new URL('../protocol/protocol.json', import.meta.url), 'utf8'));
 const DOCUMENTED = new Map(protocol.requests.map((r) => [r.requestType, r]));
+// The subscription bit of each event ("(1 << 6)" in protocol.json): a client gets an event only when it subscribed to its category.
+const BITS = new Map(protocol.enums.find((e) => e.enumType === 'EventSubscription').enumIdentifiers.map((i) => [i.enumIdentifier, /^\(1 << (\d+)\)$/.exec(i.enumValue)?.[1]]));
+const EVENT_BIT = new Map(protocol.events.map((e) => [e.eventType, 2 ** Number(BITS.get(e.eventSubscription))]));
+const ALL_EVENTS = 2047; // obs-websocket's default: every category that is not high-volume
+
+export const TRACE_DIR = new URL('./traces/', import.meta.url);
+/** The stored traces, each with its file name. */
+export const loadTraces = (dir = TRACE_DIR) =>
+  readdirSync(dir).filter((f) => f.endsWith('.json')).sort().map((file) => ({ file, ...JSON.parse(readFileSync(new URL(file, dir), 'utf8')) }));
+const STORED = loadTraces();
+// A trace value matches when each of its fields matches; a field that the trace leaves out matches anything.
+const matches = (want, got) =>
+  want === undefined || (want && typeof want === 'object' ? !!got && typeof got === 'object' && Object.entries(want).every(([k, v]) => matches(v, got[k])) : Object.is(want, got));
 export const PRIVATE_REQUESTS = ['GetSourcePrivateSettings', 'SetSourcePrivateSettings', 'GetSceneItemPrivateSettings', 'SetSceneItemPrivateSettings'];
 const sha = (s) => createHash('sha256').update(s).digest('base64');
 const SAMPLE = { String: 'sample', Number: 1, Boolean: false, Object: {}, Any: null };
 const sample = (type) => (type.startsWith('Array') ? [] : SAMPLE[type]);
 
 /**
- * options: password, recording (bool), streaming (bool), port (default: any free port), platform, obsVersion, inputs ({name: kind}), streamKey, token, crashOn (request name),
- * outputs (the GetOutputList items; by default four outputs, record and stream active when recording and streaming are on),
+ * options: password, recording, streaming, replayBuffer, virtualCam (bool: the output state at start), traces (default: the stored traces),
+ * port (default: any free port), platform, obsVersion, inputs ({name: kind}), streamKey, token, crashOn (request name),
+ * outputs (the GetOutputList items; by default four outputs, each active when its output state is on),
  * silentOn (request names that never get an answer), failOn (request names that get a failed status),
  * recordDirectory (the GetRecordDirectory folder), plant (bool: see plantReply below; each planted secret is listed in `planted` as { secret, field }).
  * Each input has the UUID "uuid-<name>". Like OBS, the fake resolves inputName first and inputUuid only when no name is given.
- * Returns { port, log, sent, planted, connections, close() }. log holds every request type that reached the fake, in order;
+ * Returns { port, log, sent, planted, state, stops, crashes, connections, close() }. log holds every request type that reached the fake, in order;
  * sent holds { requestType, requestData } for each; connections() is the count of WebSocket connections that the fake accepted.
+ * state is the output state now. stops holds { requestType, cause } for each recording that a request or a crash stopped;
+ * crashes() is the count of simulated crashes (each closes the socket with 1006 and ends every output, as a real crash does).
  */
 export const DISPLAY_UUID = '5d1f3c2a-8b4e-4f6a-9c7d-0e1f2a3b4c5d';
 export async function startFakeObs(options = {}) {
@@ -27,6 +45,26 @@ export async function startFakeObs(options = {}) {
   const log = [];
   const sent = [];
   const planted = [];
+  const state = { recording: !!o.recording, streaming: !!o.streaming, replayBuffer: !!o.replayBuffer, virtualCam: !!o.virtualCam };
+  const stops = [];
+  let crashes = 0;
+  const timers = new Set();
+  const entries = (o.traces ?? STORED).flatMap((t) => t.entries);
+  const traceFor = (requestType, requestData) => {
+    const now = { ...state, videoActive: Object.values(state).some(Boolean) };
+    return entries.find((e) => e.requestType === requestType && matches(e.when, now) && matches(e.requestData, requestData ?? {}));
+  };
+  // A real crash ends OBS and every output with it, so a crash during a take counts as a stop.
+  const crash = (ws, requestType) => {
+    crashes++;
+    if (state.recording) stops.push({ requestType, cause: 'crash' });
+    for (const k of Object.keys(state)) state[k] = false;
+    ws.terminate();
+  };
+  const later = (ms, fn) => {
+    const t = setTimeout(() => (timers.delete(t), fn()), ms);
+    timers.add(t);
+  };
   const key = () => o.streamKey ?? 'sample-stream-key';
   const token = () => o.token ?? 'sample-refresh-token';
   const inputOf = (d) => d?.inputName ?? (typeof d?.inputUuid === 'string' ? d.inputUuid.replace(/^uuid-/, '') : undefined);
@@ -64,10 +102,10 @@ export async function startFakeObs(options = {}) {
 
   const outputs = () =>
     o.outputs ?? [
-      { outputName: 'adv_file_output', outputKind: 'ffmpeg_muxer', outputActive: !!o.recording },
-      { outputName: 'adv_stream', outputKind: 'rtmp_output', outputActive: !!o.streaming },
-      { outputName: 'virtualcam_output', outputKind: 'virtualcam_output', outputActive: false },
-      { outputName: 'Replay Buffer', outputKind: 'replay_buffer', outputActive: false },
+      { outputName: 'adv_file_output', outputKind: 'ffmpeg_muxer', outputActive: state.recording },
+      { outputName: 'adv_stream', outputKind: 'rtmp_output', outputActive: state.streaming },
+      { outputName: 'virtualcam_output', outputKind: 'virtualcam_output', outputActive: state.virtualCam },
+      { outputName: 'Replay Buffer', outputKind: 'replay_buffer', outputActive: state.replayBuffer },
     ].map((x) => ({ outputWidth: 1920, outputHeight: 1080, outputFlags: {}, ...x }));
   const answer = (type, data) => {
     switch (type) {
@@ -80,9 +118,9 @@ export async function startFakeObs(options = {}) {
       case 'GetRecordDirectory':
         return { recordDirectory: o.recordDirectory ?? 'sample' };
       case 'GetRecordStatus':
-        return { outputActive: !!o.recording, outputPaused: false, outputTimecode: '00:00:00.000', outputDuration: 0, outputBytes: 0 };
+        return { outputActive: state.recording, outputPaused: false, outputTimecode: '00:00:00.000', outputDuration: 0, outputBytes: 0 };
       case 'GetStreamStatus':
-        return { outputActive: !!o.streaming, outputReconnecting: false, outputTimecode: '00:00:00.000', outputDuration: 0, outputCongestion: 0, outputBytes: 0, outputSkippedFrames: 0, outputTotalFrames: 0 };
+        return { outputActive: state.streaming, outputReconnecting: false, outputTimecode: '00:00:00.000', outputDuration: 0, outputCongestion: 0, outputBytes: 0, outputSkippedFrames: 0, outputTotalFrames: 0 };
       case 'GetInputSettings': {
         return { inputKind: o.inputs[inputOf(data)] ?? 'sample_kind', inputSettings: { url: 'https://example.com/overlay?token=abc123', display_uuid: DISPLAY_UUID, ...settings() } };
       }
@@ -124,34 +162,54 @@ export async function startFakeObs(options = {}) {
       const { op, d } = JSON.parse(String(raw));
       if (op === 1) {
         if (o.password && d.authentication !== sha(sha(o.password + salt) + challenge)) return ws.close(4009, 'Authentication failed.');
+        ws.subscriptions = d.eventSubscriptions ?? ALL_EVENTS;
         return ws.send(JSON.stringify({ op: 2, d: { negotiatedRpcVersion: 1 } }));
       }
       if (op !== 6) return;
       const { requestType, requestId, requestData } = d;
       log.push(requestType);
       sent.push({ requestType, requestData });
-      if (requestType === o.crashOn) return ws.terminate();
+      if (requestType === o.crashOn) return crash(ws, requestType);
       if (o.silentOn?.includes(requestType)) return;
       if (requestType === 'GetInputPropertiesListPropertyItems') {
         const cleared = o.inputs[inputOf(requestData)] === 'screen_capture' && requestData?.propertyName === 'type';
-        if (!cleared) return ws.terminate();
+        if (!cleared) return crash(ws, requestType);
       }
       const known = DOCUMENTED.has(requestType) || PRIVATE_REQUESTS.includes(requestType);
-      const answered = !known ? { error: 204 } : o.failOn?.includes(requestType) ? { error: 600 } : answer(requestType, requestData);
+      const failed = !known ? 204 : o.failOn?.includes(requestType) ? 600 : undefined;
+      const t = failed ? undefined : traceFor(requestType, requestData);
+      const status = failed ? { result: false, code: failed, comment: 'simulated failure' } : (t?.status ?? { result: true, code: 100 });
+      const answered = t ? (t.responseData ?? {}) : answer(requestType, requestData);
       // GetVersion is the handshake that the server needs to run, so it is never planted.
       const data = o.plant && requestType !== 'GetVersion' ? plantReply(answered) : answered;
-      const status = data?.error ? { result: false, code: data.error, comment: 'simulated failure' } : { result: true, code: 100 };
       ws.send(JSON.stringify({ op: 7, d: { requestType, requestId, requestStatus: status, ...(status.result ? { responseData: data } : {}) } }));
+      if (!t) return;
+      // The trace's events go out at their delays; its effect on the output state lands with the last one, as in OBS.
+      // A stop counts at once: OBS accepted the request, so the take ends.
+      if (t.effect?.recording === false && state.recording) stops.push({ requestType, cause: 'request' });
+      for (const ev of t.events ?? []) later(ev.delayMs ?? 0, () => broadcast(ev));
+      later(Math.max(0, ...(t.events ?? []).map((ev) => ev.delayMs ?? 0)), () => Object.assign(state, t.effect));
     });
   });
+  const broadcast = ({ eventType, eventData }) => {
+    const message = JSON.stringify({ op: 5, d: { eventType, eventIntent: EVENT_BIT.get(eventType), eventData } });
+    for (const c of wss.clients) if (c.subscriptions & EVENT_BIT.get(eventType)) c.send(message);
+  };
 
   return {
     port: wss.address().port,
     log,
     sent,
     planted,
+    state,
+    stops,
+    crashes: () => crashes,
     connections: () => connections,
     options: o,
-    close: () => new Promise((r) => { for (const c of wss.clients) c.terminate(); wss.close(r); }),
+    close: () => new Promise((r) => {
+      for (const t of timers) clearTimeout(t);
+      for (const c of wss.clients) c.terminate();
+      wss.close(r);
+    }),
   };
 }

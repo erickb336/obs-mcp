@@ -19,6 +19,8 @@ const MAY_PASS = new Set([
   'sceneName', 'sceneUuid', 'currentProgramSceneName', 'currentProgramSceneUuid', 'currentPreviewSceneName', 'currentPreviewSceneUuid',
   'inputName', 'inputUuid', 'sourceName', 'sourceUuid', 'filterName', 'outputName', 'transitionName', 'transitionUuid',
   'currentSceneTransitionName', 'currentSceneTransitionUuid', 'currentProfileName', 'currentSceneCollectionName',
+  // The lists of profile and scene collection names. The sample reply had empty lists; the stored traces fill them.
+  'profiles', 'sceneCollections',
   'desktop1', 'desktop2', 'mic1', 'mic2', 'mic3', 'mic4',
   // Kinds and states.
   'inputKind', 'unversionedInputKind', 'filterKind', 'outputKind', 'transitionKind', 'currentSceneTransitionKind', 'streamServiceType',
