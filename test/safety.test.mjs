@@ -60,6 +60,35 @@ test('no reply, server log or doctor output holds a password or a key (A8)', asy
   assert.deepEqual(leaks(all), []);
 });
 
+test('F-T12-17: with DEBUG=*, no password or planted secret of an OBS reply reaches stderr', async () => {
+  const fake = await startFakeObs({ password: PASSWORD, streamKey: STREAM_KEY, token: TOKEN, plant: true });
+  const dir = obsConfigDir({ server_enabled: true, server_port: fake.port, auth_required: true, server_password: PASSWORD });
+  const s = await connect(testEnv(dir, fake.port, { DEBUG: '*', DEBUG_DEPTH: '10' }));
+  for (const request of ['GetStreamServiceSettings', 'GetInputSettings', 'GetOutputSettings']) {
+    const e = CATALOGUE.find((x) => x.request === request);
+    await s.call('obs_read', { request, params: { ...sampleParams(e), ...(request === 'GetInputSettings' ? { inputName: 'Display' } : {}) } });
+  }
+  await s.close();
+  await fake.close();
+  assert.ok(fake.planted.length > 50, `${fake.planted.length} secrets were on the wire`);
+  const err = s.stderr();
+  const leaked = [PASSWORD, ...fake.planted].filter((p) => err.includes(p));
+  assert.deepEqual(leaked, [], `${leaked.length} secrets in stderr`);
+});
+
+test('F-T12-18: the packed package holds npm-shrinkwrap.json, so npx installs the pinned versions', () => {
+  const root = fileURLToPath(new URL('..', import.meta.url));
+  const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+  // The shrinkwrap is the project's only lockfile, so the pack needs no script (npm can run with ignore-scripts).
+  const out = execFileSync(npm, ['pack', '--dry-run', '--json', '--ignore-scripts'], { cwd: root, encoding: 'utf8', shell: process.platform === 'win32', stdio: ['ignore', 'pipe', 'ignore'] });
+  const files = JSON.parse(out.slice(out.indexOf('[')))[0].files.map((f) => f.path);
+  assert.ok(files.includes('npm-shrinkwrap.json'), files.join(', '));
+  const shrinkwrap = JSON.parse(readFileSync(join(root, 'npm-shrinkwrap.json'), 'utf8'));
+  const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
+  assert.deepEqual(shrinkwrap.packages[''].dependencies, pkg.dependencies);
+  assert.equal(shrinkwrap.packages['node_modules/debug'].version, '4.4.3');
+});
+
 test('the server process opens no listening socket', { skip: process.platform === 'win32' && 'uses lsof' }, async () => {
   const s = await connect(testEnv(obsConfigDir(null), await closedPort()));
   await s.call('obs_status');
@@ -142,7 +171,7 @@ test('the repository holds no machine-specific path, address or e-mail', () => {
     /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/,
   ];
   const hits = files
-    .filter((f) => !f.endsWith('package-lock.json') && existsSync(join(root, f)))
+    .filter((f) => !f.endsWith('npm-shrinkwrap.json') && existsSync(join(root, f)))
     .flatMap((f) => patterns.filter((p) => p.test(readFileSync(join(root, f), 'utf8'))).map((p) => `${f}: ${p}`));
   assert.deepEqual(hits, []);
 });

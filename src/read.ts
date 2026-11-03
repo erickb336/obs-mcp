@@ -33,7 +33,8 @@ const refuse =(refused: string, extra: Record<string, unknown> = {}): ReadResult
 export async function read(obs: Obs, request: string, params: Record<string, unknown> = {}): Promise<ReadResult> {
   const e = entry(request);
   if (!e) {
-    return refuse(`${request} is not in the catalogue of documented requests, so it is not sent.`, {
+    const name = request.length > 80 ? `${request.slice(0, 80)}...` : request;
+    return refuse(`${name} is not in the catalogue of documented requests, so it is not sent.`, {
       nearest: search(request, 3).map((x) => x.request),
     });
   }
@@ -65,12 +66,13 @@ export async function read(obs: Obs, request: string, params: Record<string, unk
   }
 }
 
-/** Returns why a list request must not run, or null. Reads the recording state just before, whoever started the recording. */
+/** Returns why a list request must not run, or null. Reads the recording and stream state just before, whoever started them. */
 async function listGuard(obs: Obs, params: Record<string, unknown>): Promise<string | null> {
   // With both fields, the guard could clear one input while OBS resolves the other.
   if (params.inputName !== undefined && params.inputUuid !== undefined) return 'give inputName or inputUuid, not both.';
-  const status = await obs.call('GetRecordStatus');
-  if (status.outputActive) return 'a recording is active, and a list request can crash OBS.';
+  const [record, stream] = await Promise.all([obs.call('GetRecordStatus'), obs.call('GetStreamStatus')]);
+  if (record.outputActive) return 'a recording is active, and a list request can crash OBS.';
+  if (stream.outputActive) return 'a stream is live, and a list request can crash OBS.';
   const input = params.inputUuid !== undefined ? { inputUuid: params.inputUuid } : { inputName: params.inputName };
   const { inputKind } = await obs.call('GetInputSettings', input);
   const v = obs.version!;

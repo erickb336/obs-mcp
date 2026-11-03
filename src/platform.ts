@@ -3,7 +3,7 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, readdirSync, statSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, delimiter } from 'node:path';
+import { join, delimiter, win32 } from 'node:path';
 
 const OS = process.platform;
 /** Runs an OS tool. Returns its output, also on a non-zero exit, or null when the tool is missing or hangs. */
@@ -64,7 +64,7 @@ export function versionFromLog(obsConfigDir: string): string | undefined {
 /** Local addresses on which a TCP port listens, read by the OS tool. null when the tool gave no reading. */
 export function listenAddresses(port: number): string[] | null {
   if (OS === 'win32') {
-    const out = probe('netstat', ['-an', '-p', 'TCP']);
+    const out = probe(netstatPath(), ['-an', '-p', 'TCP']);
     return out === null ? null : netstatListeners(out, port);
   }
   if (OS === 'darwin') {
@@ -77,6 +77,9 @@ export function listenAddresses(port: number): string[] | null {
   if (out === null) return null;
   return out.split('\n').filter(Boolean).map((l) => l.trim().split(/\s+/)[3]).filter(Boolean);
 }
+
+/** The full path of Windows netstat, so that a netstat.exe in the current folder or on PATH never runs instead. */
+export const netstatPath = (env: NodeJS.ProcessEnv = process.env) => win32.join(env.SystemRoot || 'C:\\Windows', 'System32', 'netstat.exe');
 
 /**
  * The local addresses in Windows "netstat -an" output that listen on a TCP port. The state word changes with the

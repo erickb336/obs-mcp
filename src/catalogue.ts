@@ -30,12 +30,15 @@ export function readRule(e: Entry): string {
   return `refused in 0.0; route from ${e.from}: ${e.route}`;
 }
 
+// Summaries that say what obs_read does where it differs from the protocol text.
+const SUMMARY = new Map([['GetSourceScreenshot', 'Saves a screenshot of a source to a local file that this server owns. The reply gives the file path, not the image.']]);
+
 /** The short form of an entry that obs_find returns. */
 export const brief = (e: Entry) => ({
   request: e.request,
   effect: e.class,
   in_0_0: readRule(e),
-  summary: e.description.split('\n')[0],
+  summary: SUMMARY.get(e.request) ?? e.description.split('\n')[0],
   fields: e.fields.map((f) => `${f.name}${f.optional ? '?' : ''}: ${f.type}`),
 });
 

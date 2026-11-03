@@ -102,12 +102,12 @@ describe('against the fake OBS', () => {
     assert.deepEqual(fake.log, []);
   });
 
-  test('the cleared list row runs, after GetRecordStatus and the input kind are read', async () => {
+  test('the cleared list row runs, after the recording state, the stream state and the input kind are read', async () => {
     fake.log.length = 0;
     const r = await s.call('obs_read', { request: 'GetInputPropertiesListPropertyItems', params: { inputName: 'Display', propertyName: 'type' } });
     assert.equal(r.isError, false, r.text);
     assert.deepEqual(r.json.data.propertyItems, [{ itemName: 'Display', itemValue: 0, itemEnabled: true }]);
-    assert.deepEqual(fake.log, ['GetRecordStatus', 'GetInputSettings', 'GetInputPropertiesListPropertyItems']);
+    assert.deepEqual(fake.log, ['GetRecordStatus', 'GetStreamStatus', 'GetInputSettings', 'GetInputPropertiesListPropertyItems']);
   });
 
   test('an uncleared list row is refused and not sent, so the fake OBS does not crash', async () => {
@@ -115,7 +115,7 @@ describe('against the fake OBS', () => {
     const r = await s.call('obs_read', { request: 'GetInputPropertiesListPropertyItems', params: { inputName: 'App audio', propertyName: 'application' } });
     assert.equal(r.isError, true);
     assert.match(r.json.refused, /no cleared row for \(macos, OBS 33\.0\.1, sck_audio_capture, application\)/);
-    assert.deepEqual(fake.log, ['GetRecordStatus', 'GetInputSettings']);
+    assert.deepEqual(fake.log, ['GetRecordStatus', 'GetStreamStatus', 'GetInputSettings']);
     assert.equal((await s.call('obs_status')).json.connected, true);
   });
 
@@ -186,7 +186,7 @@ describe('against the fake OBS', () => {
     for (const word of ['constructor', '__proto__', 'toString', 'hasOwnProperty', 'valueOf']) {
       const f = await s.call('obs_find', { query: word });
       assert.equal(f.isError, false, `${word}: ${f.text}`);
-      assert.ok(Array.isArray(f.json), `${word}: ${f.text}`);
+      assert.ok(Array.isArray(f.json) || Array.isArray(f.json.results), `${word}: ${f.text}`);
       const r = await s.call('obs_read', { request: word });
       assert.match(r.json?.refused ?? r.text, new RegExp(`^${word} is not in the catalogue`), `${word}: ${r.text}`);
     }
@@ -217,14 +217,50 @@ describe('against the fake OBS', () => {
   });
 });
 
-test('during an active recording, the list request is refused even on the cleared row', async () => {
-  const fake = await startFakeObs({ recording: true });
-  const s = await connect(testEnv(obsConfigDir(null), fake.port));
-  const r = await s.call('obs_read', { request: 'GetInputPropertiesListPropertyItems', params: { inputName: 'Display', propertyName: 'type' } });
+// G15: during a stream or a recording, the list request is refused even on the cleared row, and is not sent.
+for (const [state, why] of [[{ recording: true }, /a recording is active/], [{ streaming: true }, /a stream is live/], [{ recording: true, streaming: true }, /a recording is active/]]) {
+  test(`with ${JSON.stringify(state)}, the list request is refused even on the cleared row`, async () => {
+    const fake = await startFakeObs(state);
+    const s = await connect(testEnv(obsConfigDir(null), fake.port));
+    const r = await s.call('obs_read', { request: 'GetInputPropertiesListPropertyItems', params: { inputName: 'Display', propertyName: 'type' } });
+    await s.close();
+    await fake.close();
+    assert.equal(r.isError, true, r.text);
+    assert.match(r.json.refused, why);
+    assert.deepEqual(fake.log, ['GetVersion', 'GetRecordStatus', 'GetStreamStatus']);
+  });
+}
+
+test('F-T12-16: parallel first calls share one OBS connection, and a call after a failed connection tries again', async () => {
+  const port = await closedPort();
+  const s = await connect(testEnv(obsConfigDir(null), port));
+  assert.equal((await s.call('obs_status')).json.connected, false);
+  const fake = await startFakeObs({ port });
+  const replies = await Promise.all(Array.from({ length: 6 }, () => s.call('obs_read', { request: 'GetVersion' })));
+  const connections = fake.connections();
   await s.close();
   await fake.close();
-  assert.match(r.json.refused, /a recording is active/);
-  assert.deepEqual(fake.log, ['GetVersion', 'GetRecordStatus']);
+  assert.deepEqual(replies.map((r) => r.json?.data?.obsVersion), Array(6).fill('33.0.1'));
+  assert.equal(connections, 1);
+});
+
+test('F-T12-15: obs_find gives a hint for an empty or zero-match query, and says that a screenshot goes to a file', async () => {
+  const s = await connect(testEnv(obsConfigDir(null), await closedPort()));
+  const empty = await s.call('obs_find', { query: '' });
+  const none = await s.call('obs_find', { query: 'zzqx' });
+  const shot = await s.call('obs_find', { query: 'source screenshot', limit: 1 });
+  const long = await s.call('obs_read', { request: `Get${'X'.repeat(5000)}` });
+  await s.close();
+  for (const r of [empty, none]) {
+    assert.equal(r.isError, false, r.text);
+    assert.deepEqual(r.json.results, []);
+    assert.match(r.json.hint, /^No request matches\. Search with words such as 'scene list', 'input volume' or 'record status'\. Categories: canvases, config, filters, general, /);
+  }
+  assert.equal(shot.json[0].request, 'GetSourceScreenshot');
+  assert.doesNotMatch(shot.json[0].summary, /base64/i);
+  assert.match(shot.json[0].summary, /file/);
+  assert.ok(long.text.length < 400, `${long.text.length} characters`);
+  assert.match(long.json.refused, /^GetXXXX[X]*\.\.\. is not in the catalogue/);
 });
 
 test('the fake OBS closes with 1006 on an uncleared list row', async () => {

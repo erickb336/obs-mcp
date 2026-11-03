@@ -13,10 +13,11 @@ const SAMPLE = { String: 'sample', Number: 1, Boolean: false, Object: {}, Any: n
 const sample = (type) => (type.startsWith('Array') ? [] : SAMPLE[type]);
 
 /**
- * options: password, recording (bool), platform, obsVersion, inputs ({name: kind}), streamKey, token, crashOn (request name),
+ * options: password, recording (bool), streaming (bool), port (default: any free port), platform, obsVersion, inputs ({name: kind}), streamKey, token, crashOn (request name),
  * plant (bool: each string inside the settings of a reply becomes a unique planted secret, listed in `planted`).
  * Each input has the UUID "uuid-<name>". Like OBS, the fake resolves inputName first and inputUuid only when no name is given.
- * Returns { port, log, planted, close() }. log holds every request type that reached the fake, in order.
+ * Returns { port, log, planted, connections, close() }. log holds every request type that reached the fake, in order;
+ * connections() is the count of WebSocket connections that the fake accepted.
  */
 export const DISPLAY_UUID = '5d1f3c2a-8b4e-4f6a-9c7d-0e1f2a3b4c5d';
 export async function startFakeObs(options = {}) {
@@ -52,7 +53,8 @@ export async function startFakeObs(options = {}) {
     return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, k.endsWith('Settings') || k === 'slotValue' ? plantIn(x) : plantReply(x)]));
   };
   const profile = () => ({ 'Twitch/RefreshToken': token(), 'AdvOut/FFURL': `rtmp://live.example.com/app/${key()}`, 'Video/BaseCX': '1920' });
-  const wss = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+  const wss = new WebSocketServer({ host: '127.0.0.1', port: o.port ?? 0 });
+  let connections = 0;
   await new Promise((r) => wss.once('listening', r));
 
   const answer = (type, data) => {
@@ -61,6 +63,8 @@ export async function startFakeObs(options = {}) {
         return { obsVersion: o.obsVersion, obsWebSocketVersion: '5.7.6', rpcVersion: 1, availableRequests: [...DOCUMENTED.keys(), ...PRIVATE_REQUESTS], supportedImageFormats: ['png', 'jpg'], platform: o.platform, platformDescription: `${o.platform} (simulated)` };
       case 'GetRecordStatus':
         return { outputActive: !!o.recording, outputPaused: false, outputTimecode: '00:00:00.000', outputDuration: 0, outputBytes: 0 };
+      case 'GetStreamStatus':
+        return { outputActive: !!o.streaming, outputReconnecting: false, outputTimecode: '00:00:00.000', outputDuration: 0, outputCongestion: 0, outputBytes: 0, outputSkippedFrames: 0, outputTotalFrames: 0 };
       case 'GetInputSettings': {
         return { inputKind: o.inputs[inputOf(data)] ?? 'sample_kind', inputSettings: { url: 'https://example.com/overlay?token=abc123', display_uuid: DISPLAY_UUID, ...settings() } };
       }
@@ -94,6 +98,7 @@ export async function startFakeObs(options = {}) {
   };
 
   wss.on('connection', (ws) => {
+    connections++;
     const challenge = randomBytes(16).toString('base64');
     const salt = randomBytes(16).toString('base64');
     ws.send(JSON.stringify({ op: 0, d: { obsWebSocketVersion: '5.7.6', rpcVersion: 1, ...(o.password ? { authentication: { challenge, salt } } : {}) } }));
@@ -123,6 +128,7 @@ export async function startFakeObs(options = {}) {
     port: wss.address().port,
     log,
     planted,
+    connections: () => connections,
     options: o,
     close: () => new Promise((r) => { for (const c of wss.clients) c.terminate(); wss.close(r); }),
   };

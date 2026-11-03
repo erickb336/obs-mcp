@@ -75,12 +75,13 @@ What `obs_read` runs in 0.0, from the class table in [`catalogue/classes.json`](
 
 ## Safety rules
 
+- **During a stream or a recording, the AI may do only what OBS itself allows then.** The server refuses everything else. 0.0 is read only, so today this rule applies to one request: the list request below.
 - **The server never stops a recording unless you ask.** In 0.0 it sends no change at all: no start, no stop, no setting.
 - **Listener exposure.** When the obs-websocket server is on, OBS listens on all network interfaces. It has no option to listen on localhost only. Other devices on your network can reach it, unless a firewall blocks them. Keep a password set. `obs_status` and the doctor report what listens on the port.
 - **obs-mcp opens no port.** It speaks MCP over stdio only, and it connects to OBS on 127.0.0.1 only.
 - **The password** comes from the obs-websocket settings file, or from `OBS_WEBSOCKET_PASSWORD`. Never give it as an argument: OBS writes its own command line to its log. No reply, log or doctor line shows it.
-- **Secrets in replies.** Settings can hold a stream key, password or token in any text. So the AI gets settings text only when it is on a short allow-list. See [what the AI sees](#what-the-ai-sees).
-- **List requests can crash OBS.** `GetInputPropertiesListPropertyItems` runs only on a row that was tested on real OBS. Today there is one row: property `type` of a `screen_capture` input, on macOS, OBS 33.0.1. Before each list request the server reads the recording state; during any recording, whoever started it, the request is refused.
+- **Secrets in replies.** Settings can hold a stream key, password or token in any text. So the AI gets settings text only when it is on a short allow-list. See [what the AI sees](#what-the-ai-sees). The debug log of obs-websocket-js prints raw replies, so the server turns it off, also when `DEBUG` names it.
+- **List requests can crash OBS.** `GetInputPropertiesListPropertyItems` runs only on a row that was tested on real OBS. Today there is one row: property `type` of a `screen_capture` input, on macOS, OBS 33.0.1. Before each list request the server reads the recording state and the stream state. During any recording or live stream, whoever started it, the request is refused and not sent.
 - **The doctor changes nothing.** It reads files and asks the OS. It notes a leftover crash file in the OBS `.sentinel` folder and never deletes it.
 
 ### What the AI sees

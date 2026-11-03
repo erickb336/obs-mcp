@@ -1,8 +1,15 @@
 // The OBS layer: obs-websocket settings, the connection and one request path. It holds no OS-specific code:
 // the OBS settings folder comes in from platform.ts.
 import { existsSync, readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { OBSWebSocket, EventSubscription } from 'obs-websocket-js/json';
+
+// obs-websocket-js logs every raw OBS reply, secrets included, through the "debug" package when DEBUG names it.
+// Its logger reads the enabled names of the debug instance at each call, so turning its names off here holds
+// in any import order. The require is relative to obs-websocket-js, so that it gets the same debug instance.
+const debug = createRequire(import.meta.resolve('obs-websocket-js/json'))('debug') as { enable(n: string): void; disable(): string };
+debug.enable(`${debug.disable()},-obs-websocket-js,-obs-websocket-js:*`);
 
 const DEFAULT_PORT = 4455;
 const CONNECT_MS = 3000;
@@ -89,12 +96,21 @@ export type Version = {
 /** One lazy connection to OBS, shared by every tool call. */
 export class Obs {
   private ws?: OBSWebSocket;
+  // The connection that is open or opening. Parallel first calls share it; a failure clears it, so a later call tries again.
+  private opening?: Promise<Version>;
   version?: Version;
 
   constructor(private target: () => ReturnType<typeof connectionTarget>) {}
 
-  async connect(): Promise<Version> {
-    if (this.ws && this.version) return this.version;
+  connect(): Promise<Version> {
+    this.opening ??= this.open().catch((e) => {
+      this.opening = undefined;
+      throw e;
+    });
+    return this.opening;
+  }
+
+  private async open(): Promise<Version> {
     const t = this.target();
     const ws = new OBSWebSocket();
     let timer: NodeJS.Timeout | undefined;
@@ -114,6 +130,7 @@ export class Obs {
       if (this.ws === ws) {
         this.ws = undefined;
         this.version = undefined;
+        this.opening = undefined;
       }
     });
     this.ws = ws;
@@ -147,6 +164,7 @@ export class Obs {
     const ws = this.ws;
     this.ws = undefined;
     this.version = undefined;
+    this.opening = undefined;
     await ws?.disconnect().catch(() => {});
   }
 }
