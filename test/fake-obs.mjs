@@ -24,7 +24,11 @@ export async function startFakeObs(options = {}) {
   const token = () => o.token ?? 'sample-refresh-token';
   const inputOf = (d) => d?.inputName ?? (typeof d?.inputUuid === 'string' ? d.inputUuid.replace(/^uuid-/, '') : undefined);
   // Settings with a key in a URL path or query, as RTMP, SRT and RIST outputs, filters and media sources hold them.
-  const keyUrls = () => ({ server: `rtmp://live.example.com/app/${key()}`, srt_url: `srt://ingest.example.com:9000?streamid=${key()}`, rist_url: `rist://ingest.example.com:8000?secret=${key()}`, widget: `https://alerts.example.com/widget/${key()}` });
+  const keyUrls = () => ({ server: `rtmp://live.example.com/app/${key()}`, srt_url: `srt://ingest.example.com:9000?streamid=${key()}`, rist_url: `rist://ingest.example.com:8000?secret=${key()}`, widget: `https://alerts.example.com/widget/${key()}`,
+    // F-T12-8: other schemes, a URL inside text or after a space, and a URL with no scheme.
+    rtsp_url: `rtsp://admin:${key()}@cam.local/stream`, udp_url: `udp://239.0.0.1:1234?key=${key()}`, tcp_url: `tcp://ingest.example.com:9000/${key()}`,
+    icecast_url: `icecast://source:${key()}@radio.example.com:8000/mount`, spaced: ` rtmp://live.example.com/app/${key()}`,
+    note: `Ingest at rtmp://live.example.com/app/${key()} today`, login: `admin:${key()}@cam.local/stream`, input: `cam.local:554/live/${key()}` });
   const profile = () => ({ 'Twitch/RefreshToken': token(), 'AdvOut/FFURL': `rtmp://live.example.com/app/${key()}`, 'Video/BaseCX': '1920' });
   const wss = new WebSocketServer({ host: '127.0.0.1', port: 0 });
   await new Promise((r) => wss.once('listening', r));
@@ -41,7 +45,7 @@ export async function startFakeObs(options = {}) {
       case 'GetStreamServiceSettings':
         return { streamServiceType: 'rtmp_custom', streamServiceSettings: { server: 'rtmp://live.example.com/app/secretpath?k=1', key: o.streamKey ?? 'sample-stream-key', use_auth: true, username: 'someone', password: o.password ?? 'none' } };
       case 'GetOutputSettings':
-        return { outputSettings: keyUrls() };
+        return { outputSettings: { ...keyUrls(), url: `ingest.example.com:1935/app/${key()}` } }; // a custom FFmpeg output URL with no scheme
       case 'GetSourceFilter':
         return { filterEnabled: true, filterIndex: 0, filterKind: 'sample_kind', filterSettings: keyUrls() };
       case 'GetProfileParameter':

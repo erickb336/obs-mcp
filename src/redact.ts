@@ -1,7 +1,11 @@
 // Every value that leaves the server for the model passes here.
 
 const SECRET_KEY = /password|passwd|passphrase|secret|token|bearer|auth|cookie|credential|api_?key|stream_?key|^key$/i;
-const URL_LIKE = /^(https?|rtmps?|srt|rist|wss?):\/\//i;
+// A URL with any scheme, anywhere in a text, and a "user:password@host" with no scheme.
+const URL_IN_TEXT = /[a-z][a-z0-9+.-]*:\/\/\S+/gi;
+const USERINFO = /[^\s:@/]+:[^\s@/]*@([^\s/?#@]+)\S*/g;
+// A key whose value is a URL, so the value can be a URL with no scheme ("host:port/path").
+const URL_KEY = /url|(^|_)uri(_|$)|server|ingest|endpoint|^input$/i;
 
 /** Keeps only the scheme and host of a URL. The user name, password, path, query and fragment can each hold a key. */
 export function cutUrl(s: string): string {
@@ -14,10 +18,19 @@ export function cutUrl(s: string): string {
   }
 }
 
+/** Cuts each URL in a text to its scheme and host, and each "user:password@host" to its host. */
+function cutText(s: string, key: string): string {
+  const out = s.replace(URL_IN_TEXT, cutUrl).replace(USERINFO, '$1 [cut]');
+  if (out !== s || s.includes('://') || !URL_KEY.test(key)) return out;
+  // A URL with no scheme in a URL key: only the host and port pass.
+  const [, lead, host, rest] = /^(\s*)([^\s/?#]*)(.*)$/s.exec(s)!;
+  return rest ? `${lead}${host} [cut]` : s;
+}
+
 /** Replaces secret-named values with "[redacted]" and cuts URLs, at any depth. */
 export function redact(v: unknown, key = ''): unknown {
   if (SECRET_KEY.test(key) && v !== null && typeof v !== 'boolean' && typeof v !== 'object') return '[redacted]';
-  if (typeof v === 'string') return URL_LIKE.test(v) ? cutUrl(v) : v;
+  if (typeof v === 'string') return cutText(v, key);
   if (Array.isArray(v)) return v.map((x) => redact(x));
   if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, redact(x, k)]));
   return v;
