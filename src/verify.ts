@@ -68,19 +68,18 @@ const inside = (base: string, path: string) => {
   return !!r && r !== '..' && !r.startsWith(`..${sep}`) && !isAbsolute(r);
 };
 
-// A character in a path that can hide or change the text of the reply, where the name goes. The check refuses it and
-// names it. Other format characters are part of valid names (an emoji sequence, a zero-width non-joiner, a soft hyphen).
-const HIDDEN: [RegExp, string][] = [
-  [/\p{Cc}/u, 'a control character'], // C0 (a new line, a carriage return, NUL), DEL and C1 (U+0085, U+009B)
-  [/[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/u, 'a text direction control'],
-  [/[\u2028\u2029]/u, 'a line or paragraph separator'],
-  [/[\u200B\uFEFF]/u, 'a zero-width space'], // no valid name needs one, and it hides a difference between two names
-];
-function refuseHidden(path: string) {
-  for (const [re, what] of HIDDEN) {
-    const ch = re.exec(path)?.[0];
-    if (ch) throw new VerifyError(`The path has the character U+${ch.codePointAt(0)!.toString(16).toUpperCase().padStart(4, '0')}, ${what}. The check does not read such a path: rename the file.`);
-  }
+// A character that a reader cannot see, or that changes how the text around it shows: every control, format,
+// private-use, unassigned and surrogate code point, the line and paragraph separators, the tag characters and the
+// variation selectors. A reply shows each one as \u{hex}. A backslash that starts "\u{" in the real text shows as
+// \u{5C}, so each "\u{...}" in a reply is an escape. Other backslashes stay, so a Windows path reads as it is.
+const INVISIBLE = /[\p{Cc}\p{Cf}\p{Co}\p{Cn}\p{Cs}\p{Zl}\p{Zp}\u{E0000}-\u{E007F}\uFE00-\uFE0F\u{E0100}-\u{E01EF}]|\\(?=u\{)/gu;
+
+/** The value with each invisible character of each string in it shown as \u{hex}. Only for display: never for a path to open. */
+export function visible<T>(v: T): T {
+  if (typeof v === 'string') return v.replace(INVISIBLE, (c) => `\\u{${c.codePointAt(0)!.toString(16).toUpperCase()}}`) as T;
+  if (Array.isArray(v)) return v.map(visible) as T;
+  if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [visible(k), visible(x)])) as T;
+  return v;
 }
 
 /**
@@ -92,7 +91,6 @@ export function resolveInFolder(folder: string, input: string): { path: string; 
   const shown = JSON.stringify(input.slice(0, 200));
   const outside = new VerifyError(`${shown} is outside the recording folder, or a link leads out of it. The check reads only files inside the recording folder.`);
   if (!input) throw new VerifyError('Give the name of a file in the recording folder.');
-  refuseHidden(input);
   if (input.split(/[\\/]/).includes('..')) throw new VerifyError(`The path ${shown} has "..". Give a file inside the recording folder.`);
   // A UNC, device or namespace path: \\host\share, //host/share, \\?\ and \\.\
   if (/^[\\/]{2}/.test(input)) throw outside;
@@ -111,7 +109,6 @@ export function resolveInFolder(folder: string, input: string): { path: string; 
     throw new VerifyError(`No file ${shown} in the recording folder.`);
   }
   if (!inside(root, real)) throw outside;
-  refuseHidden(real);
   if (!statSync(real).isFile()) throw new VerifyError(`${shown} is not a regular file.`);
   return { path: real, name: relative(root, real) };
 }
@@ -253,8 +250,9 @@ export function parseMetadata(text: string, channels = 0): TrackLog {
 
 /** The error lines of a pass (ffmpeg runs with "-v error"): at most 5, without the memory addresses and the full path. */
 export function errorLines(text: string, file = ''): string[] {
-  const lines = text.split(/\r?\n/).filter((l) => l.trim());
-  return [...new Set(lines.map((l) => (file ? l.split(file).join(basename(file)) : l).replace(/ @ 0x[0-9a-f]+/gi, '').slice(0, 200)))].slice(0, 5);
+  // The full path goes first, before the split into lines: a name can hold a new line.
+  const lines = (file ? text.split(file).join(basename(file)) : text).split(/\r?\n/).filter((l) => l.trim());
+  return [...new Set(lines.map((l) => l.replace(/ @ 0x[0-9a-f]+/gi, '').slice(0, 200)))].slice(0, 5);
 }
 
 /** One audio track, measured: where its audio data ends and should end, its levels and its silent intervals over the full timeline. */

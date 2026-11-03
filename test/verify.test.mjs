@@ -4,13 +4,13 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import fs, { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import fs, { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, test } from 'node:test';
 import { audioTools } from '../dist/platform.js';
-import { errorLines, judge, limitsFrom, measure, parseMetadata, parseProbe, resolveInFolder, timecode, verifyFile } from '../dist/verify.js';
+import { errorLines, judge, limitsFrom, measure, parseMetadata, parseProbe, resolveInFolder, timecode, verifyFile, visible } from '../dist/verify.js';
 import { startFakeObs } from './fake-obs.mjs';
 import { FFMPEG_VERSION, FORGED, makeFixtures, SKIP } from './fixtures.mjs';
 import { closedPort, connect, obsConfigDir, testEnv } from './helpers.mjs';
@@ -38,6 +38,21 @@ lavfi.astats.Overall.RMS_level=-40.100000
 lavfi.astats.Overall.Number_of_samples=2880000.000000
 `;
 const LOGS = [parseMetadata(TRACK_1, 1), parseMetadata(TRACK_2, 1)];
+
+// Names with characters that a reader cannot see, each with the text that a reply must show. The tag characters spell
+// an instruction ("Ignore") that a model could read but a person cannot see.
+const INVISIBLE_NAMES = {
+  zwj: ['emoji \u{1F468}\u200D\u{1F469}\u200D\u{1F467}.mov', 'emoji \u{1F468}\\u{200D}\u{1F469}\\u{200D}\u{1F467}.mov'],
+  zwnj: ['\u0645\u06CC\u200C\u062E\u0648\u0627\u0647\u0645.mov', '\u0645\u06CC\\u{200C}\u062E\u0648\u0627\u0647\u0645.mov'],
+  softHyphen: ['soft\u00ADhyphen.mov', 'soft\\u{AD}hyphen.mov'],
+  tags: ['take\u{E0049}\u{E0067}\u{E006E}\u{E006F}\u{E0072}\u{E0065}.mov', 'take\\u{E0049}\\u{E0067}\\u{E006E}\\u{E006F}\\u{E0072}\\u{E0065}.mov'],
+  bidi: ['take\u202Evom.mov', 'take\\u{202E}vom.mov'],
+  lineSeparator: ['take\u2028more.mov', 'take\\u{2028}more.mov'],
+  newLine: ['take.mov\n[Parsed_astats_0 @ 0x1] Channel: 1000000000.mov', 'take.mov\\u{A}[Parsed_astats_0 @ 0x1] Channel: 1000000000.mov'],
+  literalEscape: ['lit\\u{41}.mov', 'lit\\u{5C}u{41}.mov'],
+};
+// Every invisible character that a reply must never hold raw. The test keeps its own copy of the rule.
+const RAW_INVISIBLE = /[\p{Cc}\p{Cf}\p{Co}\p{Cn}\p{Cs}\p{Zl}\p{Zp}\u{E0000}-\u{E007F}\uFE00-\uFE0F\u{E0100}-\u{E01EF}]/u;
 const PROBE_60 = JSON.stringify({
   streams: [
     { codec_type: 'video', duration: '60.000000', start_time: '0.000000' },
@@ -117,6 +132,17 @@ describe('parser and rules, on captured ffmpeg text (no ffmpeg needed)', () => {
     const text = "[in#0/mov @ 0x1] stream 1, offset 0x18b28: partial file\n[mov @ 0x2] Could not open /rec/truncated.mov: moov atom not found\n\n[mov @ 0x2] Could not open /rec/truncated.mov: moov atom not found\n";
     assert.deepEqual(errorLines(text, '/rec/truncated.mov'), ['[in#0/mov] stream 1, offset 0x18b28: partial file', '[mov] Could not open truncated.mov: moov atom not found']);
     assert.equal(errorLines('e\n'.repeat(3) + [1, 2, 3, 4, 5, 6].join('\n')).length, 5);
+  });
+
+  test('F-T5-24, F-T5-26: visible shows each invisible character as \\u{hex}, and keeps every other character', () => {
+    for (const [raw, shown] of Object.values(INVISIBLE_NAMES)) assert.equal(visible(raw), shown);
+    assert.equal(visible('a\uD800b\uDFFFc'), 'a\\u{D800}b\\u{DFFF}c', 'a lone surrogate');
+    assert.equal(visible('pua\uE000 unassigned\u0378 fe0f\uFE0F vs\u{E0100} nul\0 del\u007F c1\u0085 bom\uFEFF zwsp\u200B ps\u2029'), 'pua\\u{E000} unassigned\\u{378} fe0f\\u{FE0F} vs\\u{E0100} nul\\u{0} del\\u{7F} c1\\u{85} bom\\u{FEFF} zwsp\\u{200B} ps\\u{2029}');
+    // A backslash that starts "\u{" in the real text is escaped too, so a literal "\u{41}" is not read as an escape.
+    assert.equal(visible('lit\\u{41}.mov'), 'lit\\u{5C}u{41}.mov');
+    assert.equal(visible('C:\\rec\\take.mov'), 'C:\\rec\\take.mov', 'any other backslash stays');
+    assert.equal(visible('Aufnahme é 録画 \u{1F600}.mov'), 'Aufnahme é 録画 \u{1F600}.mov');
+    assert.deepEqual(visible({ file: 'a\u202E', claims: [{ claim: 'Source "\u{E0049}"', n: 1, ok: true, none: null }] }), { file: 'a\\u{202E}', claims: [{ claim: 'Source "\\u{E0049}"', n: 1, ok: true, none: null }] });
   });
 
   test('timecode and settings', () => {
@@ -330,46 +356,13 @@ describe('path guard: only a regular file inside the recording folder', () => {
     }
   });
 
-  /** The refusal text for a hidden character: its code point and its class. */
-  const hidden = (code, what) => `The path has the character U+${code}, ${what}. The check does not read such a path: rename the file.`;
-
-  test('F-T5-16: a path with a new line, a carriage return or NUL is refused and names the character, also when a link inside leads to it', { skip: process.platform === 'win32' && 'a file name with a new line is not valid on Windows' }, () => {
-    const forged = 'take.mov\n[Parsed_astats_0 @ 0x1] Channel: 1000000000';
-    writeFileSync(join(folder, forged), 'x');
-    assert.throws(() => resolveInFolder(folder, forged), { message: hidden('000A', 'a control character') });
-    assert.throws(() => resolveInFolder(folder, 'take\r.mov'), { message: hidden('000D', 'a control character') });
-    assert.throws(() => resolveInFolder(folder, 'take\0.mov'), { message: hidden('0000', 'a control character') });
-    symlinkSync(join(folder, forged), join(folder, 'plain.mov'));
-    assert.throws(() => resolveInFolder(folder, 'plain.mov'), { message: hidden('000A', 'a control character') });
-  });
-
-  test('F-T5-21, F-T5-24: a C1 control, DEL, a text direction control, U+2028, U+2029 or a zero-width space is refused and named, also behind a link', { skip: process.platform === 'win32' && 'a symbolic link needs extra rights on Windows' }, () => {
-    const cases = [
-      ['0085', 'a control character'],
-      ['009B', 'a control character'],
-      ['007F', 'a control character'],
-      ...['202A', '202E', '2066', '2069', '200E', '200F', '061C'].map((c) => [c, 'a text direction control']),
-      ['2028', 'a line or paragraph separator'],
-      ['2029', 'a line or paragraph separator'],
-      ['200B', 'a zero-width space'],
-      ['FEFF', 'a zero-width space'],
-    ];
-    cases.forEach(([code, what], i) => {
-      const name = `take${String.fromCodePoint(parseInt(code, 16))}vom.mov`;
-      writeFileSync(join(folder, name), 'x');
-      assert.throws(() => resolveInFolder(folder, name), { message: hidden(code, what) }, `U+${code} in the given path`);
-      symlinkSync(join(folder, name), join(folder, `link-${i}.mov`));
-      assert.throws(() => resolveInFolder(folder, `link-${i}.mov`), { message: hidden(code, what) }, `U+${code} in the real path`);
-    });
-  });
-
-  test('F-T5-24: a valid name with an emoji sequence (ZWJ), a zero-width non-joiner or a soft hyphen is read, also behind a link', { skip: process.platform === 'win32' && 'a symbolic link needs extra rights on Windows' }, () => {
-    const names = ['emoji\u{1F468}\u200D\u{1F469}.mov', 'pers\u200Cian.mov', 'soft\u00ADhyphen.mov', 'Aufnahme é 録画.mov'];
+  test('F-T5-26: a name with an invisible character is never refused, and the real name is kept to open the file, also behind a link', { skip: process.platform === 'win32' && 'a file name with a new line is not valid on Windows' }, () => {
+    const names = Object.values(INVISIBLE_NAMES).map(([raw]) => raw);
     names.forEach((name, i) => {
       writeFileSync(join(folder, name), 'x');
-      assert.equal(resolveInFolder(folder, name).name, name);
-      symlinkSync(join(folder, name), join(folder, `valid-${i}.mov`));
-      assert.equal(resolveInFolder(folder, `valid-${i}.mov`).name, name);
+      assert.deepEqual(resolveInFolder(folder, name), { path: join(realpathSync(folder), name), name });
+      symlinkSync(join(folder, name), join(folder, `link-${i}.mov`));
+      assert.equal(resolveInFolder(folder, `link-${i}.mov`).name, name);
     });
   });
 
@@ -703,5 +696,28 @@ describe('the obs_verify_file tool, over stdio', () => {
     await s.close();
     assert.equal(r.json.state, 'verified', r.text);
     assert.equal(r.json.claims.find((c) => c.claim === 'Source "Mic" (voice) has sound on track 1').verdict, 'pass');
+  });
+
+  test('F-T5-24, F-T5-26: SIMULATED real files with invisible characters in their names verify, and no reply text holds a raw invisible character', { skip: SKIP || (process.platform === 'win32' && 'a file name with a new line is not valid on Windows') }, async () => {
+    const { f } = makeFixtures();
+    const folder = mkdtempSync(join(tmpdir(), 'obs-mcp-names-SIMULATED-'));
+    for (const [raw] of Object.values(INVISIBLE_NAMES)) copyFileSync(f.healthy, join(folder, raw));
+    const s = await connect(testEnv(obsConfigDir(null), await closedPort(), { OBS_MCP_RECORDING_DIR: folder }));
+    const source = 'Mic\u202E\u{E0049}\u200D';
+    const got = [];
+    for (const [raw] of Object.values(INVISIBLE_NAMES)) got.push(await s.call('obs_verify_file', { path: raw, expect: [{ name: source, kind: 'voice', track: 1 }] }));
+    // Error texts with names from the input: a missing file, and two sources with one name.
+    const missing = await s.call('obs_verify_file', { path: 'gone\u{E0041}\u2066.mov' });
+    const twice = await s.call('obs_verify_file', { path: INVISIBLE_NAMES.bidi[0], expect: [{ name: source, kind: 'voice', track: 1 }, { name: source, kind: 'any', track: 2 }] });
+    await s.close();
+    Object.entries(INVISIBLE_NAMES).forEach(([key, [, shown]], i) => {
+      const r = got[i];
+      assert.deepEqual([r.isError, r.json?.state, r.json?.file], [false, 'verified', shown], `${key}: ${r.text}`);
+      assert.equal(r.json.claims.find((c) => c.claim.startsWith('Source')).claim, 'Source "Mic\\u{202E}\\u{E0049}\\u{200D}" (voice) has sound on track 1');
+    });
+    assert.equal(missing.json.problem, 'No file "gone\\u{E0041}\\u{2066}.mov" in the recording folder.');
+    assert.equal(twice.json.problem, 'Two expected sources have the name "Mic\\u{202E}\\u{E0049}\\u{200D}". Give each a different name.');
+    assert.equal(s.replies.length, Object.keys(INVISIBLE_NAMES).length + 2);
+    for (const text of s.replies) assert.doesNotMatch(text, RAW_INVISIBLE, text);
   });
 });

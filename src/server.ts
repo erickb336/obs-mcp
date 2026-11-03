@@ -8,7 +8,7 @@ import { connectionTarget, listenerCheck, Obs, ObsError, SETTINGS_FILE_FIX } fro
 import { listeners, obsConfigDir } from './platform.js';
 import { deleteScreenshots, read } from './read.js';
 import { capped } from './redact.js';
-import { resolveInFolder, verifyFile, VerifyError } from './verify.js';
+import { resolveInFolder, verifyFile, VerifyError, visible } from './verify.js';
 
 export const VERSION = '0.0.0';
 const READ_ONLY = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
@@ -120,11 +120,13 @@ function createServer() {
       annotations: READ_ONLY,
     },
     async ({ path, expect }) => {
+      // A name from the folder or from the input can hold an invisible character: the reply and each error show it escaped.
       try {
         const file = resolveInFolder(await recordingFolder(), path);
-        return text(await verifyFile(file.path, file.name, expect));
+        return text(visible(await verifyFile(file.path, file.name, expect)));
       } catch (e) {
-        if (e instanceof VerifyError) return text({ problem: e.message }, true);
+        if (e instanceof VerifyError) return text({ problem: visible(e.message) }, true);
+        if (e instanceof Error) e.message = visible(e.message);
         throw e;
       }
     },
