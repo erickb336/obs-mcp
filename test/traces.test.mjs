@@ -53,10 +53,10 @@ test('the leak scan names each place and rule of a raw trace, never the value, a
   const leaks = findLeaks(RAW, MACHINE);
   assert.deepEqual(leaks.map((l) => `${l.path}: ${l.rule}`), [
     'hello.authentication: secret field "authentication"', 'identify.authentication: secret field "authentication"',
-    'streamServiceSettings.server: not on the allow-list', 'streamServiceSettings.key: secret field "key"', 'streamServiceSettings.service: not on the allow-list',
+    'streamServiceSettings.server: settings value', 'streamServiceSettings.key: secret field "key"', 'streamServiceSettings.service: settings value',
     'streamServiceSettings.username: secret field "username"', 'streamServiceSettings.password: secret field "password"',
     'outputSettings.path: file path', 'recordDirectory: file path',
-    'inputSettings.display_uuid: not on the allow-list', 'inputSettings.device_id: not on the allow-list', 'inputSettings.window_name: not on the allow-list',
+    'inputSettings.display_uuid: settings value', 'inputSettings.device_id: settings value', 'inputSettings.window_name: settings value',
     'scene.sceneName: not on the allow-list',
   ]);
   assert.equal(JSON.stringify(leaks).includes('hunter22'), false);
@@ -101,6 +101,26 @@ for (const [name, value] of Object.entries(MISSED)) {
     assert.deepEqual(findLeaks(JSON.parse(out), MACHINE), []);
   });
 }
+
+test('F-T6-11: the scrub removes every settings and slot string, also one in the form of a number, a time or a version', () => {
+  const raw = {
+    inputSettings: { pin: '4711', phone: '+1 555-0100', nested: { card: '4111-1111-1111-1111' }, list: ['12:30', '1.2.3'], fps: 30 },
+    slotValue: '0042',
+    propertyItems: [{ itemName: '5551234567', itemValue: '4111111111111111', itemEnabled: true }],
+    kept: { outputTimecode: '00:00:01.234', obsVersion: '33.0.1', cpuUsage: '4711' },
+  };
+  assert.deepEqual(scrub(raw, MACHINE), {
+    inputSettings: { pin: '[scrubbed]', phone: '[scrubbed]', nested: { card: '[scrubbed]' }, list: ['[scrubbed]', '[scrubbed]'], fps: 30 },
+    slotValue: '[scrubbed]',
+    propertyItems: [{ itemName: '[scrubbed]', itemValue: '[scrubbed]', itemEnabled: true }],
+    kept: raw.kept,
+  });
+  assert.deepEqual(findLeaks(raw, MACHINE).map((l) => `${l.path}: ${l.rule}`), [
+    'inputSettings.pin: settings value', 'inputSettings.phone: settings value', 'inputSettings.nested.card: settings value',
+    'inputSettings.list[0]: settings value', 'inputSettings.list[1]: settings value', 'slotValue: settings value',
+    'propertyItems[0].itemName: settings value', 'propertyItems[0].itemValue: settings value',
+  ]);
+});
 
 test('the scrub removes the account name and host name of this machine, and a secret of the run, in a text it keeps', () => {
   const out = scrub({ comment: 'Alice ran OBS', basis: 'on studio-mac', platformDescription: 'macOS 15', outputName: 'hunter22' }, { ...MACHINE, secrets: ['hunter22'] });

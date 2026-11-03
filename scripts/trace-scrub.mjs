@@ -34,6 +34,9 @@ const KEEP = new Map([
   ...['requestType', 'eventType', 'availableRequests', 'supportedImageFormats', 'platform', 'outputName', 'outputKind', 'inputKind',
     'unversionedInputKind', 'filterKind', 'transitionKind', 'sourceType', 'hotkeyName', 'imageFormat'].map((k) => [k, IDENT]),
 ]);
+// A settings value: the free-form values that OBS, plugins and scripts keep (README, "what the AI sees"). Every string
+// in it goes, whatever its shape, because a PIN, a phone number or a card number has the form of a number.
+const SETTINGS = /Settings$|^(slotValue|itemName|itemValue)$/;
 // An object key stays only when it is a plain identifier.
 const KEY = /^[A-Za-z_][\w.-]{0,63}$/;
 
@@ -66,10 +69,11 @@ function localRules({ secrets = [], user = userInfo().username, host = hostname(
 const denied = (s, rules, text) => rules.find(([, re, scope]) => (!scope || text) && re.test(s))?.[0];
 
 /** The rule that removes the string s in the field key, or undefined when it stays. */
-function why(key, s, rules) {
+function why(key, s, rules, inSettings) {
   if (s === '' || PLACEHOLDER.test(s)) return undefined;
   if (SECRET_FIELD.test(key)) return `secret field "${key}"`;
   if (PATH.test(s)) return 'file path';
+  if (inSettings) return 'settings value';
   const shape = KEEP.get(key);
   if (!(FORM.test(s) || shape?.test(s) || (/Uuid$/.test(key) && UUID.test(s)))) return 'not on the allow-list';
   return denied(s, rules, shape === TEXT);
@@ -79,14 +83,14 @@ function why(key, s, rules) {
 function walk(value, options) {
   const rules = [...localRules(options), ...DENY];
   const changes = [];
-  const go = (v, path, key) => {
+  const go = (v, path, key, inSettings = SETTINGS.test(key)) => {
     if (typeof v === 'string') {
-      const rule = why(key, v, rules);
+      const rule = why(key, v, rules, inSettings);
       if (!rule) return v;
       changes.push({ path, rule });
       return rule === 'file path' ? '[path]' : '[scrubbed]';
     }
-    if (Array.isArray(v)) return v.map((x, i) => go(x, `${path}[${i}]`, key));
+    if (Array.isArray(v)) return v.map((x, i) => go(x, `${path}[${i}]`, key, inSettings));
     if (v && typeof v === 'object') {
       if (SECRET_FIELD.test(key) && Object.keys(v).length) return changes.push({ path, rule: `secret field "${key}"` }), '[scrubbed]';
       return Object.fromEntries(Object.entries(v).map(([k, x]) => {
@@ -95,7 +99,7 @@ function walk(value, options) {
         const name = bad ? '[scrubbed]' : k;
         const at = path ? `${path}.${name}` : name;
         if (bad) changes.push({ path: at, rule: `key: ${bad}` });
-        return [name, go(x, at, name)];
+        return [name, go(x, at, name, inSettings || SETTINGS.test(name))];
       }));
     }
     return v;
