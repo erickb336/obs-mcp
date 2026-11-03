@@ -21,58 +21,92 @@ const WIN_HOME = ['C:', 'Us' + 'ers', 'alice'].join('\\');
 const LAN = ['192', '168', '1', '20'].join('.');
 const MACHINE = { user: 'alice', host: 'studio-mac.local' };
 
-// A raw trace part with one value of each kind that the scrub must remove.
+// A raw trace part with one value of each kind that the scrub must remove, and the kinds that it keeps.
 const RAW = {
   hello: { obsWebSocketVersion: '5.7.6', authentication: { challenge: 'Q2hhbGxlbmdlVmFsdWU=', salt: 'U2FsdFZhbHVl' } },
   identify: { rpcVersion: 1, authentication: 'aGFzaGVkLXBhc3N3b3Jk' },
-  streamServiceSettings: { server: 'rtmp://live.example.com/app/live_123456789_abcdefgh', key: 'live_123456789_abcdefgh', service: 'Twitch', protocol: 'RTMP', use_auth: true, username: 'alice', password: 'hunter22' },
+  streamServiceSettings: { server: 'rtmp://live.example.com/app/live_123456789_abcdefgh', key: 'live_123456789_abcdefgh', service: 'Twitch', use_auth: true, username: 'alice', password: 'hunter22' },
   outputSettings: { path: `${HOME}/Movies/2026-11-03 10-00-00.mov`, muxer_settings: '', bitrate: 6000 },
   recordDirectory: `${LINUX_HOME}/Videos`,
   inputSettings: { display_uuid: '5d1f3c2a-8b4e-4f6a-9c7d-0e1f2a3b4c5d', type: 0, device_id: 'default', window_name: 'Mail - alice' },
-  log: `obs --websocket_password hunter22 from ${WIN_HOME}\\obs on studio-mac.local at ${LAN} and fe80::1c2d, mail ${['ops.team', 'example.org'].join('@')}`,
-  bare: 'ingest.example.com:1935/app/k3y',
-  header: 'Authorization: Bearer abc.def.ghi',
-  url: 'ws://127.0.0.1:4455',
-  kept: { outputTimecode: '00:00:01.234', obsVersion: '33.0.1', outputState: 'OBS_WEBSOCKET_OUTPUT_STARTED', activeFps: 30 },
+  scene: { sceneName: 'Call', sceneUuid: '00000000-0000-4000-8000-000000000001', sceneIndex: 0 },
+  kept: {
+    outputTimecode: '00:00:01.234', obsVersion: '33.0.1', outputState: 'OBS_WEBSOCKET_OUTPUT_STARTED', activeFps: 30, requestType: 'GetStats',
+    outputName: 'Replay Buffer', hotkeyName: 'libobs.mute', comment: 'Video settings cannot be changed while an output is active.',
+  },
 };
 
-test('the scrub replaces each secret and machine detail, and keeps timecodes, versions and states', () => {
-  assert.deepEqual(scrub(RAW, { ...MACHINE, secrets: ['hunter22'] }), {
+test('the scrub keeps only allow-listed forms and fields, and replaces every other string', () => {
+  assert.deepEqual(scrub(RAW, MACHINE), {
     hello: { obsWebSocketVersion: '5.7.6', authentication: '[scrubbed]' },
     identify: { rpcVersion: 1, authentication: '[scrubbed]' },
-    streamServiceSettings: { server: '[scrubbed]', key: '[scrubbed]', service: 'Twitch', protocol: 'RTMP', use_auth: true, username: '[scrubbed]', password: '[scrubbed]' },
+    streamServiceSettings: { server: '[scrubbed]', key: '[scrubbed]', service: '[scrubbed]', use_auth: true, username: '[scrubbed]', password: '[scrubbed]' },
     outputSettings: { path: '[path]', muxer_settings: '', bitrate: 6000 },
     recordDirectory: '[path]',
-    inputSettings: { display_uuid: '[scrubbed]', type: 0, device_id: 'default', window_name: '[scrubbed]' },
-    log: 'obs --websocket_password=[scrubbed] from C:\\Users\\[user]\\obs on [host] at [address] and [address], mail [email]',
-    bare: '[host]',
-    header: 'Authorization: Bearer [scrubbed]',
-    url: 'ws://[scrubbed]',
-    kept: { outputTimecode: '00:00:01.234', obsVersion: '33.0.1', outputState: 'OBS_WEBSOCKET_OUTPUT_STARTED', activeFps: 30 },
+    inputSettings: { display_uuid: '[scrubbed]', type: 0, device_id: '[scrubbed]', window_name: '[scrubbed]' },
+    scene: { sceneName: '[scrubbed]', sceneUuid: '00000000-0000-4000-8000-000000000001', sceneIndex: 0 },
+    kept: RAW.kept,
   });
 });
 
 test('the leak scan names each place and rule of a raw trace, never the value, and finds nothing after the scrub', () => {
   const leaks = findLeaks(RAW, MACHINE);
-  assert.deepEqual(leaks.map((l) => l.path), [
-    'hello.authentication', 'identify.authentication', 'streamServiceSettings.server', 'streamServiceSettings.key',
-    'streamServiceSettings.username', 'streamServiceSettings.password', 'outputSettings.path', 'recordDirectory',
-    'inputSettings.display_uuid', 'inputSettings.window_name',
-    'log', 'log', 'log', 'log', 'log', 'log', 'bare', 'header', 'url',
+  assert.deepEqual(leaks.map((l) => `${l.path}: ${l.rule}`), [
+    'hello.authentication: secret field "authentication"', 'identify.authentication: secret field "authentication"',
+    'streamServiceSettings.server: not on the allow-list', 'streamServiceSettings.key: secret field "key"', 'streamServiceSettings.service: not on the allow-list',
+    'streamServiceSettings.username: secret field "username"', 'streamServiceSettings.password: secret field "password"',
+    'outputSettings.path: file path', 'recordDirectory: file path',
+    'inputSettings.display_uuid: not on the allow-list', 'inputSettings.device_id: not on the allow-list', 'inputSettings.window_name: not on the allow-list',
+    'scene.sceneName: not on the allow-list',
   ]);
-  // The user name in the Windows home goes by the account-name rule, before the Windows home rule sees it.
-  assert.deepEqual(leaks.filter((l) => l.path === 'log').map((l) => l.rule), ['account name of this machine', 'host name of this machine', 'flag with a secret', 'e-mail', 'IPv4 address', 'IPv6 address']);
   assert.equal(JSON.stringify(leaks).includes('hunter22'), false);
   const clean = scrub(RAW, MACHINE);
   assert.deepEqual(findLeaks(clean, MACHINE), []);
   assert.deepEqual(scrub(clean, MACHINE), clean);
 });
 
-test('the scrub removes the account name and host name of this machine, and a secret of the run, in any text', () => {
-  const out = scrub({ note: 'Alice ran OBS on studio-mac; token hunter22 held' }, { ...MACHINE, secrets: ['hunter22'] });
-  assert.deepEqual(out, { note: '[user] ran OBS on [host]; token [scrubbed] held' });
+// F-T6-2, F-T6-6, F-T6-7, F-T6-8: the values that the scrub of R131 left in a trace. Each one goes in a free field
+// (settings, a name, a slot), and in a text field that the allow-list keeps ("comment"), where the deny list must find it.
+const BS = '\\';
+const MISSED = {
+  apiKey: { inputSettings: { apiKey: 'AKIAIOSFODNN7EXAMPLE' } },
+  accessKey: { responseData: { accessKey: 'sk-live-0123456789abcdefABCDEF0123' } },
+  'short key in a profile value': { parameterValue: 'abcd-efgh-ijkl-mnop-qrst' },
+  'one-word secret in a slot': { slotValue: 'hunter2secret' },
+  'real name in an input name': { inputName: 'Erick Benitez iPhone Camera' },
+  'path under /Volumes': { comment: `Failed to open ${['', 'Vol' + 'umes', 'Erick SSD', 'take.mkv'].join('/')}` },
+  'path under /private/var/folders': { comment: `Wrote ${['', 'private', 'var', 'folders', 'ab', 'T', 'obs.log'].join('/')}` },
+  'host name with no port': { comment: 'connected to erick-studio-mbp.lan' },
+  'escaped Windows home in text': { comment: `saved to C:${BS}${BS}Us${'ers'}${BS}${BS}zelda${BS}${BS}Videos ok` },
+  'escaped Windows home in a name': { outputPath: `saved to C:${BS}${BS}Us${'ers'}${BS}${BS}zelda${BS}${BS}Videos ok` },
+  'lower-case Windows home': { comment: 'in c:/us' + 'ers/zelda/x' },
+  'lower-case macOS home': { comment: 'in /us' + 'ers/zelda/x' },
+  'password= in text': { comment: 'login with password=Zq9hunterPW now' },
+  'password: in text': { comment: 'login with password: Zq9hunterPW now' },
+  'token: in text': { note: 'token: Zq9hunterPW' },
+  'key: in a kept text': { comment: 'stream key: Zq9hunterPW' },
+  'home path in a key': { [`${HOME.replace('alice', 'zelda')}/file.mov`]: 1 },
+  'Windows home in a key': { [`C:/Us${'ers'}/zelda/file.mov`]: 1 },
+  'URL with a key in a key': { 'rtmp://live.x.com/app/KEYNAMESEC': 1 },
+  'stream key in a plain key': { live_123456789_KEYNAMESEC: 1 },
+  'long token in a kept text': { comment: 'use 9f8e7d6c5b4a39281706 now' },
+  'address in a number form': { cpuUsage: LAN },
+};
+for (const [name, value] of Object.entries(MISSED)) {
+  test(`the scan finds, and the scrub removes, a value that R131 missed: ${name}`, () => {
+    const leaks = findLeaks(value, MACHINE);
+    assert.equal(leaks.length, 1, JSON.stringify(leaks));
+    const out = JSON.stringify(scrub(value, MACHINE));
+    assert.match(out, /^\{"\[scrubbed\]":1\}$|^\{"\w+":(\{"\w+":)?"\[(scrubbed|path)\]"\}?\}$/);
+    assert.deepEqual(findLeaks(JSON.parse(out), MACHINE), []);
+  });
+}
+
+test('the scrub removes the account name and host name of this machine, and a secret of the run, in a text it keeps', () => {
+  const out = scrub({ comment: 'Alice ran OBS', basis: 'on studio-mac', platformDescription: 'macOS 15', outputName: 'hunter22' }, { ...MACHINE, secrets: ['hunter22'] });
+  assert.deepEqual(out, { comment: '[scrubbed]', basis: '[scrubbed]', platformDescription: 'macOS 15', outputName: '[scrubbed]' });
   // A name of 3 letters or fewer is not matched, so that a user called "obs" does not empty every trace.
-  assert.deepEqual(scrub({ note: 'obs ran' }, { user: 'obs', host: 'pc' }), { note: 'obs ran' });
+  assert.deepEqual(scrub({ comment: 'obs ran' }, { user: 'obs', host: 'pc' }), { comment: 'obs ran' });
 });
 
 const traces = loadTraces();
@@ -151,6 +185,26 @@ test('the fake OBS replays a record stop: STOPPING, then STOPPED about 1 s later
   assert.equal((await c.call('StopRecord')).code, 501);
   await c.obs.disconnect();
   await fake.close();
+});
+
+test('F-T6-3: the fake OBS logs, answers and counts each request of a RequestBatch, so a batched stop counts in the sweep', async () => {
+  const fake = await startFakeObs({ recording: true });
+  const c = await client(fake);
+  const results = await c.obs.callBatch([{ requestType: 'GetRecordStatus' }, { requestType: 'StopRecord' }]);
+  assert.deepEqual(results.map((r) => [r.requestType, r.requestStatus.code]), [['GetRecordStatus', 100], ['StopRecord', 100]]);
+  assert.deepEqual(fake.log, ['GetRecordStatus', 'StopRecord']);
+  assert.deepEqual(fake.stops, [{ requestType: 'StopRecord', cause: 'request' }]);
+  // A list request that crashes OBS ends the batch, and the crash counts as a stop.
+  const crashed = await startFakeObs({ recording: true });
+  const d = await client(crashed);
+  const closed = new Promise((r) => d.obs.once('ConnectionClosed', r));
+  d.obs.callBatch([{ requestType: 'GetInputPropertiesListPropertyItems', requestData: { inputName: 'App audio', propertyName: 'application' } }, { requestType: 'GetStats' }]).catch(() => {});
+  assert.equal((await closed).code, 1006);
+  assert.deepEqual(crashed.log, ['GetInputPropertiesListPropertyItems']);
+  assert.deepEqual(crashed.stops, [{ requestType: 'GetInputPropertiesListPropertyItems', cause: 'crash' }]);
+  await c.obs.disconnect();
+  await fake.close();
+  await crashed.close();
 });
 
 test('the fake OBS sends events only to a client that subscribed to their category, as obs-websocket does', async () => {

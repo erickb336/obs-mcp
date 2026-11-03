@@ -1,35 +1,27 @@
 // Records obs-websocket traces for the fake OBS: each request, its reply and the events after it, through the
 // trace scrub. Run it only with the owner's consent, against a disposable OBS profile and scene collection.
 //
-//   OBS_WEBSOCKET_PASSWORD=... node scripts/capture-traces.mjs --url ws://127.0.0.1:4455 --out trace.json [--plan plan.json] [--allow-record]
+//   OBS_WEBSOCKET_PASSWORD=... node scripts/capture-traces.mjs --url ws://127.0.0.1:4455 --out trace.json [--plan plan.json] [--allow-record] [--timeout-ms 10000]
 //
 // The password comes from OBS_WEBSOCKET_PASSWORD or a hidden prompt, never from an argument, and it is never written.
 // The script:
 // - connects to a loopback address only;
 // - reads GetStreamStatus and GetRecordStatus first, and stops when either output is active;
-// - never sends a list request on "application" or "display_uuid" (each crashed OBS 33.0.1 in T4);
-// - never starts a stream or sends a raw output or hotkey request (each can start a stream or stop a recording);
-// - sends a record start or stop only with --allow-record;
-// - writes the trace only after the scrub, and only when the leak scan of the scrubbed trace is empty.
+// - sends only what obs_read of the server runs, with the same guards (a list request only on a cleared row and with
+//   no output active, a profile parameter only from the safe list), and a record start or stop only with --allow-record;
+// - stops when OBS closes the connection or gives no reply in --timeout-ms, and then writes the partial trace;
+// - writes the trace only after the scrub.
 // plan.json is a list of { requestType, requestData }. With no plan, it sends each catalogue read that needs no field.
 import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { parseArgs } from 'node:util';
 import WebSocket from 'ws';
-import { findLeaks, scrub } from './trace-scrub.mjs';
+import { CATALOGUE, entry, READ_GUARDED } from '../dist/catalogue.js';
+import { listGuard, SAFE_PROFILE_PARAMETERS } from '../dist/read.js';
+import { scrub } from './trace-scrub.mjs';
 
-const CRASH_ROWS = ['application', 'display_uuid'];
-const NEVER = ['StartStream', 'ToggleStream', 'StartOutput', 'StopOutput', 'ToggleOutput', 'TriggerHotkeyByName', 'TriggerHotkeyByKeySequence'];
 const RECORD = ['StartRecord', 'StopRecord', 'ToggleRecord'];
 const ALL_EVENTS = 2047;
-
-/** Why the script does not send a request, or undefined when it may send it. */
-function refusal({ requestType, requestData }, allowRecord) {
-  if (requestType === 'GetInputPropertiesListPropertyItems' && CRASH_ROWS.includes(requestData?.propertyName)) return `a list request on "${requestData.propertyName}" crashed OBS 33.0.1 (T4).`;
-  if (NEVER.includes(requestType)) return 'it can start a stream or stop a recording, so the capture never sends it.';
-  if (RECORD.includes(requestType) && !allowRecord) return 'it starts or stops a recording; give --allow-record to send it.';
-  return undefined;
-}
 
 const fail = (message, code = 1) => {
   console.error(`capture-traces: ${message}`);
@@ -39,20 +31,20 @@ const fail = (message, code = 1) => {
 if (process.argv.slice(2).some((a) => /^--?[\w-]*(pass|secret|token)/i.test(a))) fail('the password comes from OBS_WEBSOCKET_PASSWORD or a prompt, never from an argument.', 2);
 let args;
 try {
-  args = parseArgs({ options: { url: { type: 'string' }, out: { type: 'string' }, plan: { type: 'string' }, 'allow-record': { type: 'boolean' }, 'settle-ms': { type: 'string', default: '300' } } }).values;
+  args = parseArgs({ options: { url: { type: 'string' }, out: { type: 'string' }, plan: { type: 'string' }, 'allow-record': { type: 'boolean' }, 'settle-ms': { type: 'string', default: '300' }, 'timeout-ms': { type: 'string', default: '10000' } } }).values;
 } catch {
   // The parser's message quotes the argument, and an argument can be a password typed in the wrong place.
-  fail('unknown argument. Options: --url, --out, --plan, --allow-record, --settle-ms.', 2);
+  fail('unknown argument. Options: --url, --out, --plan, --allow-record, --settle-ms, --timeout-ms.', 2);
 }
 if (!args.url || !args.out) fail('give --url ws://127.0.0.1:<port> and --out <file.json>.', 2);
 const url = new URL(args.url);
 if (!/^wss?:$/.test(url.protocol) || !['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)) fail('the URL must be ws:// on a loopback address (127.0.0.1, localhost or [::1]).', 2);
 const settleMs = Number(args['settle-ms']);
+const timeoutMs = Number(args['timeout-ms']);
+if (!(timeoutMs > 0)) fail('--timeout-ms must be a number above 0.', 2);
 const plan = args.plan
   ? JSON.parse(readFileSync(args.plan, 'utf8'))
-  : JSON.parse(readFileSync(new URL('../dist/catalogue.json', import.meta.url), 'utf8'))
-      .filter((e) => e.class === 'read' && e.fields.every((f) => f.optional))
-      .map((e) => ({ requestType: e.request }));
+  : CATALOGUE.filter((e) => e.class === 'read' && e.fields.every((f) => f.optional)).map((e) => ({ requestType: e.request }));
 
 /** Reads a password from the terminal with no echo. */
 function prompt() {
@@ -83,9 +75,15 @@ const pending = new Map();
 const events = [];
 let password = process.env.OBS_WEBSOCKET_PASSWORD;
 let nextId = 0;
+let closed;
 const opened = new Promise((resolve, reject) => {
-  ws.once('error', (e) => reject(new Error(`no connection to ${url.origin}: ${e.message}`)));
-  ws.once('close', (code) => reject(new Error(code === 4009 ? 'OBS refused the password.' : `OBS closed the connection (${code}).`)));
+  ws.on('error', (e) => reject(new Error(`no connection to ${url.origin}: ${e.message}`)));
+  ws.on('close', (code) => {
+    closed = code;
+    reject(new Error(code === 4009 ? 'OBS refused the password.' : `OBS closed the connection (${code}).`));
+    // A crash of OBS closes the socket with 1006: each request in flight ends with the reason.
+    for (const p of pending.values()) p.end(new Error(`OBS closed the connection (${code}) while ${p.requestType} was in flight.`));
+  });
   ws.on('message', async (raw) => {
     const { op, d } = JSON.parse(String(raw));
     if (op === 0) {
@@ -98,13 +96,22 @@ const opened = new Promise((resolve, reject) => {
       ws.send(JSON.stringify({ op: 1, d: { rpcVersion: 1, eventSubscriptions: ALL_EVENTS, ...(authentication ? { authentication } : {}) } }));
     } else if (op === 2) resolve();
     else if (op === 5) events.push({ at: performance.now(), eventType: d.eventType, eventData: d.eventData ?? {} });
-    else if (op === 7) pending.get(d.requestId)?.(d);
+    else if (op === 7) pending.get(d.requestId)?.end(undefined, d);
   });
 });
+/** Sends one request. It fails when OBS closes the connection or gives no reply in --timeout-ms. */
 const send = (requestType, requestData) =>
-  new Promise((resolve) => {
+  new Promise((resolve, reject) => {
+    if (closed !== undefined) return reject(new Error(`OBS closed the connection (${closed}) before ${requestType}.`));
     const requestId = String(++nextId);
-    pending.set(requestId, resolve);
+    const timer = setTimeout(() => pending.get(requestId)?.end(new Error(`OBS gave no reply to ${requestType} in ${timeoutMs} ms.`)), timeoutMs);
+    const end = (error, reply) => {
+      clearTimeout(timer);
+      pending.delete(requestId);
+      if (error) reject(error);
+      else resolve(reply);
+    };
+    pending.set(requestId, { requestType, end });
     ws.send(JSON.stringify({ op: 6, d: { requestType, requestId, ...(requestData ? { requestData } : {}) } }));
   });
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -144,18 +151,51 @@ async function record(requestType, requestData) {
   return reply;
 }
 
-const version = (await record('GetVersion')).responseData ?? {};
-const stream = (await record('GetStreamStatus')).responseData;
-const rec = (await record('GetRecordStatus')).responseData;
-if (stream?.outputActive !== false || rec?.outputActive !== false) {
-  ws.close();
-  fail('a stream or a recording is active, or its state is not known. The capture sends nothing during an output, and wrote no file.', 3);
+let version = {};
+/** The server's guards call OBS through this: a failed request throws, as in the server. */
+const guardObs = {
+  get version() {
+    return version;
+  },
+  async call(requestType, requestData) {
+    const reply = await send(requestType, requestData);
+    if (!reply.requestStatus.result) throw new Error(`${requestType} failed with code ${reply.requestStatus.code}.`);
+    return reply.responseData ?? {};
+  },
+};
+/** Why the capture does not send a request, or { data } to send. The rules are those of obs_read in the server. */
+async function check({ requestType, requestData }) {
+  if (RECORD.includes(requestType)) return args['allow-record'] ? { data: requestData } : { why: 'it starts or stops a recording; give --allow-record to send it.' };
+  const e = entry(requestType);
+  if (!e) return { why: 'it is not in the catalogue of documented requests.' };
+  if (e.class !== 'read' && !READ_GUARDED.has(requestType)) return { why: `it is in the class ${e.class}. The capture sends what obs_read runs, and a record start or stop with --allow-record.` };
+  if (requestType === 'GetProfileParameter' && !SAFE_PROFILE_PARAMETERS.get(requestData?.parameterCategory)?.includes(requestData?.parameterName)) {
+    return { why: 'it is not on the list of safe profile parameters, because a profile can hold tokens and stream keys.' };
+  }
+  if (requestType === 'GetInputPropertiesListPropertyItems') {
+    const guard = await listGuard(guardObs, requestData ?? {});
+    return typeof guard === 'string' ? { why: guard } : { data: guard };
+  }
+  return { data: requestData };
 }
+
 const refused = [];
-for (const r of plan) {
-  const why = refusal(r, args['allow-record']);
-  if (why) refused.push({ requestType: r.requestType, ...(r.requestData ? { requestData: r.requestData } : {}), refused: why });
-  else await record(r.requestType, r.requestData);
+let stopped;
+try {
+  version = (await record('GetVersion')).responseData ?? {};
+  const stream = (await record('GetStreamStatus')).responseData;
+  const rec = (await record('GetRecordStatus')).responseData;
+  if (stream?.outputActive !== false || rec?.outputActive !== false) {
+    ws.close();
+    fail('a stream or a recording is active, or its state is not known. The capture sends nothing during an output, and wrote no file.', 3);
+  }
+  for (const r of plan) {
+    const { why, data } = await check(r);
+    if (why) refused.push({ requestType: r.requestType, ...(r.requestData ? { requestData: r.requestData } : {}), refused: why });
+    else await record(r.requestType, data);
+  }
+} catch (e) {
+  stopped = e.message;
 }
 ws.close();
 
@@ -163,15 +203,15 @@ const trace = scrub(
   {
     format: 'obs-mcp-trace/1',
     source: 'captured',
-    basis: `Captured with scripts/capture-traces.mjs from OBS ${version.obsVersion}, obs-websocket ${version.obsWebSocketVersion}, then scrubbed.`,
+    basis: `Captured with the trace capture script from OBS ${version.obsVersion}, obs-websocket ${version.obsWebSocketVersion}, then scrubbed.`,
+    ...(stopped ? { incomplete: `The capture stopped: ${stopped}` } : {}),
     obs: { obsVersion: version.obsVersion, obsWebSocketVersion: version.obsWebSocketVersion, rpcVersion: version.rpcVersion, platform: version.platform },
     entries,
     refused,
   },
   { secrets: [password] },
 );
-const leaks = findLeaks(trace, { secrets: [password] });
-if (leaks.length) fail(`the scrubbed trace still holds ${leaks.length} value(s) to scrub, so no file was written.`, 4);
 writeFileSync(args.out, `${JSON.stringify(trace, null, 2)}\n`);
-console.error(`capture-traces: ${entries.length} requests recorded, ${refused.length} refused, written to ${args.out} after the scrub.`);
 for (const r of refused) console.error(`  refused ${r.requestType}: ${r.refused}`);
+if (stopped) fail(`stopped: ${stopped} The partial trace (${entries.length} requests) is written to ${args.out} after the scrub.`, 5);
+console.error(`capture-traces: ${entries.length} requests recorded, ${refused.length} refused, written to ${args.out} after the scrub.`);

@@ -1,7 +1,8 @@
 // An in-memory fake of OBS with obs-websocket 5 (JSON). SIMULATED: it is not real OBS.
 // It replays the stored traces in test/traces: a request type and request data, in an output state, give the
 // response status, code, data and events of the trace, and its effect on the output state. A request with no trace
-// gets sample values in the shape of protocol.json. It logs each request it gets, counts each recording stop, and
+// gets sample values in the shape of protocol.json. It logs each request it gets, alone or in a RequestBatch (op 8),
+// counts each recording stop, and
 // closes the socket with no close frame (the client sees 1006) on a list request that real OBS can crash on.
 import { createHash, randomBytes } from 'node:crypto';
 import { readdirSync, readFileSync } from 'node:fs';
@@ -165,32 +166,47 @@ export async function startFakeObs(options = {}) {
         ws.subscriptions = d.eventSubscriptions ?? ALL_EVENTS;
         return ws.send(JSON.stringify({ op: 2, d: { negotiatedRpcVersion: 1 } }));
       }
-      if (op !== 6) return;
-      const { requestType, requestId, requestData } = d;
-      log.push(requestType);
-      sent.push({ requestType, requestData });
-      if (requestType === o.crashOn) return crash(ws, requestType);
-      if (o.silentOn?.includes(requestType)) return;
-      if (requestType === 'GetInputPropertiesListPropertyItems') {
-        const cleared = o.inputs[inputOf(requestData)] === 'screen_capture' && requestData?.propertyName === 'type';
-        if (!cleared) return crash(ws, requestType);
+      if (op === 6) {
+        const reply = handle(ws, d);
+        if (reply) ws.send(JSON.stringify({ op: 7, d: reply }));
+      } else if (op === 8) {
+        // A RequestBatch: each request is logged, answered and counted like a single one, in order. A crash ends the batch.
+        const results = [];
+        for (const r of d.requests ?? []) {
+          const reply = handle(ws, r);
+          if (ws.readyState !== ws.OPEN) return;
+          if (reply) results.push(reply);
+        }
+        ws.send(JSON.stringify({ op: 9, d: { requestId: d.requestId, results } }));
       }
-      const known = DOCUMENTED.has(requestType) || PRIVATE_REQUESTS.includes(requestType);
-      const failed = !known ? 204 : o.failOn?.includes(requestType) ? 600 : undefined;
-      const t = failed ? undefined : traceFor(requestType, requestData);
-      const status = failed ? { result: false, code: failed, comment: 'simulated failure' } : (t?.status ?? { result: true, code: 100 });
-      const answered = t ? (t.responseData ?? {}) : answer(requestType, requestData);
-      // GetVersion is the handshake that the server needs to run, so it is never planted.
-      const data = o.plant && requestType !== 'GetVersion' ? plantReply(answered) : answered;
-      ws.send(JSON.stringify({ op: 7, d: { requestType, requestId, requestStatus: status, ...(status.result ? { responseData: data } : {}) } }));
-      if (!t) return;
+    });
+  });
+  /** Logs and answers one request, and plays its trace. Returns the reply, or nothing on a crash or a silent request. */
+  const handle = (ws, { requestType, requestId, requestData }) => {
+    log.push(requestType);
+    sent.push({ requestType, requestData });
+    if (requestType === o.crashOn) return crash(ws, requestType);
+    if (o.silentOn?.includes(requestType)) return undefined;
+    if (requestType === 'GetInputPropertiesListPropertyItems') {
+      const cleared = o.inputs[inputOf(requestData)] === 'screen_capture' && requestData?.propertyName === 'type';
+      if (!cleared) return crash(ws, requestType);
+    }
+    const known = DOCUMENTED.has(requestType) || PRIVATE_REQUESTS.includes(requestType);
+    const failed = !known ? 204 : o.failOn?.includes(requestType) ? 600 : undefined;
+    const t = failed ? undefined : traceFor(requestType, requestData);
+    const status = failed ? { result: false, code: failed, comment: 'simulated failure' } : (t?.status ?? { result: true, code: 100 });
+    const answered = t ? (t.responseData ?? {}) : answer(requestType, requestData);
+    // GetVersion is the handshake that the server needs to run, so it is never planted.
+    const data = o.plant && requestType !== 'GetVersion' ? plantReply(answered) : answered;
+    if (t) {
       // The trace's events go out at their delays; its effect on the output state lands with the last one, as in OBS.
       // A stop counts at once: OBS accepted the request, so the take ends.
       if (t.effect?.recording === false && state.recording) stops.push({ requestType, cause: 'request' });
       for (const ev of t.events ?? []) later(ev.delayMs ?? 0, () => broadcast(ev));
       later(Math.max(0, ...(t.events ?? []).map((ev) => ev.delayMs ?? 0)), () => Object.assign(state, t.effect));
-    });
-  });
+    }
+    return { requestType, requestId, requestStatus: status, ...(status.result ? { responseData: data } : {}) };
+  };
   const broadcast = ({ eventType, eventData }) => {
     const message = JSON.stringify({ op: 5, d: { eventType, eventIntent: EVENT_BIT.get(eventType), eventData } });
     for (const c of wss.clients) if (c.subscriptions & EVENT_BIT.get(eventType)) c.send(message);

@@ -31,42 +31,60 @@ const files = () => {
 const PLAN = [
   { requestType: 'GetStats' },
   { requestType: 'GetInputPropertiesListPropertyItems', requestData: { inputName: 'App audio', propertyName: 'application' } },
+  { requestType: 'GetInputPropertiesListPropertyItems', requestData: { inputName: 'App audio', propertyName: 'Application' } },
   { requestType: 'GetInputPropertiesListPropertyItems', requestData: { inputName: 'Display', propertyName: 'display_uuid' } },
   { requestType: 'GetInputPropertiesListPropertyItems', requestData: { inputName: 'Display', propertyName: 'type' } },
   { requestType: 'StartStream' },
   { requestType: 'ToggleOutput', requestData: { outputName: 'adv_file_output' } },
+  // F-T6-1: requests that R41 refuses for a crash (obs-studio #14105) or for plugin code.
+  { requestType: 'OpenInputPropertiesDialog', requestData: { inputName: 'Display' } },
+  { requestType: 'PressInputPropertiesButton', requestData: { inputName: 'Display', propertyName: 'reactivate_capture' } },
+  { requestType: 'CallVendorRequest', requestData: { vendorName: 'x', requestType: 'stop' } },
+  { requestType: 'SetOutputSettings', requestData: { outputName: 'adv_file_output', outputSettings: {} } },
+  { requestType: 'GetProfileParameter', requestData: { parameterCategory: 'Twitch', parameterName: 'RefreshToken' } },
   { requestType: 'StartRecord' },
   { requestType: 'StopRecord' },
   { requestType: 'GetStreamServiceSettings' },
 ];
+const GUARD_READS = ['GetRecordStatus', 'GetStreamStatus', 'GetOutputList', 'GetInputList'];
+const NO_ROW = (kind, property) => `no cleared row for (macos, OBS 33.0.1, ${kind}, ${property}). A list request can crash OBS, so only rows tested on real OBS run.`;
+const NOT_A_READ = (cls) => `it is in the class ${cls}. The capture sends what obs_read runs, and a record start or stop with --allow-record.`;
 
-test('the capture sends the plan, refuses the crash rows, a stream start and a record start or stop, and writes a scrubbed trace', async () => {
+test('the capture sends only what obs_read runs, with its guards, and writes a scrubbed trace', async () => {
   const fake = await startFakeObs({ password: PASSWORD, streamKey: 'live_123456789_captureKey' });
   const f = files();
   writeFileSync(f.plan, JSON.stringify(PLAN));
   const r = await run(['--url', `ws://127.0.0.1:${fake.port}`, '--out', f.out, '--plan', f.plan, '--settle-ms', '0'], { OBS_WEBSOCKET_PASSWORD: PASSWORD });
   await fake.close();
   assert.equal(r.code, 0, r.stderr);
-  assert.deepEqual(fake.log, ['GetVersion', 'GetStreamStatus', 'GetRecordStatus', 'GetStats', 'GetInputPropertiesListPropertyItems', 'GetStreamServiceSettings']);
+  // Before each list request, the server's guard reads the outputs and the inputs (F-T6-9).
+  assert.deepEqual(fake.log, ['GetVersion', 'GetStreamStatus', 'GetRecordStatus', 'GetStats', ...GUARD_READS, ...GUARD_READS, ...GUARD_READS, ...GUARD_READS, 'GetInputPropertiesListPropertyItems', 'GetStreamServiceSettings']);
+  assert.deepEqual(fake.sent.find((s) => s.requestType === 'GetInputPropertiesListPropertyItems').requestData, { inputUuid: 'uuid-Display', propertyName: 'type' });
   assert.equal(fake.crashes(), 0);
   const text = readFileSync(f.out, 'utf8');
   const trace = JSON.parse(text);
   assert.equal(trace.source, 'captured');
-  assert.deepEqual(trace.refused.map((x) => `${x.requestType} ${x.requestData?.propertyName ?? ''}: ${x.refused}`), [
-    'GetInputPropertiesListPropertyItems application: a list request on "application" crashed OBS 33.0.1 (T4).',
-    'GetInputPropertiesListPropertyItems display_uuid: a list request on "display_uuid" crashed OBS 33.0.1 (T4).',
-    'StartStream : it can start a stream or stop a recording, so the capture never sends it.',
-    'ToggleOutput : it can start a stream or stop a recording, so the capture never sends it.',
-    'StartRecord : it starts or stops a recording; give --allow-record to send it.',
-    'StopRecord : it starts or stops a recording; give --allow-record to send it.',
+  assert.deepEqual(trace.refused.map((x) => `${x.requestType}: ${x.refused}`), [
+    `GetInputPropertiesListPropertyItems: ${NO_ROW('sck_audio_capture', 'application')}`,
+    `GetInputPropertiesListPropertyItems: ${NO_ROW('sck_audio_capture', 'Application')}`,
+    `GetInputPropertiesListPropertyItems: ${NO_ROW('screen_capture', 'display_uuid')}`,
+    `StartStream: ${NOT_A_READ('guarded')}`,
+    `ToggleOutput: ${NOT_A_READ('guarded')}`,
+    `OpenInputPropertiesDialog: ${NOT_A_READ('change')}`,
+    `PressInputPropertiesButton: ${NOT_A_READ('change')}`,
+    `CallVendorRequest: ${NOT_A_READ('guarded')}`,
+    `SetOutputSettings: ${NOT_A_READ('change')}`,
+    'GetProfileParameter: it is not on the list of safe profile parameters, because a profile can hold tokens and stream keys.',
+    'StartRecord: it starts or stops a recording; give --allow-record to send it.',
+    'StopRecord: it starts or stops a recording; give --allow-record to send it.',
   ]);
   // The fake's stream settings hold a server URL with a key, a user name and the password: the scrub took them out.
   assert.deepEqual(trace.entries.find((e) => e.requestType === 'GetStreamServiceSettings').responseData.streamServiceSettings, {
-    server: '[scrubbed]', protocol: 'RTMP', key: '[scrubbed]', use_auth: true, username: '[scrubbed]', password: '[scrubbed]',
+    server: '[scrubbed]', protocol: '[scrubbed]', key: '[scrubbed]', use_auth: true, username: '[scrubbed]', password: '[scrubbed]',
   });
   for (const secret of [PASSWORD, 'live_123456789_captureKey', 'someone']) assert.equal(text.includes(secret), false, secret);
   assert.deepEqual(findLeaks(trace), []);
-  assert.match(r.stderr, /6 requests recorded, 6 refused, written to .* after the scrub\./);
+  assert.match(r.stderr, /6 requests recorded, 12 refused, written to .* after the scrub\./);
   assert.equal(r.stderr.includes(PASSWORD), false);
 
   // The fake OBS replays the captured trace: the captured GetStats reply comes back.
@@ -94,6 +112,51 @@ test('with --allow-record, the capture records a take with its events and its ef
   assert.ok(take[2].events[1].delayMs >= 1000, `STOPPED after ${take[2].events[1].delayMs} ms`);
   assert.deepEqual(fake.stops, [{ requestType: 'StopRecord', cause: 'request' }]);
 });
+
+test('F-T6-1: during a take that --allow-record started, the capture still refuses each request that obs_read refuses, and a list request', async () => {
+  const fake = await startFakeObs();
+  const f = files();
+  writeFileSync(f.plan, JSON.stringify([
+    { requestType: 'StartRecord' },
+    { requestType: 'OpenInputPropertiesDialog', requestData: { inputName: 'Display' } },
+    { requestType: 'CallVendorRequest', requestData: { vendorName: 'x', requestType: 'stop' } },
+    { requestType: 'TriggerHotkeyByName', requestData: { hotkeyName: 'OBSBasic.StopRecording' } },
+    { requestType: 'GetInputPropertiesListPropertyItems', requestData: { inputName: 'Display', propertyName: 'type' } },
+    { requestType: 'StopRecord' },
+  ]));
+  const r = await run(['--url', `ws://127.0.0.1:${fake.port}`, '--out', f.out, '--plan', f.plan, '--settle-ms', '0', '--allow-record']);
+  await fake.close();
+  assert.equal(r.code, 0, r.stderr);
+  assert.deepEqual(fake.log, ['GetVersion', 'GetStreamStatus', 'GetRecordStatus', 'StartRecord', ...GUARD_READS, 'StopRecord']);
+  assert.deepEqual(JSON.parse(readFileSync(f.out, 'utf8')).refused.map((x) => `${x.requestType}: ${x.refused}`), [
+    `OpenInputPropertiesDialog: ${NOT_A_READ('change')}`,
+    `CallVendorRequest: ${NOT_A_READ('guarded')}`,
+    `TriggerHotkeyByName: ${NOT_A_READ('guarded')}`,
+    'GetInputPropertiesListPropertyItems: a recording is active, and a list request can crash OBS.',
+  ]);
+  assert.deepEqual(fake.stops, [{ requestType: 'StopRecord', cause: 'request' }]);
+  assert.equal(fake.crashes(), 0);
+});
+
+// F-T6-4 and F-T6-9: a crash of OBS or a request with no reply ends the capture with the reason, and the partial trace is written.
+for (const [name, options, reason] of [
+  ['OBS closes the connection', { crashOn: 'GetSceneList' }, 'OBS closed the connection (1006) while GetSceneList was in flight.'],
+  ['OBS gives no reply', { silentOn: ['GetSceneList'] }, 'OBS gave no reply to GetSceneList in 300 ms.'],
+]) {
+  test(`when ${name} during the capture, it stops with the reason and writes the scrubbed partial trace`, async () => {
+    const fake = await startFakeObs(options);
+    const f = files();
+    writeFileSync(f.plan, JSON.stringify([{ requestType: 'GetStats' }, { requestType: 'GetSceneList' }, { requestType: 'GetVideoSettings' }]));
+    const r = await run(['--url', `ws://127.0.0.1:${fake.port}`, '--out', f.out, '--plan', f.plan, '--settle-ms', '0', '--timeout-ms', '300']);
+    await fake.close();
+    assert.equal(r.code, 5, r.stderr);
+    assert.equal(r.stderr, `capture-traces: stopped: ${reason} The partial trace (4 requests) is written to ${f.out} after the scrub.\n`);
+    const trace = JSON.parse(readFileSync(f.out, 'utf8'));
+    assert.equal(trace.incomplete, `The capture stopped: ${reason}`);
+    assert.deepEqual(trace.entries.map((e) => e.requestType), ['GetVersion', 'GetStreamStatus', 'GetRecordStatus', 'GetStats']);
+    assert.deepEqual(findLeaks(trace), []);
+  });
+}
 
 for (const [name, state] of [['a recording', { recording: true }], ['a stream', { streaming: true }]]) {
   test(`during ${name}, the capture sends nothing after the two status reads and writes no file`, async () => {

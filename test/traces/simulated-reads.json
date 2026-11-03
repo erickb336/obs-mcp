@@ -17,17 +17,17 @@
       "requestType": "GetSceneList",
       "status": { "result": true, "code": 100 },
       "responseData": {
-        "currentProgramSceneName": "Call", "currentProgramSceneUuid": "00000000-0000-4000-8000-000000000001",
+        "currentProgramSceneName": "[scrubbed]", "currentProgramSceneUuid": "00000000-0000-4000-8000-000000000001",
         "currentPreviewSceneName": null, "currentPreviewSceneUuid": null,
         "scenes": [
-          { "sceneIndex": 0, "sceneName": "Call", "sceneUuid": "00000000-0000-4000-8000-000000000001" },
-          { "sceneIndex": 1, "sceneName": "Break", "sceneUuid": "00000000-0000-4000-8000-000000000002" }
+          { "sceneIndex": 0, "sceneName": "[scrubbed]", "sceneUuid": "00000000-0000-4000-8000-000000000001" },
+          { "sceneIndex": 1, "sceneName": "[scrubbed]", "sceneUuid": "00000000-0000-4000-8000-000000000002" }
         ]
       }
     },
-    { "requestType": "GetCurrentProgramScene", "status": { "result": true, "code": 100 }, "responseData": { "sceneName": "Call", "sceneUuid": "00000000-0000-4000-8000-000000000001", "currentProgramSceneName": "Call", "currentProgramSceneUuid": "00000000-0000-4000-8000-000000000001" } },
-    { "requestType": "GetProfileList", "status": { "result": true, "code": 100 }, "responseData": { "currentProfileName": "Untitled", "profiles": ["Untitled"] } },
-    { "requestType": "GetSceneCollectionList", "status": { "result": true, "code": 100 }, "responseData": { "currentSceneCollectionName": "Untitled", "sceneCollections": ["Untitled"] } },
+    { "requestType": "GetCurrentProgramScene", "status": { "result": true, "code": 100 }, "responseData": { "sceneName": "[scrubbed]", "sceneUuid": "00000000-0000-4000-8000-000000000001", "currentProgramSceneName": "[scrubbed]", "currentProgramSceneUuid": "00000000-0000-4000-8000-000000000001" } },
+    { "requestType": "GetProfileList", "status": { "result": true, "code": 100 }, "responseData": { "currentProfileName": "[scrubbed]", "profiles": ["[scrubbed]"] } },
+    { "requestType": "GetSceneCollectionList", "status": { "result": true, "code": 100 }, "responseData": { "currentSceneCollectionName": "[scrubbed]", "sceneCollections": ["[scrubbed]"] } },
     {
       "requestType": "GetVideoSettings",
       "status": { "result": true, "code": 100 },
