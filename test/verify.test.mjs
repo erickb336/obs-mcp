@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, test } from 'node:test';
 import { audioTools } from '../dist/platform.js';
-import { errorLines, judge, limitsFrom, measure, packetEnd, parseMetadata, parseProbe, resolveInFolder, timecode, verifyFile, visible } from '../dist/verify.js';
+import { addFrame, errorLines, judge, limitsFrom, measure, packetEnd, parseMetadata, parseProbe, resolveInFolder, timecode, verifyFile, visible } from '../dist/verify.js';
 import { startFakeObs } from './fake-obs.mjs';
 import { FFMPEG_VERSION, FORGED, makeFixtures, SKIP } from './fixtures.mjs';
 import { closedPort, connect, obsConfigDir, testEnv } from './helpers.mjs';
@@ -68,9 +68,9 @@ const verdicts = (claims) => Object.fromEntries(claims.map((c) => [c.claim, c.ve
 const track = (silences = [], peakDb = -20, extra = {}) => ({ silences: silences.map(([start, end]) => (end === null ? { start } : { start, end })), peakDb, samples: Infinity, ...extra });
 
 describe('parser and rules, on captured ffmpeg text (no ffmpeg needed)', () => {
-  test('parseMetadata reads level, samples and silent intervals from the stdout of a pass, and ignores any other line', () => {
-    assert.deepEqual(LOGS[0], { silences: [], channelPeaksDb: [-6.0206], peakDb: -6.0206, rmsDb: -9.031275, samples: 2880000 });
-    assert.deepEqual(LOGS[1], { silences: [{ start: 25.000854 }], channelPeaksDb: [-31.5], peakDb: -31.5, rmsDb: -40.1, samples: 2880000 });
+  test('parseMetadata reads the decoder rate, level, samples and silent intervals from the stdout of a pass, and ignores any other line', () => {
+    assert.deepEqual(LOGS[0], { rate: 48000, silences: [], channelPeaksDb: [-6.0206], peakDb: -6.0206, rmsDb: -9.031275, samples: 2880000 });
+    assert.deepEqual(LOGS[1], { rate: 48000, silences: [{ start: 25.000854 }], channelPeaksDb: [-31.5], peakDb: -31.5, rmsDb: -40.1, samples: 2880000 });
     // Log lines of ffmpeg 8 and 9 are not on stdout, and they count for nothing here.
     assert.deepEqual(parseMetadata('[silencedetect @ 0x1] silence_start: 3\n[Parsed_astats_0 @ 0x2] Peak level dB: -1\n'), { silences: [] });
   });
@@ -90,6 +90,27 @@ describe('parser and rules, on captured ffmpeg text (no ffmpeg needed)', () => {
     const [m] = measure(probe, [track([[15, null]], -10, { samples: 960000 })]);
     assert.deepEqual(m.silences, [{ start: 15, end: 30, why: 'no audio data' }]);
     assert.equal(m.soundS, 15);
+  });
+
+  test('F-T24-1: addFrame keeps each hole of d or more at its times, and missingS nets the 1 ms rounding of MKV to nothing', () => {
+    // SIMULATED frame lines of ffprobe: 1024 samples at 48 kHz (21.333 ms) with MKV times in ms, a frame with no time,
+    // a 7 s hole after the frame at 0.064 s, and a 0.3 s hole (below d) after the frame at 7.106 s.
+    const times = ['0.000', '0.021', '0.043', 'N/A', '0.064', '7.085', '7.106', '7.428'];
+    const t = { silences: [] };
+    for (const at of times) addFrame(t, `stream_index=1|best_effort_timestamp_time=${at}|nb_samples=1024`, 48000, 0.5);
+    assert.deepEqual(t.holes.map((h) => [h.start.toFixed(3), h.end]), [['0.085', 7.085]]);
+    assert.equal(t.missingS.toFixed(3), '7.300'); // the 7 s hole and the 0.3 s hole; the rounding nets to 0
+    // A line with no time or no sample count changes nothing.
+    const before = JSON.stringify(t);
+    addFrame(t, 'stream_index=1|best_effort_timestamp_time=99|nb_samples=N/A', 48000, 0.5);
+    assert.equal(JSON.stringify(t), before);
+  });
+
+  test('F-T24-1: measure puts a hole in the middle of the track, and the track ends at its last frame, not 7 s early', () => {
+    const probe = parseProbe(JSON.stringify({ streams: [{ codec_type: 'audio', sample_rate: '48000', duration: '20' }], format: { duration: '20' } }));
+    // 13 s of samples, a 7 s hole from 5 s to 12 s, and a silence from 15 s to 16 s.
+    const [m] = measure(probe, [track([[15, 16]], -10, { samples: 13 * 48000, holes: [{ start: 5, end: 12 }], missingS: 7 })]);
+    assert.deepEqual([m.endS, m.soundS, m.silences], [20, 12, [{ start: 5, end: 12, why: 'no audio data' }, { start: 15, end: 16, why: 'silent' }]]);
   });
 
   test('F-T5-23: a pass with no sample count is a track with no audio data, not its stated length of sound', () => {
@@ -564,6 +585,42 @@ describe('SIMULATED files made by ffmpeg', { skip: SKIP }, () => {
       const r = await check(`offset-${ext}`, [{ name: 'Music', kind: 'continuous', track: 1 }]);
       assert.equal(r.state, 'verified', JSON.stringify(r.claims));
       assert.deepEqual([r.duration, r.tracks[0].ends_at, r.tracks[0].silent_intervals], ['00:00:20.0', '00:00:20.0', []]);
+    });
+  }
+
+  // F-T24-1: a hole with no audio packets in the middle of a track is at its true times, in each container. Track 2 is
+  // a full tone, so as a backup it covers the hole.
+  const source = (r) => r.claims.find((c) => c.claim.startsWith('Source "Mic"'));
+  const file = (r) => r.claims.find((c) => c.claim === 'The file is readable and complete');
+  for (const ext of ['mov', 'mp4', 'mkv', 'flv', 'ts']) {
+    const hole7 = [{ from: '00:00:05.0', to: '00:00:12.0', seconds: 7, why: 'no audio data' }];
+    const hole08 = [{ from: '00:00:05.0', to: '00:00:05.8', seconds: 0.8, why: 'no audio data' }];
+    test(`F-T24-1: SIMULATED .${ext}, track 1 has no audio packets from 5 s to 12 s: failed, the hole at 00:00:05.0 to 00:00:12.0, track 1 ends at 00:00:20.0`, async () => {
+      const r = await check(`hole7-${ext}`, [{ name: 'Mic', kind: 'continuous', track: 1 }]);
+      assert.equal(r.state, 'failed');
+      assert.equal(file(r).verdict, 'fail');
+      assert.match(file(r).evidence, /^Track 1 has no audio data from 00:00:05\.0 to 00:00:12\.0\. The file may be cut short or damaged\./);
+      assert.deepEqual([source(r).verdict, source(r).gaps], ['fail', hole7]);
+      assert.deepEqual(r.tracks.map((t) => [t.ends_at, t.sound_s, t.silent_intervals]), [['00:00:20.0', 13, hole7], ['00:00:20.0', 20, []]]);
+    });
+    test(`F-T24-1: SIMULATED .${ext}, the same 7 s hole with a backup track that covers it: the source warns, use the backup for 00:00:05.0 to 00:00:12.0`, async () => {
+      const r = await check(`hole7-${ext}`, [{ name: 'Mic', kind: 'continuous', track: 1, backup: 2 }]);
+      assert.equal(r.state, 'failed'); // the file claim: a hole of 1 s or more is damage
+      assert.deepEqual([source(r).verdict, source(r).gaps], ['warn', hole7]);
+      assert.match(source(r).evidence, /^Track 1 fails alone, and backup track 2 has sound there: use the backup track for those times\. Track 1: .* 1 silent interval: 00:00:05\.0 to 00:00:12\.0 \(no audio data\);/);
+    });
+    test(`F-T24-1: SIMULATED .${ext}, track 1 has no audio packets from 5 s to 5.8 s, gap limit 0.5 s: the source fails, gap 00:00:05.0 to 00:00:05.8`, async () => {
+      const r = await verifyFile(f[`hole08-${ext}`], ext, [{ name: 'Mic', kind: 'continuous', track: 1 }], { ...process.env, OBS_MCP_CONTINUOUS_GAP_S: '0.5' });
+      assert.equal(r.state, 'failed');
+      assert.equal(file(r).verdict, 'pass', file(r).evidence); // shorter than 1 s: not damage, the gap limit decides
+      assert.deepEqual([source(r).verdict, source(r).gaps], ['fail', hole08]);
+      assert.deepEqual(r.tracks.map((t) => [t.ends_at, t.silent_intervals]), [['00:00:20.0', hole08], ['00:00:20.0', []]]);
+    });
+    test(`F-T24-1: SIMULATED .${ext}, the same 0.8 s hole with a backup track that covers it, gap limit 0.5 s: verified_with_warnings, use the backup`, async () => {
+      const r = await verifyFile(f[`hole08-${ext}`], ext, [{ name: 'Mic', kind: 'continuous', track: 1, backup: 2 }], { ...process.env, OBS_MCP_CONTINUOUS_GAP_S: '0.5' });
+      assert.equal(r.state, 'verified_with_warnings', JSON.stringify(r.claims));
+      assert.deepEqual([source(r).verdict, source(r).gaps], ['warn', hole08]);
+      assert.match(source(r).evidence, /^Track 1 fails alone, and backup track 2 has sound there: use the backup track for those times\./);
     });
   }
 

@@ -1,7 +1,9 @@
 // The file check: what a saved recording holds, per audio track and over the full timeline.
 // It only reads. It never changes, moves or deletes the file, whatever the result.
 // ffprobe gives the streams and their durations. One ffmpeg pass on each audio track gives its level (astats) and
-// every silent interval (silencedetect). Without ffmpeg, afinfo (macOS) gives the tracks, and the sound is not checked.
+// every silent interval (silencedetect). One ffprobe read of the decoded audio frames gives each hole with no audio
+// data, which silencedetect cannot see, as a hole holds no samples. Without ffmpeg, afinfo (macOS) gives the tracks,
+// and the sound is not checked.
 // The file path, the expected sources and every line that ffmpeg prints are untrusted input. The filter results come on
 // stdout, where only the filters write; the log on stderr can hold text from the file, so it never fails a file alone.
 // Limits that the check cannot close: a hard link inside the folder to a file outside it is a regular file inside the
@@ -181,7 +183,7 @@ function run(cmd: string, args: string[], timeoutMs: number, limitS = timeoutMs 
  * file (-copyts), so measure takes originS from each time of the pass. By default ffmpeg moves the times in a different
  * way per format (in MPEG-TS, to the start of each stream), so its default times are not on one timeline.
  */
-export type Probe = { originS: number; durationS?: number; video?: { durationS?: number; startS: number }; audio: { sampleRate?: number; channels?: number; durationS?: number; startS: number }[] };
+export type Probe = { originS: number; durationS?: number; video?: { durationS?: number; startS: number }; audio: { index: number; sampleRate?: number; channels?: number; durationS?: number; startS: number }[] };
 
 const num = (v: unknown) => (v === undefined || v === null || v === '' || v === 'N/A' || !Number.isFinite(Number(v)) ? undefined : Number(v));
 
@@ -209,12 +211,39 @@ export function parseProbe(json: string, format = ''): Probe {
     originS,
     durationS: duration !== undefined && format === 'matroska' ? Math.max(0, duration - originS) : duration,
     video: video ? { durationS: num(video.duration), startS: startOf(video) } : undefined,
-    audio: streams.filter((s) => s.codec_type === 'audio').map((s) => ({ sampleRate: num(s.sample_rate), channels: num(s.channels), durationS: num(s.duration), startS: startOf(s) })),
+    // ffprobe lists the streams in the order of their index, so the place of a stream in the list is its index.
+    audio: streams.flatMap((s, index) => (s.codec_type === 'audio' ? [{ index, sampleRate: num(s.sample_rate), channels: num(s.channels), durationS: num(s.duration), startS: startOf(s) }] : [])),
   };
 }
 
-/** What the ffmpeg pass of one track says: level, the peak of each channel, decoded samples and silent intervals (times of the file, from -copyts; dropped: the count over MAX_INTERVALS). */
-export type TrackLog = { peakDb?: number; rmsDb?: number; samples?: number; channelPeaksDb?: number[]; silences: { start: number; end?: number }[]; dropped?: number };
+/**
+ * What the ffmpeg pass of one track says: the sample rate that the decoder gives, level, the peak of each channel,
+ * decoded samples and silent intervals (times of the file, from -copyts; dropped: the count over MAX_INTERVALS). The
+ * frame read of the track (addFrame) adds the end of its last frame, its holes and missingS.
+ */
+export type TrackLog = { rate?: number; peakDb?: number; rmsDb?: number; samples?: number; channelPeaksDb?: number[]; silences: { start: number; end?: number }[]; dropped?: number; frameEnd?: number; holes?: { start: number; end: number }[]; missingS?: number; holesDropped?: number };
+
+/**
+ * Adds one line of the frame read ("stream_index=1|best_effort_timestamp_time=5.0|nb_samples=1024", a time of the file)
+ * to the log of its track. A hole is the time from the end of one frame to the start of the next, where the file holds
+ * no audio data: the decoder gives no sample for it, so silencedetect cannot see it. Each hole of d or more is kept, up
+ * to MAX_INTERVALS (holesDropped: the count over it). missingS is the net time between the frames, so that a time stamp
+ * that moves back and forth by its rounding (1 ms in MKV) adds nothing, and many short holes add up. Only the last end
+ * and the holes are kept, so a long take reads in bounded memory.
+ */
+export function addFrame(t: TrackLog, line: string, rate: number, d: number) {
+  const f = Object.fromEntries(line.split('|').map((kv) => kv.split('=')));
+  const at = num(f.best_effort_timestamp_time);
+  const n = num(f.nb_samples);
+  if (at === undefined || n === undefined) return;
+  if (t.frameEnd !== undefined) {
+    const gap = at - t.frameEnd;
+    t.missingS = (t.missingS ?? 0) + gap;
+    if (gap >= d && (t.holes ??= []).length < MAX_INTERVALS) t.holes.push({ start: t.frameEnd, end: at });
+    else if (gap >= d) t.holesDropped = (t.holesDropped ?? 0) + 1;
+  }
+  t.frameEnd = at + n / rate;
+}
 
 const db = (s: string) => (s.trim() === '-inf' ? -Infinity : num(s.trim()));
 
@@ -245,6 +274,10 @@ const trackFilter = (silenceDb: number, d: number) =>
 export function parseMetadata(text: string, channels = 0): TrackLog {
   const t: TrackLog = { silences: [] };
   for (const line of text.split('\n')) {
+    // The time base of the filters is 1/the sample rate, so a frame line gives the rate that the decoder gives. ffprobe
+    // can state another rate: an FLV header states 44.1 kHz for a 48 kHz AAC track. A frame from 1 s on gives it to 1 Hz.
+    const f = /^frame:\d+\s+pts:(\d+)\s+pts_time:(\S+)/.exec(line);
+    if (f && Number(f[2]) >= 1) t.rate = Math.round(Number(f[1]) / Number(f[2]));
     const m = /^lavfi\.(silence_start|silence_end|astats\.(\w+)\.(Peak_level|RMS_level|Number_of_samples))=(\S+)$/.exec(line);
     if (!m) continue;
     const [, key, channel, stat, value] = m;
@@ -274,7 +307,7 @@ export function errorLines(text: string, file = ''): string[] {
 }
 
 /** One audio track, measured: where its audio data ends and should end, its levels and its silent intervals over the full timeline. */
-type Measure = { track: number; endS: number; expectedEndS: number; declaredS?: number; peakDb?: number; rmsDb?: number; channelPeaksDb?: number[]; silences: Interval[]; soundS: number };
+type Measure = { track: number; endS: number; expectedEndS: number; declaredS?: number; holes: Interval[]; peakDb?: number; rmsDb?: number; channelPeaksDb?: number[]; silences: Interval[]; soundS: number };
 
 const total = (iv: Interval[]) => iv.reduce((a, g) => a + (g.end - g.start), 0);
 
@@ -313,17 +346,22 @@ export function measure(probe: Probe, logs: TrackLog[]): Measure[] {
     const start = a.startS;
     // A pass with no sample count decoded no sample: astats prints at least once for any audio data. So the stated
     // length of a track never stands in for its audio data.
-    const decoded = a.sampleRate ? (t.samples ?? 0) / a.sampleRate : 0;
-    const endS = Math.min(duration, start + decoded);
+    // The holes inside the track push its end later: its audio data ends at its start, plus its samples, plus its holes.
+    const rate = t.rate ?? a.sampleRate;
+    const decoded = rate ? (t.samples ?? 0) / rate : 0;
+    const missing = Math.max(0, t.missingS ?? 0);
+    const endS = Math.min(duration, start + decoded + missing);
+    const holes: Interval[] = (t.holes ?? []).map((h) => ({ start: h.start - probe.originS, end: Math.min(endS, h.end - probe.originS), why: 'no audio data' as const })).filter((h) => h.end > h.start);
     const silent: Interval[] = t.silences.map((s) => ({ start: Math.max(start, s.start - probe.originS), end: Math.min(endS, s.end === undefined ? endS : s.end - probe.originS), why: 'silent' as const })).filter((s) => s.end > s.start);
-    // Sound is audio data that is not silent. A time with no audio data is never sound, however short.
-    const soundS = Math.max(0, endS - start - total(merge(silent)));
-    // Before the track starts and after it ends, the file holds no audio data for it: that is silence too.
-    const silences = [...silent];
+    // Sound is audio data that is not silent. A time with no audio data is never sound, however short: so sound is the
+    // time from the start to the end, less every hole, less the silence outside the holes (a silence can span a hole).
+    const soundS = Math.max(0, endS - start - missing - (total(merge([...silent, ...holes])) - total(holes)));
+    // Before the track starts, in a hole and after it ends, the file holds no audio data for it: that is silence too.
+    const silences = [...silent, ...holes];
     if (start >= MIN_SOUND_S) silences.push({ start: 0, end: start, why: 'no audio data' });
     if (duration - endS >= MIN_SOUND_S) silences.push({ start: endS, end: duration, why: 'no audio data' });
     const expectedEndS = a.durationS !== undefined ? start + a.durationS : duration;
-    return { track: i + 1, endS, expectedEndS, declaredS: a.durationS, peakDb: t.peakDb, rmsDb: t.rmsDb, channelPeaksDb: t.channelPeaksDb, silences: merge(silences), soundS };
+    return { track: i + 1, endS, expectedEndS, declaredS: a.durationS, holes, peakDb: t.peakDb, rmsDb: t.rmsDb, channelPeaksDb: t.channelPeaksDb, silences: merge(silences), soundS };
   });
 }
 
@@ -504,8 +542,27 @@ export async function verifyFile(path: string, name: string, expect: Expected[] 
         );
       }
     }
+    if (soundChecked) {
+      // One read of the decoded frames of all audio tracks gives where each hole is: see addFrame.
+      const byIndex = new Map(probe.audio.map((a, i) => [String(a.index), { log: logs[i], rate: logs[i].rate ?? a.sampleRate! }]));
+      const frame = (line: string) => {
+        const track = byIndex.get(/^stream_index=(\d+)\|/.exec(line)?.[1] ?? '');
+        if (track) addFrame(track.log, line, track.rate, d);
+      };
+      const r = await run(tools.ffprobe, ['-v', 'error', '-protocol_whitelist', 'file', '-select_streams', 'a', '-show_entries', 'frame=stream_index,best_effort_timestamp_time,nb_samples', '-of', 'compact=p=0', '-f', format, '-i', input], left(), limits.timeoutS, frame);
+      const flood = logs.findIndex((t) => t.holesDropped);
+      if (r.stopped || r.code !== 0 || flood >= 0) {
+        soundChecked = false;
+        fileProblems.push(r.stopped ? `ffprobe stopped on the audio frames: ${r.stopped}` : r.code !== 0 ? `ffprobe exit code ${r.code} on the audio frames: ${clean(r.err) || 'no message'}` : `ffprobe read more than ${MAX_INTERVALS} holes with no audio data on track ${flood + 1} (${logs[flood].holesDropped} more), more than a real track can have`);
+      }
+    }
     measures = measure(probe, logs);
     if (soundChecked) {
+      // OBS writes every track without a hole: a hole of CUT_S or more is damage, as a track cut short is.
+      for (const m of measures) {
+        const long = m.holes.filter((h) => h.end - h.start >= CUT_S);
+        if (long.length) fileProblems.push(`Track ${m.track} has no audio data ${long.slice(0, NAMED_GAPS).map((h) => `from ${timecode(h.start)} to ${timecode(h.end)}`).join(', ')}${long.length > NAMED_GAPS ? `, and ${count(long.length - NAMED_GAPS, 'more hole')}` : ''}`);
+      }
       for (const m of measures.filter((x) => x.expectedEndS - x.endS >= CUT_S)) {
         const start = probe.audio[m.track - 1].startS;
         fileProblems.push(m.endS <= start ? `Track ${m.track} has no audio data: ffmpeg decoded no sample of it` : m.declaredS !== undefined ? `Track ${m.track} says ${m.declaredS.toFixed(1)} s, but its audio data ends at ${timecode(m.endS)}` : `Track ${m.track} states no length, and its audio data ends at ${timecode(m.endS)}, but the file runs to ${timecode(duration)}`);
