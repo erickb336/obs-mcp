@@ -1,0 +1,48 @@
+{
+  "name": "@erickb336/obs-mcp",
+  "version": "0.0.0",
+  "description": "A local MCP server that gives an agent safe read access to OBS Studio through obs-websocket.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "obs-mcp": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/erickb336/obs-mcp.git"
+  },
+  "keywords": [
+    "mcp",
+    "obs",
+    "obs-studio",
+    "obs-websocket"
+  ],
+  "scripts": {
+    "build": "node scripts/catalogue.mjs && tsc -p tsconfig.json",
+    "test": "npm run build && node --test --test-reporter=spec \"test/*.test.mjs\"",
+    "parity": "node scripts/catalogue.mjs --check protocol/protocol.json",
+    "smoke": "node scripts/packed-smoke.mjs",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.4.0",
+    "obs-websocket-js": "5.0.8",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "2.4.0",
+    "@types/node": "24.19.2",
+    "@types/ws": "8.18.1",
+    "js-tiktoken": "1.0.21",
+    "typescript": "6.0.3",
+    "ws": "8.22.1"
+  }
+}
