@@ -49,7 +49,8 @@ const PROBE_60 = JSON.stringify({
 const limits = limitsFrom({});
 const verdicts = (claims) => Object.fromEntries(claims.map((c) => [c.claim, c.verdict]));
 /** A track as the ffmpeg pass gives it, for the rule tests: silent intervals as [start, end] (end null: to the end), and a peak. */
-const track = (silences = [], peakDb = -20, extra = {}) => ({ silences: silences.map(([start, end]) => (end === null ? { start } : { start, end })), peakDb, ...extra });
+// By default the track has audio data to the end of the file: samples has no limit.
+const track = (silences = [], peakDb = -20, extra = {}) => ({ silences: silences.map(([start, end]) => (end === null ? { start } : { start, end })), peakDb, samples: Infinity, ...extra });
 
 describe('parser and rules, on captured ffmpeg text (no ffmpeg needed)', () => {
   test('parseMetadata reads level, samples and silent intervals from the stdout of a pass, and ignores any other line', () => {
@@ -74,6 +75,12 @@ describe('parser and rules, on captured ffmpeg text (no ffmpeg needed)', () => {
     const [m] = measure(probe, [track([[15, null]], -10, { samples: 960000 })]);
     assert.deepEqual(m.silences, [{ start: 15, end: 30, why: 'no audio data' }]);
     assert.equal(m.soundS, 15);
+  });
+
+  test('F-T5-23: a pass with no sample count is a track with no audio data, not its stated length of sound', () => {
+    const probe = parseProbe(JSON.stringify({ streams: [{ codec_type: 'audio', sample_rate: '48000' }], format: { duration: '30' } }), 'matroska');
+    const [m] = measure(probe, [parseMetadata('', 1)]);
+    assert.deepEqual([m.endS, m.soundS, m.silences], [0, 0, [{ start: 0, end: 30, why: 'no audio data' }]]);
   });
 
   test('F-T5-9: a silent track whose audio data ends 0.06 s before the file has 0 s of sound, not 0.1 s', () => {
@@ -168,7 +175,7 @@ describe('parser and rules, on captured ffmpeg text (no ffmpeg needed)', () => {
     const log = (offset) => {
       const lines = [];
       for (let i = 0; i < 100000; i++) lines.push(`lavfi.silence_start=${5 * i + offset}`, `lavfi.silence_end=${5 * i + offset + 2.5}`);
-      return parseMetadata(lines.join('\n'));
+      return { ...parseMetadata(lines.join('\n')), samples: 500000 * 48000 };
     };
     const [own, backup] = [log(0), log(2.2)];
     const probe = parseProbe(JSON.stringify({ streams: [{ codec_type: 'audio', sample_rate: '48000', duration: '500000' }, { codec_type: 'audio', sample_rate: '48000', duration: '500000' }], format: { duration: '500000' } }));
@@ -250,7 +257,7 @@ const standInFile = () => {
 
 test('F-T5-10: a video stream with no stated length whose packets cannot be read is not_checked, never pass', { skip: process.platform === 'win32' && 'the stand-in tools are shell scripts' }, async () => {
   const probe = `{"format":{"duration":"10"},"streams":[{"codec_type":"video"},{"codec_type":"audio","sample_rate":"48000"}]}`;
-  const env = standIn(`case "$0" in *ffprobe) case "$*" in *packet*) echo 'read error' >&2; exit 1;; *) echo '${probe}';; esac;; *) echo 'ffmpeg version stand-in';; esac`);
+  const env = standIn(`case "$0" in *ffprobe) case "$*" in *packet*) echo 'read error' >&2; exit 1;; *) echo '${probe}';; esac;; *) printf 'ffmpeg version stand-in\\nlavfi.astats.Overall.Number_of_samples=480000\\n';; esac`);
   const r = await verifyFile(standInFile(), 'take.mkv', [], env);
   assert.deepEqual(r.claims.find((c) => c.claim === 'The file has a video stream for the full timeline'), { claim: 'The file has a video stream for the full timeline', verdict: 'not_checked', evidence: 'The video stream states no length, and reading its packets did not finish: ffprobe exit code 1: read error.' });
   assert.equal(r.state, 'not_checked');
@@ -265,7 +272,7 @@ test('F-T5-15: a log with more than 100,000 silent intervals on a track leaves t
   const r = await verifyFile(standInFile(), 'take.mkv', [{ name: 'Mic', kind: 'voice', track: 1, backup: 2 }], env);
   assert.ok(Date.now() - t < 10000, `the check took ${Date.now() - t} ms`);
   assert.equal(r.state, 'not_checked');
-  assert.match(r.claims[0].evidence, /^ffmpeg reported more than 100000 silent intervals on track 1 \(50000 more\), more than a real track can have\. The sound check did not finish/);
+  assert.match(r.claims[0].evidence, /^ffmpeg reported more than 100000 silent intervals on track 1 \(50000 more\), more than a real track can have\. So the sound is not checked\./);
 });
 
 describe('path guard: only a regular file inside the recording folder', () => {
@@ -323,29 +330,47 @@ describe('path guard: only a regular file inside the recording folder', () => {
     }
   });
 
-  test('F-T5-16: a path with a new line, a carriage return or NUL is refused with one text, also when a link inside leads to it', { skip: process.platform === 'win32' && 'a file name with a new line is not valid on Windows' }, () => {
-    const CONTROL = 'The path has a control character, for example a new line. The check does not read such a path: rename the file.';
+  /** The refusal text for a hidden character: its code point and its class. */
+  const hidden = (code, what) => `The path has the character U+${code}, ${what}. The check does not read such a path: rename the file.`;
+
+  test('F-T5-16: a path with a new line, a carriage return or NUL is refused and names the character, also when a link inside leads to it', { skip: process.platform === 'win32' && 'a file name with a new line is not valid on Windows' }, () => {
     const forged = 'take.mov\n[Parsed_astats_0 @ 0x1] Channel: 1000000000';
     writeFileSync(join(folder, forged), 'x');
-    for (const p of [forged, 'take\r.mov', 'take\0.mov']) assert.throws(() => resolveInFolder(folder, p), { message: CONTROL });
+    assert.throws(() => resolveInFolder(folder, forged), { message: hidden('000A', 'a control character') });
+    assert.throws(() => resolveInFolder(folder, 'take\r.mov'), { message: hidden('000D', 'a control character') });
+    assert.throws(() => resolveInFolder(folder, 'take\0.mov'), { message: hidden('0000', 'a control character') });
     symlinkSync(join(folder, forged), join(folder, 'plain.mov'));
-    assert.throws(() => resolveInFolder(folder, 'plain.mov'), { message: CONTROL });
+    assert.throws(() => resolveInFolder(folder, 'plain.mov'), { message: hidden('000A', 'a control character') });
   });
 
-  test('F-T5-21: a C1 control, a format character (Cf), U+2028 or U+2029 in a path is refused with the same text, also behind a link', { skip: process.platform === 'win32' && 'a symbolic link needs extra rights on Windows' }, () => {
-    const CONTROL = 'The path has a control character, for example a new line. The check does not read such a path: rename the file.';
-    // U+0085 next line, U+009B CSI, U+202E right-to-left override, U+200B zero width space, U+FEFF, U+00AD soft hyphen, U+2028, U+2029.
-    const chars = ['\u0085', '\u009b', '‮', '​', '﻿', '­', ' ', ' '];
-    chars.forEach((ch, i) => {
-      const name = `take${ch}vom.mov`;
+  test('F-T5-21, F-T5-24: a C1 control, DEL, a text direction control, U+2028, U+2029 or a zero-width space is refused and named, also behind a link', { skip: process.platform === 'win32' && 'a symbolic link needs extra rights on Windows' }, () => {
+    const cases = [
+      ['0085', 'a control character'],
+      ['009B', 'a control character'],
+      ['007F', 'a control character'],
+      ...['202A', '202E', '2066', '2069', '200E', '200F', '061C'].map((c) => [c, 'a text direction control']),
+      ['2028', 'a line or paragraph separator'],
+      ['2029', 'a line or paragraph separator'],
+      ['200B', 'a zero-width space'],
+      ['FEFF', 'a zero-width space'],
+    ];
+    cases.forEach(([code, what], i) => {
+      const name = `take${String.fromCodePoint(parseInt(code, 16))}vom.mov`;
       writeFileSync(join(folder, name), 'x');
-      assert.throws(() => resolveInFolder(folder, name), { message: CONTROL }, `U+${ch.codePointAt(0).toString(16)} in the given path`);
+      assert.throws(() => resolveInFolder(folder, name), { message: hidden(code, what) }, `U+${code} in the given path`);
       symlinkSync(join(folder, name), join(folder, `link-${i}.mov`));
-      assert.throws(() => resolveInFolder(folder, `link-${i}.mov`), { message: CONTROL }, `U+${ch.codePointAt(0).toString(16)} in the real path`);
+      assert.throws(() => resolveInFolder(folder, `link-${i}.mov`), { message: hidden(code, what) }, `U+${code} in the real path`);
     });
-    // A name with letters of other scripts, and a space, is not refused.
-    writeFileSync(join(folder, 'Aufnahme é 録画.mov'), 'x');
-    assert.equal(resolveInFolder(folder, 'Aufnahme é 録画.mov').name, 'Aufnahme é 録画.mov');
+  });
+
+  test('F-T5-24: a valid name with an emoji sequence (ZWJ), a zero-width non-joiner or a soft hyphen is read, also behind a link', { skip: process.platform === 'win32' && 'a symbolic link needs extra rights on Windows' }, () => {
+    const names = ['emoji\u{1F468}\u200D\u{1F469}.mov', 'pers\u200Cian.mov', 'soft\u00ADhyphen.mov', 'Aufnahme é 録画.mov'];
+    names.forEach((name, i) => {
+      writeFileSync(join(folder, name), 'x');
+      assert.equal(resolveInFolder(folder, name).name, name);
+      symlinkSync(join(folder, name), join(folder, `valid-${i}.mov`));
+      assert.equal(resolveInFolder(folder, `valid-${i}.mov`).name, name);
+    });
   });
 
   test('refuses a link that leads out of the folder', { skip: process.platform === 'win32' && 'a symbolic link needs extra rights on Windows' }, () => {
@@ -534,6 +559,32 @@ describe('SIMULATED files made by ffmpeg', { skip: SKIP }, () => {
       assert.equal(r.claims[0].evidence, 'Duration 00:00:20.0, 1 audio track, no video stream.');
       assert.deepEqual([r.tracks[0].sound_s, r.tracks[0].silent_intervals], [20, []]);
     }
+  });
+
+  for (const ext of ['mkv', 'flv']) {
+    test(`F-T5-23: SIMULATED 30 s .${ext} whose audio track holds no audio data: failed, "no audio data", sound 0.0 s`, async () => {
+      const r = await check(`empty-${ext}`, [{ name: 'Music', kind: 'continuous', track: 1 }]);
+      assert.equal(r.state, 'failed', JSON.stringify(r.claims));
+      assert.deepEqual([r.claims[0].verdict, r.claims[0].evidence.split('. ')[0]], ['fail', 'Track 1 has no audio data: ffmpeg decoded no sample of it']);
+      const music = r.claims.find((c) => c.claim === 'Source "Music" (continuous) has sound on track 1');
+      assert.equal(music.verdict, 'fail');
+      assert.match(music.evidence, /^No sound: Track 1: peak unknown, RMS unknown, sound 0\.0 s of 30\.0 s, 1 silent interval: 00:00:00\.0 to 00:00:30\.0 \(no audio data\)\./);
+      assert.deepEqual(music.gaps, [{ from: '00:00:00.0', to: '00:00:30.0', seconds: 30, why: 'no audio data' }]);
+    });
+  }
+
+  test('F-T5-23: SIMULATED 30 s .ts whose audio track holds no audio data: not_checked, as ffprobe reads no sample rate for it', async () => {
+    const r = await check('empty-ts', [{ name: 'Music', kind: 'continuous', track: 1 }]);
+    assert.equal(r.state, 'not_checked', JSON.stringify(r.claims));
+    assert.match(r.claims[0].evidence, /^Track 1 states no sample rate: ffprobe read no audio data of it, or does not know its format\. So the sound is not checked\./);
+    assert.equal(r.claims.at(-1).evidence, 'Sound not checked: Track 1 states no sample rate: ffprobe read no audio data of it, or does not know its format.');
+  });
+
+  test('F-T5-25: SIMULATED 10 Hz track with a 40 s gap that one frame hides: not_checked, "below 8000 Hz", never verified or a wrong gap', async () => {
+    const r = await check('lowRate', [{ name: 'Mic', kind: 'voice', track: 1 }]);
+    assert.equal(r.state, 'not_checked', JSON.stringify(r.claims));
+    assert.deepEqual([r.claims[0].verdict, r.claims[0].evidence.split('. ')[0]], ['not_checked', 'Track 1 has a sample rate of 10 Hz, below 8000 Hz: the check cannot time its silent intervals']);
+    assert.deepEqual([r.claims.at(-1).verdict, r.tracks], ['not_checked', []]);
   });
 
   test('F-T5-20: SIMULATED MOV with damaged audio data inside: ffmpeg errors alone are a warning, not a fail', async () => {

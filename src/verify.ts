@@ -33,6 +33,7 @@ const NAMED_GAPS = 3; // silent intervals named in the evidence of a claim
 // 100,000 is about 14 hours. A pass with more is not trusted, and the sound of that track is not checked.
 const MAX_INTERVALS = 100_000;
 const MAX_OUTPUT = 32 * 1024 * 1024; // bytes read from one tool run
+const MIN_RATE_HZ = 8000; // the lowest sample rate that the check reads; OBS records at 44.1 kHz or 48 kHz
 // A track whose audio data ends this much or more before its stated length, or before the end of the file when it
 // states no length (MKV), is cut short. OBS writes every track for the full recording; a healthy track ends within
 // one audio frame (about 0.02 s) of the file.
@@ -67,11 +68,20 @@ const inside = (base: string, path: string) => {
   return !!r && r !== '..' && !r.startsWith(`..${sep}`) && !isAbsolute(r);
 };
 
-// A control or format character in a path: a new line, a carriage return, NUL, a C1 control (U+0085, U+009B), a
-// direction override (U+202E), a zero-width character, U+2028 or U+2029. The name goes into the reply, where such a
-// character can hide or change text. The check refuses such a path, with one text.
-const CONTROL = /[\p{Cc}\p{Cf}\u2028\u2029]/u;
-const controlChar = () => new VerifyError('The path has a control character, for example a new line. The check does not read such a path: rename the file.');
+// A character in a path that can hide or change the text of the reply, where the name goes. The check refuses it and
+// names it. Other format characters are part of valid names (an emoji sequence, a zero-width non-joiner, a soft hyphen).
+const HIDDEN: [RegExp, string][] = [
+  [/\p{Cc}/u, 'a control character'], // C0 (a new line, a carriage return, NUL), DEL and C1 (U+0085, U+009B)
+  [/[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/u, 'a text direction control'],
+  [/[\u2028\u2029]/u, 'a line or paragraph separator'],
+  [/[\u200B\uFEFF]/u, 'a zero-width space'], // no valid name needs one, and it hides a difference between two names
+];
+function refuseHidden(path: string) {
+  for (const [re, what] of HIDDEN) {
+    const ch = re.exec(path)?.[0];
+    if (ch) throw new VerifyError(`The path has the character U+${ch.codePointAt(0)!.toString(16).toUpperCase().padStart(4, '0')}, ${what}. The check does not read such a path: rename the file.`);
+  }
+}
 
 /**
  * The file inside the recording folder. Refuses "..", a path or a link that leads out of the folder, and anything that
@@ -82,7 +92,7 @@ export function resolveInFolder(folder: string, input: string): { path: string; 
   const shown = JSON.stringify(input.slice(0, 200));
   const outside = new VerifyError(`${shown} is outside the recording folder, or a link leads out of it. The check reads only files inside the recording folder.`);
   if (!input) throw new VerifyError('Give the name of a file in the recording folder.');
-  if (CONTROL.test(input)) throw controlChar();
+  refuseHidden(input);
   if (input.split(/[\\/]/).includes('..')) throw new VerifyError(`The path ${shown} has "..". Give a file inside the recording folder.`);
   // A UNC, device or namespace path: \\host\share, //host/share, \\?\ and \\.\
   if (/^[\\/]{2}/.test(input)) throw outside;
@@ -101,7 +111,7 @@ export function resolveInFolder(folder: string, input: string): { path: string; 
     throw new VerifyError(`No file ${shown} in the recording folder.`);
   }
   if (!inside(root, real)) throw outside;
-  if (CONTROL.test(real)) throw controlChar();
+  refuseHidden(real);
   if (!statSync(real).isFile()) throw new VerifyError(`${shown} is not a regular file.`);
   return { path: real, name: relative(root, real) };
 }
@@ -285,7 +295,9 @@ export function measure(probe: Probe, logs: TrackLog[]): Measure[] {
   return probe.audio.map((a, i) => {
     const t = logs[i] ?? { silences: [] };
     const start = a.startS;
-    const decoded = t.samples !== undefined && a.sampleRate ? t.samples / a.sampleRate : (a.durationS ?? duration);
+    // A pass with no sample count decoded no sample: astats prints at least once for any audio data. So the stated
+    // length of a track never stands in for its audio data.
+    const decoded = a.sampleRate ? (t.samples ?? 0) / a.sampleRate : 0;
     const endS = Math.min(duration, start + decoded);
     const silent: Interval[] = t.silences.map((s) => ({ start: Math.max(start, s.start - probe.originS), end: Math.min(endS, s.end === undefined ? endS : s.end - probe.originS), why: 'silent' as const })).filter((s) => s.end > s.start);
     // Sound is audio data that is not silent. A time with no audio data is never sound, however short.
@@ -450,6 +462,14 @@ export async function verifyFile(path: string, name: string, expect: Expected[] 
   if (n) {
     // One pass per track, one after another, all within one time limit. The metadata of a pass has no track label.
     const logs: TrackLog[] = [];
+    // Below MIN_RATE_HZ a frame of 512 samples is longer than d, so one frame can hold two silences and hide one. A
+    // track with no sample rate (0 in MPEG-TS) has no audio data that ffprobe could read, or a format that it does not know.
+    const slow = probe.audio.findIndex((a) => !a.sampleRate || a.sampleRate < MIN_RATE_HZ);
+    if (slow >= 0) {
+      soundChecked = false;
+      const rate = probe.audio[slow].sampleRate;
+      fileProblems.push(rate ? `Track ${slow + 1} has a sample rate of ${rate} Hz, below ${MIN_RATE_HZ} Hz: the check cannot time its silent intervals` : `Track ${slow + 1} states no sample rate: ffprobe read no audio data of it, or does not know its format`);
+    }
     for (let i = 0; i < n && soundChecked; i++) {
       const args = ['-hide_banner', '-nostdin', '-nostats', '-v', 'error', '-copyts', '-protocol_whitelist', 'file', '-f', format, '-i', input, '-map', `0:a:${i}`, '-af', trackFilter(limits.silenceDb, d), '-f', 'null', '-'];
       const f = await run(tools.ffmpeg, args, left(), limits.timeoutS);
@@ -471,7 +491,8 @@ export async function verifyFile(path: string, name: string, expect: Expected[] 
     measures = measure(probe, logs);
     if (soundChecked) {
       for (const m of measures.filter((x) => x.expectedEndS - x.endS >= CUT_S)) {
-        fileProblems.push(m.declaredS !== undefined ? `Track ${m.track} says ${m.declaredS.toFixed(1)} s, but its audio data ends at ${timecode(m.endS)}` : `Track ${m.track} states no length, and its audio data ends at ${timecode(m.endS)}, but the file runs to ${timecode(duration)}`);
+        const start = probe.audio[m.track - 1].startS;
+        fileProblems.push(m.endS <= start ? `Track ${m.track} has no audio data: ffmpeg decoded no sample of it` : m.declaredS !== undefined ? `Track ${m.track} says ${m.declaredS.toFixed(1)} s, but its audio data ends at ${timecode(m.endS)}` : `Track ${m.track} states no length, and its audio data ends at ${timecode(m.endS)}, but the file runs to ${timecode(duration)}`);
       }
     }
   }
@@ -482,7 +503,7 @@ export async function verifyFile(path: string, name: string, expect: Expected[] 
     claim: 'The file is readable and complete',
     verdict: fileProblems.length ? (soundChecked ? 'fail' : 'not_checked') : errorText ? 'warn' : 'pass',
     evidence: fileProblems.length
-      ? `${[...fileProblems, errorText].filter(Boolean).join('; ')}. ${soundChecked ? 'The file may be cut short or damaged.' : 'The sound check did not finish, so the sound is not checked.'} ${fileFacts.join(', ')}.`
+      ? `${[...fileProblems, errorText].filter(Boolean).join('; ')}. ${soundChecked ? 'The file may be cut short or damaged.' : 'So the sound is not checked.'} ${fileFacts.join(', ')}.`
       : `${errorText ? `${errorText}. Each track has audio data to its end, so the file is not cut short; the errors can be damage inside the file. ` : ''}${fileFacts.join(', ')}.`,
   });
   // Where the video ends on the timeline of the file. MKV and FLV state no length for it: then its packets give the end.
@@ -512,7 +533,7 @@ export async function verifyFile(path: string, name: string, expect: Expected[] 
   });
   claims.push({ claim: 'The file has audio', verdict: n ? 'pass' : 'fail', evidence: n ? `${count(n, 'audio track')}.` : 'No audio stream.' });
   if (n && soundChecked) claims.push(...judge(probe, measures, expect, limits));
-  else if (expect.length) claims.push(...expect.map((e) => ({ claim: `Source ${JSON.stringify(e.name)} (${e.kind}) has sound on track ${e.track}`, verdict: (n ? 'not_checked' : 'fail') as Verdict, evidence: n ? 'Sound not checked: the ffmpeg pass did not finish.' : 'The file has no audio stream.' })));
+  else if (expect.length) claims.push(...expect.map((e) => ({ claim: `Source ${JSON.stringify(e.name)} (${e.kind}) has sound on track ${e.track}`, verdict: (n ? 'not_checked' : 'fail') as Verdict, evidence: n ? `Sound not checked: ${fileProblems.join('; ')}.` : 'The file has no audio stream.' })));
 
   const roles = new Map<number, string>();
   for (const e of expect) {

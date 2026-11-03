@@ -87,6 +87,16 @@ export function makeFixtures() {
   f.truncatedIndexKept = cut(f.faststart, 'SIMULATED-truncated-index-kept.mov', 0.5);
   // MKV keeps the 20 s length in its header, so a cut copy still says 20 s, and its audio ends near 10 s.
   f.cutMkv = cut(f.stereoMkv, 'SIMULATED-cut-stereo.mkv', 0.5);
+  // 30 s copies whose audio track holds no audio data: every audio packet dropped (-bsf:a noise=drop=1), the stream kept.
+  for (const ext of ['mkv', 'flv', 'ts']) {
+    const from = make(dir, `SIMULATED-30s.${ext}`, [video(30), sine(440, 30)]);
+    f[`empty-${ext}`] = join(dir, `SIMULATED-empty-audio.${ext}`);
+    execFileSync(tools.ffmpeg, ['-hide_banner', '-loglevel', 'error', '-y', '-i', from, '-map', '0', '-c', 'copy', '-bsf:a', 'noise=drop=1', f[`empty-${ext}`]]);
+  }
+  // 60 s PCM MKV at 10 Hz: silent from 1 s to 41 s and from 42 s to 43 s. A frame of 512 samples is 51.2 s, so the two
+  // silences fall in one frame, and a check that reads it sees only the second one.
+  f.lowRate = join(dir, 'SIMULATED-10hz.mkv');
+  execFileSync(tools.ffmpeg, ['-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi', '-i', 'aevalsrc=0.3*not(between(t\\,1\\,41))*not(between(t\\,42\\,43)):s=10:d=60', '-c:a', 'pcm_s16le', f.lowRate]);
   // A name that a shell or an option parser would misread.
   f.odd = join(dir, "-i odd 'name' ;$(touch PWNED).mov");
   copyFileSync(f.healthy, f.odd);
