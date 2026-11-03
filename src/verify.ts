@@ -123,14 +123,19 @@ function checkExpect(expect: Expected[]) {
   }
 }
 
-/** Runs a tool with an argument array, never a shell, with a time limit and an output limit. */
-function run(cmd: string, args: string[], timeoutMs: number, limitS = timeoutMs / 1000): Promise<{ code: number | null; out: string; err: string; stopped?: string }> {
+/**
+ * Runs a tool with an argument array, never a shell, with a time limit and an output limit. With onLine, each line of
+ * stdout goes to onLine as it comes, and only the stderr and a line not yet ended count to the output limit: so a tool
+ * that prints one short line per packet of a long file runs in bounded memory, to its time limit.
+ */
+function run(cmd: string, args: string[], timeoutMs: number, limitS = timeoutMs / 1000, onLine?: (line: string) => void): Promise<{ code: number | null; out: string; err: string; stopped?: string }> {
   return new Promise((resolve) => {
     const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
     const out: Buffer[] = [];
     let done = false;
     const err: Buffer[] = [];
     let bytes = 0;
+    let rest = ''; // the part of stdout after its last new line, with onLine
     let stopped: string | undefined;
     // A stop answers at once: a child of the tool can hold the pipes open after the kill, so "close" can come late.
     const stop = (why: string) => {
@@ -146,12 +151,19 @@ function run(cmd: string, args: string[], timeoutMs: number, limitS = timeoutMs 
       if (bytes > MAX_OUTPUT) stop(`its output passed ${MAX_OUTPUT} bytes`);
       else to.push(d);
     };
-    child.stdout.on('data', keep(out));
+    const lines = (d: Buffer) => {
+      const parts = (rest + d.toString('latin1')).split('\n');
+      rest = parts.pop()!;
+      if (rest.length > MAX_OUTPUT) return stop(`its output passed ${MAX_OUTPUT} bytes`);
+      for (const line of parts) onLine!(line);
+    };
+    child.stdout.on('data', onLine ? lines : keep(out));
     child.stderr.on('data', keep(err));
     function finish(code: number | null) {
       if (done) return;
       done = true;
       clearTimeout(timer);
+      if (onLine && !stopped && rest) onLine(rest);
       resolve({ code, out: Buffer.concat(out).toString('utf8'), err: Buffer.concat(err).toString('utf8'), stopped });
     }
     child.on('error', (e) => {
@@ -172,6 +184,12 @@ function run(cmd: string, args: string[], timeoutMs: number, limitS = timeoutMs 
 export type Probe = { originS: number; durationS?: number; video?: { durationS?: number; startS: number }; audio: { sampleRate?: number; channels?: number; durationS?: number; startS: number }[] };
 
 const num = (v: unknown) => (v === undefined || v === null || v === '' || v === 'N/A' || !Number.isFinite(Number(v)) ? undefined : Number(v));
+
+/** The later of end and the end of one packet line of ffprobe ("pts_time,duration_time"). A line with no time leaves end as it is. */
+export function packetEnd(line: string, end: number): number {
+  const [pts, length] = line.split(',');
+  return num(pts) === undefined ? end : Math.max(end, Number(pts) + (num(length) ?? 0));
+}
 
 const PROBE_ENTRIES = 'format=duration,start_time:stream=codec_type,sample_rate,channels,duration,start_time';
 
@@ -505,16 +523,15 @@ export async function verifyFile(path: string, name: string, expect: Expected[] 
       : `${errorText ? `${errorText}. Each track has audio data to its end, so the file is not cut short; the errors can be damage inside the file. ` : ''}${fileFacts.join(', ')}.`,
   });
   // Where the video ends on the timeline of the file. MKV and FLV state no length for it: then its packets give the end.
+  // ffprobe prints one line per packet, every packet of the file, as a packet near the end can come before another in
+  // the file (B-frames). Only the latest end is kept as the lines come, so a take of any length reads in bounded memory.
   const video = probe.video;
   let videoEndS = video?.durationS === undefined ? undefined : video.startS + video.durationS;
   let videoNotRead = '';
   if (video && videoEndS === undefined) {
-    const v = await run(tools.ffprobe, ['-v', 'error', '-protocol_whitelist', 'file', '-select_streams', 'v:0', '-show_entries', 'packet=pts_time,duration_time', '-of', 'csv=p=0', '-f', format, '-i', input], left(), limits.timeoutS);
     let end = -Infinity;
-    for (const line of v.out.split('\n')) {
-      const [pts, length] = line.split(',');
-      if (num(pts) !== undefined) end = Math.max(end, Number(pts) + (num(length) ?? 0));
-    }
+    const packet = (line: string) => (end = packetEnd(line, end));
+    const v = await run(tools.ffprobe, ['-v', 'error', '-protocol_whitelist', 'file', '-select_streams', 'v:0', '-show_entries', 'packet=pts_time,duration_time', '-of', 'csv=p=0', '-f', format, '-i', input], left(), limits.timeoutS, packet);
     if (v.stopped || v.code !== 0) videoNotRead = v.stopped ? `ffprobe stopped: ${v.stopped}` : `ffprobe exit code ${v.code}: ${clean(v.err) || 'no message'}`;
     else if (end > -Infinity) videoEndS = Math.max(0, end - probe.originS);
     else videoNotRead = 'the video stream has no packets';
