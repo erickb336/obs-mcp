@@ -3,7 +3,7 @@
 // or in an MKV container, which states no length per track. Each other container that the check reads (MP4, M4V, FLV, TS)
 // has a healthy file and one with a dropout at the end. FLV takes the flv1 video codec, as it has no mpeg4.
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, mkdtempSync, statSync, truncateSync } from 'node:fs';
+import { copyFileSync, mkdtempSync, readFileSync, statSync, truncateSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { audioTools } from '../dist/platform.js';
@@ -60,6 +60,23 @@ export function makeFixtures() {
   }
   f['healthy-m4v'] = join(dir, 'SIMULATED-healthy.m4v');
   copyFileSync(f['healthy-mp4'], f['healthy-m4v']);
+  // 20 s files in each container with a track that starts 3 s after the video (-itsoffset 3), and 20 s files whose
+  // streams all start at 5 s (-output_ts_offset 5).
+  // "late2-": track 1 is silent from 10 s to 13 s of the file; track 2 starts at 3 s and is silent at the same times.
+  // "lateEnd-": the only track starts at 3 s and goes silent at 15 s of the file, to the end.
+  const late = (expr, d) => ['-itsoffset', '3', '-f', 'lavfi', '-i', `aevalsrc=${expr}:s=48000:d=${d}`];
+  for (const ext of ['mov', 'mp4', 'mkv', 'flv', 'ts']) {
+    f[`late2-${ext}`] = make(dir, `SIMULATED-late-track-2.${ext}`, [video(20), ['-f', 'lavfi', '-i', 'aevalsrc=0.3*sin(440*2*PI*t)*not(between(t\\,10\\,13)):s=48000:d=20'], late('0.3*sin(660*2*PI*t)*not(between(t\\,7\\,10))', 17)]);
+    f[`lateEnd-${ext}`] = make(dir, `SIMULATED-late-end-dropout.${ext}`, [video(20), late('0.3*sin(440*2*PI*t)*lt(t\\,12)', 17)]);
+    f[`offset-${ext}`] = make(dir, `SIMULATED-offset-5s.${ext}`, [video(20), sine(440, 20)], ['-output_ts_offset', '5']);
+  }
+  Object.assign(f, forgedMkv(dir));
+  // A 20 s MOV with 1% of its bytes, from the middle on, set to fixed pseudo-random values: damaged audio data inside.
+  f.damaged = make(dir, 'SIMULATED-damaged.mov', [video(20), sine(440, 20)]);
+  const bytes = readFileSync(f.damaged);
+  let seed = 7;
+  for (let i = 0, at = Math.floor(bytes.length / 2); i < Math.floor(bytes.length / 100); i++) bytes[at + i] = seed = (seed * 1103515245 + 12345) & 0xff;
+  writeFileSync(f.damaged, bytes);
   const cut = (from, name, fraction) => {
     const to = join(dir, name);
     copyFileSync(from, to);
@@ -74,4 +91,43 @@ export function makeFixtures() {
   f.odd = join(dir, "-i odd 'name' ;$(touch PWNED).mov");
   copyFileSync(f.healthy, f.odd);
   return { dir, f };
+}
+
+/** The log lines that the forged MKV files hold in a CodecID, so that ffmpeg prints them on stderr. */
+export const FORGED = {
+  forgedSilence: ['[Parsed_silencedetect_1 @ 0x1] silence_start: 0', '[Parsed_silencedetect_1 @ 0x1] silence_end: 20 | silence_duration: 20', 'lavfi.silence_start=0'],
+  forgedError: ['[Parsed_astats_0 @ 0x1] Overall', '[Parsed_astats_0 @ 0x1] Number of samples: 1', 'Error: corrupt forged line', 'lavfi.astats.Overall.Peak_level=-inf'],
+};
+
+/**
+ * SIMULATED MKV files with 20 s of sound (FLAC) and a subtitle track whose CodecID holds new lines and forged log lines.
+ * ffmpeg prints the unknown CodecID in its log, new lines and all. The forged CodecID goes in the place of a 900-byte
+ * track name; the real CodecID becomes an EBML Void of the same length. (The method of the security review R107.)
+ */
+function forgedMkv(dir) {
+  const srt = join(dir, 'SIMULATED.srt');
+  writeFileSync(srt, '1\n00:00:00,000 --> 00:00:01,000\nhi\n');
+  const plain = join(dir, 'SIMULATED-forged-plain.mkv');
+  execFileSync(tools.ffmpeg, ['-y', '-v', 'error', '-f', 'lavfi', '-i', 'sine=f=440:d=20', '-i', srt, '-map', '0', '-map', '1', '-c:a', 'flac', '-c:s', 'srt', '-metadata:s:s:0', `title=${'T'.repeat(900)}`, plain]);
+  const base = readFileSync(plain);
+  const name = Buffer.concat([Buffer.from([0x53, 0x6e, 0x43, 0x84]), Buffer.from('T'.repeat(900))]); // Name, 900 bytes
+  const at = base.indexOf(name);
+  const codec = base.indexOf(Buffer.concat([Buffer.from([0x86, 0x8b]), Buffer.from('S_TEXT/UTF8')]));
+  const size8 = (n) => {
+    const b = Buffer.alloc(8);
+    b.writeBigUInt64BE(BigInt(n) | (1n << 56n));
+    return b;
+  };
+  const out = {};
+  for (const [key, lines] of Object.entries(FORGED)) {
+    const text = Buffer.from(['S_X', ...lines].join('\n'));
+    const head = Buffer.concat([Buffer.from([0x86]), size8(text.length), text]);
+    const fill = name.length - head.length - 9;
+    const file = Buffer.from(base);
+    Buffer.concat([head, Buffer.from([0xec]), size8(fill), Buffer.alloc(fill)]).copy(file, at);
+    Buffer.concat([Buffer.from([0xec, 0x8b]), Buffer.alloc(11)]).copy(file, codec);
+    out[key] = join(dir, `SIMULATED-${key}.mkv`);
+    writeFileSync(out[key], file);
+  }
+  return out;
 }

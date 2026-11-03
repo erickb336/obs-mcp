@@ -2,7 +2,8 @@
 // It only reads. It never changes, moves or deletes the file, whatever the result.
 // ffprobe gives the streams and their durations. One ffmpeg pass on each audio track gives its level (astats) and
 // every silent interval (silencedetect). Without ffmpeg, afinfo (macOS) gives the tracks, and the sound is not checked.
-// The file path, the expected sources and every line that ffmpeg prints are untrusted input.
+// The file path, the expected sources and every line that ffmpeg prints are untrusted input. The filter results come on
+// stdout, where only the filters write; the log on stderr can hold text from the file, so it never fails a file alone.
 // Limits that the check cannot close: a hard link inside the folder to a file outside it is a regular file inside the
 // folder, so the check reads it; and a file that another program swaps between the path check and the ffmpeg run is
 // read as it is at that time. Both need write access to the recording folder.
@@ -28,8 +29,8 @@ const LOW_PEAK_DB = -40; // a peak below this is a low level
 const CLIP_PEAK_DB = -0.1; // a peak at or above this may clip
 const MAX_GAPS = 20; // gaps listed in one claim or track
 const NAMED_GAPS = 3; // silent intervals named in the evidence of a claim
-// Silent intervals read from the log of one track. A real track cannot pass it: each interval is 0.5 s or more, so
-// 100,000 is about 14 hours. A log with more is not trusted, and the sound of that track is not checked.
+// Silent intervals read from the pass of one track. A real track cannot pass it: each interval is 0.5 s or more, so
+// 100,000 is about 14 hours. A pass with more is not trusted, and the sound of that track is not checked.
 const MAX_INTERVALS = 100_000;
 const MAX_OUTPUT = 32 * 1024 * 1024; // bytes read from one tool run
 // A track whose audio data ends this much or more before its stated length, or before the end of the file when it
@@ -66,9 +67,10 @@ const inside = (base: string, path: string) => {
   return !!r && r !== '..' && !r.startsWith(`..${sep}`) && !isAbsolute(r);
 };
 
-// A control character (a new line, a carriage return, NUL) in a path. ffmpeg prints the path in its log, so a new line
-// in a name could add lines that the check would read as filter lines. The check refuses such a path, with one text.
-const CONTROL = /[\u0000-\u001f\u007f]/;
+// A control or format character in a path: a new line, a carriage return, NUL, a C1 control (U+0085, U+009B), a
+// direction override (U+202E), a zero-width character, U+2028 or U+2029. The name goes into the reply, where such a
+// character can hide or change text. The check refuses such a path, with one text.
+const CONTROL = /[\p{Cc}\p{Cf}\u2028\u2029]/u;
 const controlChar = () => new VerifyError('The path has a control character, for example a new line. The check does not read such a path: rename the file.');
 
 /**
@@ -154,9 +156,11 @@ function run(cmd: string, args: string[], timeoutMs: number, limitS = timeoutMs 
 }
 
 /**
- * What ffprobe says: the container duration, the first video stream and each audio stream, in file order. Each start
- * is on the timeline of the file: from the start time of the container (originS), which is 0 in MOV and MKV and about
- * 1.4 s in MPEG-TS. ffmpeg moves its own timeline the same way, so the times in the ffmpeg log are on it already.
+ * What ffprobe says: the container duration, the first video stream and each audio stream, in file order. The timeline
+ * of the file starts at the start time of the container (originS): 0 in an OBS MOV or MKV, about 1.4 s in MPEG-TS, and
+ * any time in a file made with an offset. Each start here is on that timeline. The ffmpeg pass keeps the times of the
+ * file (-copyts), so measure takes originS from each time of the pass. By default ffmpeg moves the times in a different
+ * way per format (in MPEG-TS, to the start of each stream), so its default times are not on one timeline.
  */
 export type Probe = { originS: number; durationS?: number; video?: { durationS?: number; startS: number }; audio: { sampleRate?: number; channels?: number; durationS?: number; startS: number }[] };
 
@@ -164,71 +168,83 @@ const num = (v: unknown) => (v === undefined || v === null || v === '' || v === 
 
 const PROBE_ENTRIES = 'format=duration,start_time:stream=codec_type,sample_rate,channels,duration,start_time';
 
-/** Parses the JSON of "ffprobe -show_entries <PROBE_ENTRIES> -of json". */
-export function parseProbe(json: string): Probe {
+/**
+ * Parses the JSON of "ffprobe -show_entries <PROBE_ENTRIES> -of json". In Matroska (demuxer "matroska") the duration
+ * that ffprobe gives is the end time of the file, from time 0; in the other formats it is the time from originS to the end.
+ */
+export function parseProbe(json: string, format = ''): Probe {
   type Stream = { codec_type?: string; sample_rate?: string; channels?: number; duration?: string; start_time?: string };
   const j = JSON.parse(json) as { format?: { duration?: string; start_time?: string }; streams?: Stream[] };
   const streams = j.streams ?? [];
   const originS = num(j.format?.start_time) ?? 0;
   const startOf = (s: Stream) => Math.max(0, (num(s.start_time) ?? originS) - originS);
   const video = streams.find((s) => s.codec_type === 'video');
+  const duration = num(j.format?.duration);
   return {
     originS,
-    durationS: num(j.format?.duration),
+    durationS: duration !== undefined && format === 'matroska' ? Math.max(0, duration - originS) : duration,
     video: video ? { durationS: num(video.duration), startS: startOf(video) } : undefined,
     audio: streams.filter((s) => s.codec_type === 'audio').map((s) => ({ sampleRate: num(s.sample_rate), channels: num(s.channels), durationS: num(s.duration), startS: startOf(s) })),
   };
 }
 
-/** What the ffmpeg pass of one track says: level, the peak of each channel, decoded samples and silent intervals (dropped: the count over MAX_INTERVALS). */
+/** What the ffmpeg pass of one track says: level, the peak of each channel, decoded samples and silent intervals (times of the file, from -copyts; dropped: the count over MAX_INTERVALS). */
 export type TrackLog = { peakDb?: number; rmsDb?: number; samples?: number; channelPeaksDb?: number[]; silences: { start: number; end?: number }[]; dropped?: number };
 
 const db = (s: string) => (s.trim() === '-inf' ? -Infinity : num(s.trim()));
 
 /**
- * Parses the stderr of the ffmpeg pass of one track, with the astats and silencedetect filters. The line prefix differs
- * by version: "[silencedetect @ 0x..]" in ffmpeg 8, "[Parsed_silencedetect_1 @ 0x..]" or the instance name in ffmpeg 9.
- * So each track has its own pass, and a line counts by its filter name only. A channel counts only from 1 to the
- * channel count of the track (from ffprobe); the lines of any other channel are ignored.
+ * The filters of the ffmpeg pass of one track. The first ametadata deletes any metadata that comes with the audio, so
+ * only the filters set it. silencedetect sets lavfi.silence_start and lavfi.silence_end on short frames (512 samples or
+ * less: shorter than d from 8 kHz up), so each frame holds at most one start and one end, in time order. astats keeps
+ * running totals over the track and sets them on long frames, so its last values are for the whole track, with one
+ * print for each 480,000 samples. ametadata prints each set to stdout, one write for each line (direct). The text is the
+ * same in ffmpeg 8 and 9.
  */
-export function parseLog(text: string, file = '', channels = 0): { track: TrackLog; errors: string[] } {
+const trackFilter = (silenceDb: number, d: number) =>
+  [
+    'ametadata=mode=delete',
+    'asetnsamples=n=512:p=0',
+    `silencedetect=noise=${silenceDb}dB:d=${d}`,
+    'ametadata=mode=print:file=-:direct=1',
+    'ametadata=mode=delete',
+    'asetnsamples=n=480000:p=0',
+    'astats=metadata=1:measure_overall=Peak_level+RMS_level+Number_of_samples:measure_perchannel=Peak_level',
+    'ametadata=mode=print:file=-:direct=1',
+  ].join(',');
+
+/**
+ * Parses the stdout of the ffmpeg pass of one track: "key=value" lines from trackFilter. A channel counts only from 1 to
+ * the channel count of the track (from ffprobe); any other channel is ignored.
+ */
+export function parseMetadata(text: string, channels = 0): TrackLog {
   const t: TrackLog = { silences: [] };
-  const errors: string[] = [];
-  let channel = 0; // astats prints "Channel: n" before the lines of channel n, and "Overall" before the lines of the track
-  for (const line of text.split(/\r?\n/)) {
-    const m = /^\[(?:Parsed_)?(astats|silencedetect)[^\] ]* @ [^\]]*\] (.*)$/.exec(line);
-    if (!m) {
-      // ffmpeg starts an error line with "[" or "Error"; metadata from the file is indented, so a tag text never counts.
-      // The test reads the line without the file path, so that a file name such as "truncated.mov" is not an error.
-      // An error line loses the memory address and the full path, so that a reply holds neither.
-      const bare = file ? line.split(file).join('') : line;
-      if (/^(\[|Error)/.test(line) && /error|invalid|corrupt|partial file|truncat|moov atom|missing/i.test(bare) && errors.length < 5) errors.push(line.replace(/ @ 0x[0-9a-f]+/gi, '').split(file || '\0').join(basename(file)).slice(0, 200));
-      continue;
-    }
-    const kv = /^([^:]+): (.*)$/.exec(m[2]);
-    if (m[1] === 'silencedetect') {
-      const start = /^silence_start: (\S+)/.exec(m[2]);
-      const end = /^silence_end: (\S+)/.exec(m[2]);
-      if (start && num(start[1]) !== undefined) {
-        if (t.silences.length < MAX_INTERVALS) t.silences.push({ start: Number(start[1]) });
-        else t.dropped = (t.dropped ?? 0) + 1;
-      } else if (end && num(end[1]) !== undefined && !t.dropped) {
-        const open = t.silences.at(-1);
-        if (open && open.end === undefined) open.end = Number(end[1]);
-      }
-    } else if (m[2] === 'Overall') channel = 0;
-    else if (kv?.[1] === 'Channel') {
-      const c = Number(kv[2]);
-      channel = Number.isInteger(c) && c >= 1 && c <= channels ? c : -1;
-    } else if (kv && channel) {
-      if (channel > 0 && kv[1] === 'Peak level dB') (t.channelPeaksDb ??= [])[channel - 1] = db(kv[2]) ?? NaN;
-    } else if (kv) {
-      if (kv[1] === 'Peak level dB') t.peakDb = db(kv[2]);
-      if (kv[1] === 'RMS level dB') t.rmsDb = db(kv[2]);
-      if (kv[1] === 'Number of samples') t.samples = num(kv[2]);
+  for (const line of text.split('\n')) {
+    const m = /^lavfi\.(silence_start|silence_end|astats\.(\w+)\.(Peak_level|RMS_level|Number_of_samples))=(\S+)$/.exec(line);
+    if (!m) continue;
+    const [, key, channel, stat, value] = m;
+    if (key === 'silence_start' && num(value) !== undefined) {
+      if (t.silences.length < MAX_INTERVALS) t.silences.push({ start: Number(value) });
+      else t.dropped = (t.dropped ?? 0) + 1;
+    } else if (key === 'silence_end' && num(value) !== undefined && !t.dropped) {
+      const open = t.silences.at(-1);
+      if (open && open.end === undefined) open.end = Number(value);
+    } else if (channel === 'Overall') {
+      if (stat === 'Peak_level') t.peakDb = db(value);
+      if (stat === 'RMS_level') t.rmsDb = db(value);
+      if (stat === 'Number_of_samples') t.samples = num(value);
+    } else if (stat === 'Peak_level') {
+      const c = Number(channel);
+      if (Number.isInteger(c) && c >= 1 && c <= channels) (t.channelPeaksDb ??= [])[c - 1] = db(value) ?? NaN;
     }
   }
-  return { track: t, errors };
+  return t;
+}
+
+/** The error lines of a pass (ffmpeg runs with "-v error"): at most 5, without the memory addresses and the full path. */
+export function errorLines(text: string, file = ''): string[] {
+  const lines = text.split(/\r?\n/).filter((l) => l.trim());
+  return [...new Set(lines.map((l) => (file ? l.split(file).join(basename(file)) : l).replace(/ @ 0x[0-9a-f]+/gi, '').slice(0, 200)))].slice(0, 5);
 }
 
 /** One audio track, measured: where its audio data ends and should end, its levels and its silent intervals over the full timeline. */
@@ -263,7 +279,7 @@ function intersect(a: Interval[], b: Interval[]): Interval[] {
   return merge(out);
 }
 
-/** Puts the probe and the ffmpeg log together, per track, on the timeline of the container. */
+/** Puts the probe and the ffmpeg pass together, per track, on the timeline of the file: each time of the pass less originS. */
 export function measure(probe: Probe, logs: TrackLog[]): Measure[] {
   const duration = probe.durationS ?? 0;
   return probe.audio.map((a, i) => {
@@ -271,7 +287,7 @@ export function measure(probe: Probe, logs: TrackLog[]): Measure[] {
     const start = a.startS;
     const decoded = t.samples !== undefined && a.sampleRate ? t.samples / a.sampleRate : (a.durationS ?? duration);
     const endS = Math.min(duration, start + decoded);
-    const silent: Interval[] = t.silences.map((s) => ({ start: Math.max(start, s.start), end: Math.min(endS, s.end ?? endS), why: 'silent' as const })).filter((s) => s.end > s.start);
+    const silent: Interval[] = t.silences.map((s) => ({ start: Math.max(start, s.start - probe.originS), end: Math.min(endS, s.end === undefined ? endS : s.end - probe.originS), why: 'silent' as const })).filter((s) => s.end > s.start);
     // Sound is audio data that is not silent. A time with no audio data is never sound, however short.
     const soundS = Math.max(0, endS - start - total(merge(silent)));
     // Before the track starts and after it ends, the file holds no audio data for it: that is silence too.
@@ -411,7 +427,7 @@ export async function verifyFile(path: string, name: string, expect: Expected[] 
   const clean = (s: string) => s.replace(/ @ 0x[0-9a-f]+/gi, '').split(path).join(name).trim().split('\n').slice(0, 3).join(' ').slice(0, 300);
   let probe: Probe | undefined;
   try {
-    probe = p.code === 0 && !p.stopped ? parseProbe(p.out) : undefined;
+    probe = p.code === 0 && !p.stopped ? parseProbe(p.out, format) : undefined;
   } catch {
     probe = undefined;
   }
@@ -429,25 +445,26 @@ export async function verifyFile(path: string, name: string, expect: Expected[] 
   let soundChecked = true;
   const fileFacts = [`Duration ${timecode(duration)}`, count(n, 'audio track'), probe.video ? 'a video stream' : 'no video stream'];
   const fileProblems: string[] = [];
+  const errors: string[] = []; // the error lines of the ffmpeg passes
   const d = shortestGap(limits);
   if (n) {
-    // One pass per track, one after another, all within one time limit: see parseLog for why a pass holds one track.
+    // One pass per track, one after another, all within one time limit. The metadata of a pass has no track label.
     const logs: TrackLog[] = [];
-    const errors: string[] = [];
     for (let i = 0; i < n && soundChecked; i++) {
-      const filter = `astats=metadata=0:measure_perchannel=Peak_level,silencedetect=noise=${limits.silenceDb}dB:d=${d}`;
-      const f = await run(tools.ffmpeg, ['-hide_banner', '-nostdin', '-nostats', '-protocol_whitelist', 'file', '-f', format, '-i', input, '-map', `0:a:${i}`, '-af', filter, '-f', 'null', '-'], left(), limits.timeoutS);
-      const log = parseLog(f.err, path, probe.audio[i].channels);
-      logs.push(log.track);
-      for (const e of log.errors) if (errors.length < 5 && !errors.includes(e)) errors.push(e);
-      if (f.stopped || f.code !== 0 || log.track.dropped) {
+      const args = ['-hide_banner', '-nostdin', '-nostats', '-v', 'error', '-copyts', '-protocol_whitelist', 'file', '-f', format, '-i', input, '-map', `0:a:${i}`, '-af', trackFilter(limits.silenceDb, d), '-f', 'null', '-'];
+      const f = await run(tools.ffmpeg, args, left(), limits.timeoutS);
+      const track = parseMetadata(f.out, probe.audio[i].channels);
+      const trackErrors = errorLines(f.err, path);
+      logs.push(track);
+      for (const e of trackErrors) if (errors.length < 5 && !errors.includes(e)) errors.push(e);
+      if (f.stopped || f.code !== 0 || track.dropped) {
         soundChecked = false;
         fileProblems.push(
           f.stopped
             ? `ffmpeg stopped on track ${i + 1}: ${f.stopped}`
             : f.code !== 0
-              ? `ffmpeg exit code ${f.code} on track ${i + 1}: ${log.errors.join(' | ') || clean(f.err.split('\n').slice(-4).join('\n'))}`
-              : `ffmpeg reported more than ${MAX_INTERVALS} silent intervals on track ${i + 1} (${log.track.dropped} more), more than a real track can have`,
+              ? `ffmpeg exit code ${f.code} on track ${i + 1}: ${trackErrors.join(' | ') || 'no message'}`
+              : `ffmpeg reported more than ${MAX_INTERVALS} silent intervals on track ${i + 1} (${track.dropped} more), more than a real track can have`,
         );
       }
     }
@@ -456,13 +473,17 @@ export async function verifyFile(path: string, name: string, expect: Expected[] 
       for (const m of measures.filter((x) => x.expectedEndS - x.endS >= CUT_S)) {
         fileProblems.push(m.declaredS !== undefined ? `Track ${m.track} says ${m.declaredS.toFixed(1)} s, but its audio data ends at ${timecode(m.endS)}` : `Track ${m.track} states no length, and its audio data ends at ${timecode(m.endS)}, but the file runs to ${timecode(duration)}`);
       }
-      if (errors.length) fileProblems.push(`ffmpeg reported: ${errors.join(' | ')}`);
     }
   }
+  // The error lines of ffmpeg are evidence, not a verdict: the log can hold text from the file. They go with a measured
+  // problem; alone, they are a warning, as each track has its full audio data.
+  const errorText = soundChecked && errors.length ? `ffmpeg reported: ${errors.join(' | ')}` : '';
   claims.push({
     claim: 'The file is readable and complete',
-    verdict: fileProblems.length ? (soundChecked ? 'fail' : 'not_checked') : 'pass',
-    evidence: `${fileProblems.length ? `${fileProblems.join('; ')}. ${soundChecked ? 'The file may be cut short or damaged.' : 'The sound check did not finish, so the sound is not checked.'} ` : ''}${fileFacts.join(', ')}.`,
+    verdict: fileProblems.length ? (soundChecked ? 'fail' : 'not_checked') : errorText ? 'warn' : 'pass',
+    evidence: fileProblems.length
+      ? `${[...fileProblems, errorText].filter(Boolean).join('; ')}. ${soundChecked ? 'The file may be cut short or damaged.' : 'The sound check did not finish, so the sound is not checked.'} ${fileFacts.join(', ')}.`
+      : `${errorText ? `${errorText}. Each track has audio data to its end, so the file is not cut short; the errors can be damage inside the file. ` : ''}${fileFacts.join(', ')}.`,
   });
   // Where the video ends on the timeline of the file. MKV and FLV state no length for it: then its packets give the end.
   const video = probe.video;
