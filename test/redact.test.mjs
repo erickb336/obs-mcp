@@ -1,60 +1,67 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { capped, redact, streamServiceView } from '../dist/redact.js';
+import { capped, redact } from '../dist/redact.js';
 import { search } from '../dist/catalogue.js';
 
-test('redact replaces secret-named values and cuts the query of a URL, at any depth', () => {
-  const out = redact({ inputSettings: { password: 'p1', stream_key: 'k1', token: 7, url: 'https://example.com/page?token=abc#x', bypass: true, name: 'Mic' } });
-  assert.deepEqual(out, { inputSettings: { password: '[redacted]', stream_key: '[redacted]', token: '[redacted]', url: 'https://example.com [cut]', bypass: true, name: 'Mic' } });
+const K = 'live_123456789_fakeStreamKeyK9w4';
+const hidden = (s) => ({ hidden: 'text', length: s.length });
+
+test('inside settings, numbers, booleans and null pass, and every other string is hidden as type and length', () => {
+  const settings = { password: 'p1', pwd: K, name: 'Mic', url: 'https://example.com', volume: 0.5, on: true, unset: null };
+  assert.deepEqual(redact({ inputKind: 'browser_source', inputSettings: settings }), {
+    inputKind: 'browser_source',
+    inputSettings: { password: hidden('p1'), pwd: hidden(K), name: hidden('Mic'), url: hidden('https://example.com'), volume: 0.5, on: true, unset: null },
+  });
 });
 
-test('F-T12-4: a URL keeps only its scheme and host, because a path or query can hold a key', () => {
-  assert.deepEqual(
-    ['rtmp://live.example.com/app/live_123_abc', 'rtmps://a.example:443/live2/k', 'srt://ingest.example.com:9000?streamid=k1', 'rist://ingest.example.com:8000?secret=k2', 'https://alerts.example.com/widget/t0k', 'https://example.com/', 'wss://example.com'].map((u) => redact(u)),
-    ['rtmp://live.example.com [cut]', 'rtmps://a.example:443 [cut]', 'srt://ingest.example.com:9000 [cut]', 'rist://ingest.example.com:8000 [cut]', 'https://alerts.example.com [cut]', 'https://example.com', 'wss://example.com'],
-  );
+test('fields outside settings pass, so names, kinds and states stay readable', () => {
+  const reply = { sceneName: 'Main', scenes: [{ sceneName: 'Main', sceneIndex: 0 }], outputActive: false };
+  assert.deepEqual(redact(reply), reply);
 });
 
-test('F-T12-8: a URL with any scheme, anywhere in a value, and a URL with no scheme lose all but the host', () => {
-  const k = 'live_123456789_fakeStreamKeyK9w4';
-  assert.deepEqual(
-    redact({
-      rtsp: `rtsp://admin:${k}@cam.local/stream`,
-      udp: `udp://239.0.0.1:1234?key=${k}`,
-      tcp: `tcp://ingest.example.com:9000/${k}`,
-      icecast: `icecast://source:${k}@radio.example.com:8000/mount`,
-      spaced: ` RTMP://live.example.com/app/${k}`,
-      note: `Ingest at rtmp://live.example.com/app/${k} and srt://b.example?streamid=${k} today`,
-      login: `admin:${k}@cam.local/stream`,
-      input: `cam.local:554/live/${k}`,
-      url: `ingest.example.com:1935/app/${k}`,
-      server: 'auto',
-      name: 'Camera 2: wide',
-      at: 'Mic @ -6 dB',
-      security_mode: 'none / tls',
-    }),
-    {
-      rtsp: 'rtsp://cam.local [cut]',
-      udp: 'udp://239.0.0.1:1234 [cut]',
-      tcp: 'tcp://ingest.example.com:9000 [cut]',
-      icecast: 'icecast://radio.example.com:8000 [cut]',
-      spaced: ' rtmp://live.example.com [cut]',
-      note: 'Ingest at rtmp://live.example.com [cut] and srt://b.example [cut] today',
-      login: 'cam.local [cut]',
-      input: 'cam.local:554 [cut]',
-      url: 'ingest.example.com:1935 [cut]',
-      server: 'auto',
-      name: 'Camera 2: wide',
-      at: 'Mic @ -6 dB',
-      security_mode: 'none / tls',
-    },
-  );
+test('an allow-listed (kind, key) passes only a value of its shape', () => {
+  const uuid = '5d1f3c2a-8b4e-4f6a-9c7d-0e1f2a3b4c5d';
+  assert.deepEqual(redact({ inputKind: 'screen_capture', inputSettings: { display_uuid: uuid } }).inputSettings, { display_uuid: uuid });
+  assert.deepEqual(redact({ inputKind: 'screen_capture', inputSettings: { display_uuid: K } }).inputSettings, { display_uuid: hidden(K) });
+  // The same key under another kind is hidden.
+  assert.deepEqual(redact({ inputKind: 'browser_source', inputSettings: { display_uuid: uuid } }).inputSettings, { display_uuid: hidden(uuid) });
+  // A default-settings reply has no kind field: the kind comes from the request.
+  assert.deepEqual(redact({ defaultFilterSettings: { sampling: 'lanczos', file: 'a' } }, { filterKind: 'scale_filter' }), { defaultFilterSettings: { sampling: 'lanczos', file: hidden('a') } });
 });
 
-test('stream service settings pass only service, server and protocol; the server loses its path', () => {
-  const out = streamServiceView({ streamServiceType: 'rtmp_custom', streamServiceSettings: { server: 'rtmp://live.example.com/app/key123', key: 'key123', username: 'u', password: 'p', service: 'Custom' } });
-  assert.deepEqual(out.streamServiceSettings, { service: 'Custom', server: 'rtmp://live.example.com [cut]' });
-  assert.equal(out.streamServiceType, 'rtmp_custom');
+test('F-T12-9: a stream server with no scheme and a key in its path is hidden; an enum passes', () => {
+  const server = `live.example.com:1935/app/${K}`;
+  const out = redact({ streamServiceType: 'rtmp_custom', streamServiceSettings: { server, key: K, protocol: 'RTMP', use_auth: true } });
+  assert.deepEqual(out.streamServiceSettings, { server: hidden(server), key: hidden(K), protocol: 'RTMP', use_auth: true });
+  const common = redact({ streamServiceType: 'rtmp_common', streamServiceSettings: { service: 'Twitch', server: 'auto', key: K } });
+  assert.deepEqual(common.streamServiceSettings, { service: 'Twitch', server: 'auto', key: hidden(K) });
+});
+
+test('F-T12-11, F-T12-13: a password with "@" or "/", other secret names, a flag in text and JSON text are hidden whole', () => {
+  const values = { password: `pa@ss/${K}`, pass: K, psk: K, rtmp_key: K, args: `--key=${K} --fast`, json: JSON.stringify({ token: K }) };
+  const out = redact({ outputSettings: values });
+  assert.deepEqual(out.outputSettings, Object.fromEntries(Object.entries(values).map(([k, v]) => [k, hidden(v)])));
+});
+
+test('F-T12-12: an array item keeps its parent key, at any depth', () => {
+  const out = redact({ filterKind: 'scale_filter', filterSettings: { sampling: ['lanczos', K], list: [{ value: K, on: true }, [K, 2]] } });
+  assert.deepEqual(out.filterSettings, { sampling: ['lanczos', hidden(K)], list: [{ value: hidden(K), on: true }, [hidden(K), 2]] });
+});
+
+test('GetPersistentData: a slot value is settings, so text is hidden and a number passes', () => {
+  assert.deepEqual(redact({ slotValue: K }), { slotValue: hidden(K) });
+  assert.deepEqual(redact({ slotValue: 3 }), { slotValue: 3 });
+  assert.deepEqual(redact({ slotValue: { token: K, n: 1 } }), { slotValue: { token: hidden(K), n: 1 } });
+});
+
+test('F-T12-10: a 200,000-character value returns within 50 ms', () => {
+  for (const s of ['a'.repeat(200000), `a:${'b'.repeat(199998)}`, 'x://'.repeat(50000), 'a@'.repeat(100000)]) {
+    const t = performance.now();
+    const out = capped(redact({ inputKind: 'screen_capture', inputSettings: { display_uuid: s, note: s } }));
+    const ms = performance.now() - t;
+    assert.equal(out, '{"inputKind":"screen_capture","inputSettings":{"display_uuid":{"hidden":"text","length":200000},"note":{"hidden":"text","length":200000}}}');
+    assert.ok(ms < 50, `${ms.toFixed(1)} ms`);
+  }
 });
 
 test('a long reply is cut with a note that gives the full length', () => {

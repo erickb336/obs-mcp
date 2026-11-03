@@ -1,54 +1,78 @@
-// Every value that leaves the server for the model passes here.
+// Every reply passes here before it goes to the model.
+//
+// Settings are free-form: OBS, plugins and scripts keep any value in them, stream keys, passwords and tokens too.
+// So a value inside settings passes only when its shape is known to be safe: a number, a boolean, null, or a string
+// that the allow-list below accepts for its (kind, key). Every other string becomes {"hidden":"text","length":n}.
+// No string is searched for secrets: the server does not try to recognise a secret, so it cannot miss one.
 
-const SECRET_KEY = /password|passwd|passphrase|secret|token|bearer|auth|cookie|credential|api_?key|stream_?key|^key$/i;
-// A URL with any scheme, anywhere in a text, and a "user:password@host" with no scheme.
-const URL_IN_TEXT = /[a-z][a-z0-9+.-]*:\/\/\S+/gi;
-const USERINFO = /[^\s:@/]+:[^\s@/]*@([^\s/?#@]+)\S*/g;
-// A key whose value is a URL, so the value can be a URL with no scheme ("host:port/path").
-const URL_KEY = /url|(^|_)uri(_|$)|server|ingest|endpoint|^input$/i;
+/** A reply field that holds free-form settings: inputSettings, filterSettings, transitionSettings and the like. */
+const isSettings = (key: string) => key.endsWith('Settings') || key === 'slotValue' || key === 'responseData';
 
-/** Keeps only the scheme and host of a URL. The user name, password, path, query and fragment can each hold a key. */
-export function cutUrl(s: string): string {
-  try {
-    const u = new URL(s);
-    const cut = !!(u.username || u.password || u.search || u.hash || u.pathname.length > 1);
-    return `${u.protocol}//${u.host}${cut ? ' [cut]' : ''}`;
-  } catch {
-    return '[redacted]';
-  }
+type Shape = readonly string[] | 'uuid';
+const PROTOCOLS = ['RTMP', 'RTMPS', 'SRT', 'RIST', 'WHIP', 'HLS'];
+const AUDIO_DEVICE = { device_id: ['default'] };
+const KEY_COLOR = { key_color_type: ['green', 'blue', 'magenta', 'custom'] };
+const DIRECTION = { direction: ['left', 'right', 'up', 'down'] };
+
+/**
+ * The allow-list: kind -> key -> safe shape. The kind is the input, filter or transition kind, or the stream service
+ * type. A key that is not here, or a value with another shape, is hidden. Add a row only for a value that cannot hold
+ * a secret: an enum, or a UUID that OBS makes.
+ */
+export const SAFE_SETTINGS: ReadonlyMap<string, ReadonlyMap<string, Shape>> = new Map(
+  Object.entries({
+    screen_capture: { display_uuid: 'uuid' },
+    coreaudio_input_capture: AUDIO_DEVICE,
+    coreaudio_output_capture: AUDIO_DEVICE,
+    wasapi_input_capture: AUDIO_DEVICE,
+    wasapi_output_capture: AUDIO_DEVICE,
+    pulse_input_capture: AUDIO_DEVICE,
+    pulse_output_capture: AUDIO_DEVICE,
+    noise_suppress_filter_v2: { method: ['speex', 'rnnoise', 'denoiser'] },
+    color_key_filter_v2: KEY_COLOR,
+    chroma_key_filter_v2: KEY_COLOR,
+    scale_filter: { sampling: ['point', 'bilinear', 'bicubic', 'lanczos', 'area'] },
+    swipe_transition: DIRECTION,
+    slide_transition: DIRECTION,
+    rtmp_common: { service: ['Twitch', 'YouTube - RTMPS', 'YouTube - HLS', 'Facebook Live', 'Kick', 'Restream.io'], server: ['auto'], protocol: PROTOCOLS },
+    rtmp_custom: { protocol: PROTOCOLS },
+  }).map(([kind, keys]) => [kind, new Map(Object.entries(keys as Record<string, Shape>))]),
+);
+
+// The length check comes first, so no regex ever reads a long text. This regex has no nested quantifier.
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function safe(kind: string, key: string, s: string): boolean {
+  const shape = SAFE_SETTINGS.get(kind)?.get(key);
+  if (!shape || s.length > 64) return false;
+  return shape === 'uuid' ? s.length === 36 && UUID.test(s) : shape.includes(s);
 }
 
-/** Cuts each URL in a text to its scheme and host, and each "user:password@host" to its host. */
-function cutText(s: string, key: string): string {
-  const out = s.replace(URL_IN_TEXT, cutUrl).replace(USERINFO, '$1 [cut]');
-  if (out !== s || s.includes('://') || !URL_KEY.test(key)) return out;
-  // A URL with no scheme in a URL key: only the host and port pass.
-  const [, lead, host, rest] = /^(\s*)([^\s/?#]*)(.*)$/s.exec(s)!;
-  return rest ? `${lead}${host} [cut]` : s;
-}
-
-/** Replaces secret-named values with "[redacted]" and cuts URLs, at any depth. */
-export function redact(v: unknown, key = ''): unknown {
-  if (SECRET_KEY.test(key) && v !== null && typeof v !== 'boolean' && typeof v !== 'object') return '[redacted]';
-  if (typeof v === 'string') return cutText(v, key);
-  if (Array.isArray(v)) return v.map((x) => redact(x));
-  if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, redact(x, k)]));
+/** A value inside settings. Arrays and objects recurse, and an array item keeps the key of its parent. */
+function settings(v: unknown, kind: string, key: string): unknown {
+  if (typeof v === 'string') return safe(kind, key, v) ? v : { hidden: 'text', length: v.length };
+  if (Array.isArray(v)) return v.map((x) => settings(x, kind, key));
+  if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, settings(x, kind, k)]));
   return v;
 }
 
-// GetStreamServiceSettings: an allow-list of fields, not a removal list. The server URL loses its path and query.
-const STREAM_FIELDS = ['service', 'server', 'protocol'];
-export function streamServiceView(reply: Record<string, unknown>) {
-  const s = (reply.streamServiceSettings ?? {}) as Record<string, unknown>;
-  const kept = Object.fromEntries(STREAM_FIELDS.filter((k) => typeof s[k] === 'string').map((k) => [k, redact(s[k])]));
-  return { streamServiceType: reply.streamServiceType, streamServiceSettings: kept, note: `Only these fields pass: ${STREAM_FIELDS.join(', ')}. Keys, passwords and user names never pass.` };
-}
+const kindOf = (o: Record<string, unknown>, fallback: string) => {
+  const k = o.inputKind ?? o.filterKind ?? o.transitionKind ?? o.streamServiceType;
+  return typeof k === 'string' ? k : fallback;
+};
 
-// GetPersistentData: scripts and plugins keep any value in a slot, tokens too. Only a number, a boolean or null passes.
-export function persistentView(reply: Record<string, unknown>) {
-  const v = reply.slotValue;
-  const safe = v === null || typeof v === 'number' || typeof v === 'boolean';
-  return { slotValue: safe ? v : '[redacted]', ...(safe ? {} : { note: `The slot holds a ${Array.isArray(v) ? 'array' : typeof v}. Only a number, a boolean or null passes, because a slot can hold a token.` }) };
+/**
+ * The reply as the model sees it. Fields outside settings (names, kinds, states, numbers) pass. Inside settings, only
+ * numbers, booleans, null and allow-listed strings pass. params give the kind for a default-settings request.
+ */
+export function redact(reply: unknown, params: Record<string, unknown> = {}): unknown {
+  const p = params.inputKind ?? params.filterKind;
+  const walk = (v: unknown, kind: string): unknown => {
+    if (Array.isArray(v)) return v.map((x) => walk(x, kind));
+    if (!v || typeof v !== 'object') return v;
+    const k = kindOf(v as Record<string, unknown>, kind);
+    return Object.fromEntries(Object.entries(v).map(([key, x]) => [key, isSettings(key) ? settings(x, k, key) : walk(x, k)]));
+  };
+  return walk(reply, typeof p === 'string' ? p : '');
 }
 
 const MAX_CHARS = 24000;

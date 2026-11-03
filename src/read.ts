@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { brief, checkFields, entry, readRule, READ_GUARDED, search } from './catalogue.js';
 import { Obs, ObsError } from './obs.js';
-import { persistentView, redact, streamServiceView } from './redact.js';
+import { redact } from './redact.js';
 
 export type ReadResult = { ok: true; data: unknown } | { ok: false; refused: string; [k: string]: unknown };
 
@@ -57,10 +57,8 @@ export async function read(obs: Obs, request: string, params: Record<string, unk
       if (why) return refuse(`${e.request}: ${why} It was not sent.`);
     }
     const reply = await obs.call(e.request, params);
-    if (e.request === 'GetStreamServiceSettings') return { ok: true, data: streamServiceView(reply) };
     if (e.request === 'GetSourceScreenshot') return { ok: true, data: saveScreenshot(reply, params) };
-    if (e.request === 'GetPersistentData') return { ok: true, data: persistentView(reply) };
-    return { ok: true, data: redact(reply) };
+    return { ok: true, data: redact(reply, params) };
   } catch (err) {
     if (err instanceof ObsError) return refuse(err.message);
     throw err;

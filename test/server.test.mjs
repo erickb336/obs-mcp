@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { after, before, describe, test } from 'node:test';
 import { getEncoding } from 'js-tiktoken';
 import { OBSWebSocket } from 'obs-websocket-js/json';
-import { startFakeObs, PRIVATE_REQUESTS } from './fake-obs.mjs';
+import { DISPLAY_UUID, startFakeObs, PRIVATE_REQUESTS } from './fake-obs.mjs';
 import { closedPort, connect, obsConfigDir, sampleParams, testEnv } from './helpers.mjs';
 
 const CATALOGUE = JSON.parse(readFileSync(new URL('../dist/catalogue.json', import.meta.url), 'utf8'));
@@ -119,9 +119,13 @@ describe('against the fake OBS', () => {
     assert.equal((await s.call('obs_status')).json.connected, true);
   });
 
-  test('GetStreamServiceSettings returns only allowed fields', async () => {
+  test('F-T12-9: GetStreamServiceSettings hides the server, key, user name and password, and passes the protocol', async () => {
     const r = await s.call('obs_read', { request: 'GetStreamServiceSettings' });
-    assert.deepEqual(r.json.data.streamServiceSettings, { server: 'rtmp://live.example.com [cut]' });
+    const h = (length) => ({ hidden: 'text', length });
+    assert.deepEqual(r.json.data, {
+      streamServiceType: 'rtmp_custom',
+      streamServiceSettings: { server: h('live.example.com:1935/app/live_fakestreamkey_123'.length), protocol: 'RTMP', key: h(22), use_auth: true, username: h(7), password: h(PASSWORD.length) },
+    });
   });
 
   test('F-T12-1: a list request with both inputName and inputUuid is refused, so an uncleared input never reaches OBS', async () => {
@@ -148,7 +152,7 @@ describe('against the fake OBS', () => {
     assert.deepEqual(fake.log, ['GetProfileParameter']);
   });
 
-  test('F-T12-4: a key in the path or query of an RTMP, SRT, RIST or web URL does not pass', async () => {
+  test('F-T12-4: settings strings reach the model only as type and length; numbers, booleans and allow-listed values pass', async () => {
     for (const [request, params, field] of [
       ['GetInputSettings', { inputName: 'Display' }, 'inputSettings'],
       ['GetOutputSettings', { outputName: 'adv_stream' }, 'outputSettings'],
@@ -156,22 +160,23 @@ describe('against the fake OBS', () => {
     ]) {
       const r = await s.call('obs_read', { request, params });
       assert.equal(r.isError, false, r.text);
-      const { server, srt_url, rist_url, widget } = r.json.data[field];
-      assert.deepEqual({ server, srt_url, rist_url, widget }, {
-        server: 'rtmp://live.example.com [cut]',
-        srt_url: 'srt://ingest.example.com:9000 [cut]',
-        rist_url: 'rist://ingest.example.com:8000 [cut]',
-        widget: 'https://alerts.example.com [cut]',
+      const { server, headers, show_cursor, volume, unset } = r.json.data[field];
+      assert.deepEqual({ server, headers, show_cursor, volume, unset }, {
+        server: { hidden: 'text', length: 'rtmp://live.example.com/app/live_fakestreamkey_123'.length },
+        headers: [{ hidden: 'text', length: 'Authorization: Bearer live_fakestreamkey_123'.length }, [{ hidden: 'text', length: 6 }, { hidden: 'text', length: 22 }]],
+        show_cursor: true, volume: 0.5, unset: null,
       });
       assert.equal(r.text.includes('live_fakestreamkey_123'), false);
     }
+    const display = await s.call('obs_read', { request: 'GetInputSettings', params: { inputName: 'Display' } });
+    assert.equal(display.json.data.inputSettings.display_uuid, DISPLAY_UUID);
   });
 
-  test('F-T12-5: GetPersistentData redacts a text value and passes a number', async () => {
+  test('F-T12-5: GetPersistentData hides a text value and passes a number', async () => {
     const realm = 'OBS_WEBSOCKET_DATA_REALM_GLOBAL';
     const text = await s.call('obs_read', { request: 'GetPersistentData', params: { realm, slotName: 'auth' } });
     assert.equal(text.isError, false, text.text);
-    assert.equal(text.json.data.slotValue, '[redacted]');
+    assert.deepEqual(text.json.data.slotValue, { hidden: 'text', length: 'sample-refresh-token'.length });
     assert.equal(text.text.includes('sample-refresh-token'), false);
     const num = await s.call('obs_read', { request: 'GetPersistentData', params: { realm, slotName: 'count' } });
     assert.equal(num.json.data.slotValue, 3);

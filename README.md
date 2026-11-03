@@ -66,7 +66,7 @@ What `obs_read` runs in 0.0, from the class table in [`catalogue/classes.json`](
 
 | Class | Requests | In 0.0 |
 | --- | --- | --- |
-| read | 57 | Runs. `GetSourceScreenshot` saves the image to a file in a folder that the server makes in the system temporary folder; the reply gives only the path and the size. `GetPersistentData` passes a number, a boolean or null; any other slot value becomes `[redacted]`. |
+| read | 57 | Runs. `GetSourceScreenshot` saves the image to a file in a folder that the server makes in the system temporary folder; the reply gives only the path and the size. A slot value of `GetPersistentData` is settings: see [what the AI sees](#what-the-ai-sees). |
 | change | 56 | Refused, not sent |
 | guarded | 34 | Refused, not sent, except three reads with their own guard: `GetInputPropertiesListPropertyItems`, `GetStreamServiceSettings` and `GetProfileParameter` (only video, audio, output mode and recording parameters; never tokens or output URLs) |
 | not documented | 4 private-settings requests that OBS offers live | Refused, not sent |
@@ -79,9 +79,24 @@ What `obs_read` runs in 0.0, from the class table in [`catalogue/classes.json`](
 - **Listener exposure.** When the obs-websocket server is on, OBS listens on all network interfaces. It has no option to listen on localhost only. Other devices on your network can reach it, unless a firewall blocks them. Keep a password set. `obs_status` and the doctor report what listens on the port.
 - **obs-mcp opens no port.** It speaks MCP over stdio only, and it connects to OBS on 127.0.0.1 only.
 - **The password** comes from the obs-websocket settings file, or from `OBS_WEBSOCKET_PASSWORD`. Never give it as an argument: OBS writes its own command line to its log. No reply, log or doctor line shows it.
-- **Secrets in replies.** Values with a secret name (password, key, token) become `[redacted]`. A URL with any scheme, anywhere in a value, keeps only its scheme and host, because a user name, password, path or query can hold a stream key (for example `rtsp://user:<password>@host/stream` or `srt://host?streamid=<key>`). A `user:password@host` value, and a URL with no scheme in a URL setting (`host:port/<key>`), keep only the host. `GetStreamServiceSettings` passes only `service`, `server` and `protocol`.
+- **Secrets in replies.** Settings can hold a stream key, password or token in any text. So the AI gets settings text only when it is on a short allow-list. See [what the AI sees](#what-the-ai-sees).
 - **List requests can crash OBS.** `GetInputPropertiesListPropertyItems` runs only on a row that was tested on real OBS. Today there is one row: property `type` of a `screen_capture` input, on macOS, OBS 33.0.1. Before each list request the server reads the recording state; during any recording, whoever started it, the request is refused.
 - **The doctor changes nothing.** It reads files and asks the OS. It notes a leftover crash file in the OBS `.sentinel` folder and never deletes it.
+
+### What the AI sees
+
+Settings are the free-form values that OBS, plugins and scripts keep: every reply field whose name ends in `Settings` (for example `inputSettings`, `filterSettings`, `outputSettings`, `streamServiceSettings`, `transitionSettings`), and the `slotValue` of `GetPersistentData`. The server does not try to find secrets in them. It passes only values with a known safe shape.
+
+| Value | What the AI gets |
+| --- | --- |
+| A reply field outside settings: names, kinds, states, numbers, for example a scene name or `outputActive` | The value |
+| `GetProfileParameter` | The value, but only for the safe (category, name) pairs; other pairs are refused |
+| A number, a boolean or null inside settings | The value |
+| A text inside settings, on the allow-list for its kind and key, with the expected shape | The value |
+| Any other text inside settings: URLs, paths, names, keys, passwords, JSON text | Only its type and length, for example `{"hidden":"text","length":42}` |
+| A list or an object inside settings | The same rules for each item; an item in a list uses the key of the list |
+
+The allow-list is `SAFE_SETTINGS` in [`src/redact.ts`](src/redact.ts). It holds only enums and the display UUID of a screen capture, for example the `protocol` of a stream service, `server: "auto"` of a common service, the `service` names of some common services, and the `sampling` of a scale filter. A stream server URL is hidden, also when it has no scheme.
 
 ## How it works
 
