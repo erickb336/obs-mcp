@@ -3,7 +3,8 @@
 // is not on PATH. No file here comes from OBS: the real-file test is test/real-files.test.mjs, and it is opt-in.
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import fs, { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, test } from 'node:test';
@@ -74,6 +75,20 @@ describe('parser and rules, on captured ffmpeg text (no ffmpeg needed)', () => {
     assert.equal(m.soundS, 15);
   });
 
+  test('F-T5-9: a silent track whose audio data ends 0.06 s before the file has 0 s of sound, not 0.1 s', () => {
+    // The numbers of a silent track as ffprobe and ffmpeg 9 give them: 718752 samples (14.974 s) in a 15.033 s file.
+    const probe = parseProbe(JSON.stringify({ streams: [{ codec_type: 'audio', sample_rate: '48000', duration: '14.974', start_time: '0' }], format: { duration: '15.033333' } }));
+    const log = parseLog('[Parsed_silencedetect_1 @ 0x1] silence_start: 0\n[Parsed_astats_0 @ 0x2] Peak level dB: -inf\n[Parsed_astats_0 @ 0x2] Number of samples: 718752\n[Parsed_silencedetect_1 @ 0x1] silence_end: 14.974 | silence_duration: 14.974\n');
+    const [m] = measure(probe, [log.track]);
+    assert.equal(m.soundS, 0);
+    assert.match(judge(probe, [m], [], limits)[0].evidence, /^Silent\. Track 1: peak -inf dB, RMS unknown, sound 0\.0 s of 15\.0 s\.$/);
+  });
+
+  test('F-T5-8: parseLog reads the peak of each channel apart from the overall peak', () => {
+    const text = ['Channel: 1', 'Peak level dB: -5.362297', 'Channel: 2', 'Peak level dB: -inf', 'Overall', 'Peak level dB: -5.362297', 'RMS level dB: -11.2', 'Number of samples: 480000'].map((l) => `[Parsed_astats_0 @ 0x1] ${l}`).join('\n');
+    assert.deepEqual(parseLog(text).track, { silences: [], channelPeaksDb: [-5.362297, -Infinity], peakDb: -5.362297, rmsDb: -11.2, samples: 480000 });
+  });
+
   test('a backup track with sound turns a silent source into a warning that names the backup', () => {
     const probe = parseProbe(PROBE_60);
     const silent = parseLog('[silencedetect @ 0x1] silence_start: 0\n[silencedetect @ 0x1] silence_end: 60 | silence_duration: 60\n').track;
@@ -129,6 +144,22 @@ test('a tool that hangs or floods its output is stopped, and the result is not_c
   assert.deepEqual([flood.state, flood.claims[0].evidence], ['not_checked', 'ffprobe stopped: its output passed 33554432 bytes. Nothing in the file was checked.']);
 });
 
+test('F-T5-3: OBS_MCP_VERIFY_TIMEOUT_S is one deadline for the whole check, ffprobe and ffmpeg together', { skip: process.platform === 'win32' && 'the stand-in tools are shell scripts' }, async () => {
+  // ffprobe takes 1.5 s and answers; the ffmpeg pass hangs. With a limit of 2 s the check must end near 2 s, not at 3.5 s.
+  const bin = mkdtempSync(join(tmpdir(), 'obs-mcp-standin-'));
+  const probe = `{"format":{"duration":"10"},"streams":[{"codec_type":"audio","sample_rate":"48000"}]}`;
+  const body = `case "$0" in *ffprobe) sleep 1.5; echo '${probe}';; *) case "$*" in *-version*) echo 'ffmpeg version stand-in';; *) sleep 30;; esac;; esac`;
+  for (const name of ['ffmpeg', 'ffprobe']) writeFileSync(join(bin, name), `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+  const file = join(mkdtempSync(join(tmpdir(), 'obs-mcp-take-')), 'take.mov');
+  writeFileSync(file, 'x');
+  const t = Date.now();
+  const r = await verifyFile(file, 'take.mov', [], { OBS_MCP_FFMPEG: join(bin, 'ffmpeg'), OBS_MCP_VERIFY_TIMEOUT_S: '2' });
+  const took = Date.now() - t;
+  assert.equal(r.state, 'not_checked');
+  assert.match(r.claims[0].evidence, /^ffmpeg stopped on track 1: the check passed its time limit of 2 s/);
+  assert.ok(took < 3000, `the check took ${took} ms for a limit of 2 s`);
+});
+
 describe('path guard: only a regular file inside the recording folder', () => {
   const root = mkdtempSync(join(tmpdir(), 'obs-mcp-rec-'));
   const folder = join(root, 'recordings');
@@ -152,6 +183,36 @@ describe('path guard: only a regular file inside the recording folder', () => {
     assert.throws(() => resolveInFolder(folder, 'sub'), /is not a regular file/);
     assert.throws(() => resolveInFolder(folder, 'none.mov'), /No file "none\.mov" in the recording folder/);
     assert.throws(() => resolveInFolder(folder, ''), /Give the name of a file/);
+  });
+
+  const OUTSIDE = (input) => `${JSON.stringify(input)} is outside the recording folder, or a link leads out of it. The check reads only files inside the recording folder.`;
+
+  test('F-T5-5: an outside file that exists and one that does not get the same refusal', () => {
+    for (const p of [join(root, 'secret.txt'), join(root, 'no-such-file.txt')]) assert.throws(() => resolveInFolder(folder, p), { message: OUTSIDE(p) });
+  });
+
+  test('F-T5-4: an outside, UNC, device or namespace path is refused before any file system call reads it', () => {
+    const seen = [];
+    const spy = (orig) => function (p, ...rest) {
+      seen.push(String(p));
+      return orig.call(this, p, ...rest);
+    };
+    const saved = { realpathSync: fs.realpathSync, statSync: fs.statSync, lstatSync: fs.lstatSync };
+    const native = fs.realpathSync.native;
+    fs.realpathSync = Object.assign(spy(saved.realpathSync), { native });
+    fs.statSync = spy(saved.statSync);
+    fs.lstatSync = spy(saved.lstatSync);
+    syncBuiltinESMExports();
+    try {
+      const inputs = ['/net/somehost/share/take.mov', '\\\\somehost\\share\\take.mov', '//somehost/share/take.mov', '\\\\?\\C:\\rec\\take.mov', '\\\\.\\pipe\\take', join(root, 'secret.txt')];
+      for (const p of inputs) assert.throws(() => resolveInFolder(folder, p), { message: OUTSIDE(p) });
+      assert.deepEqual(seen.filter((p) => !p.startsWith(folder) && p !== realpathSync(folder)), [], 'a file system call got a path outside the folder');
+      // A file inside is still found, by a name or by the full path of the folder.
+      assert.equal(resolveInFolder(folder, join(realpathSync(folder), 'take.mov')).name, 'take.mov');
+    } finally {
+      Object.assign(fs, saved);
+      syncBuiltinESMExports();
+    }
   });
 
   test('refuses a link that leads out of the folder', { skip: process.platform === 'win32' && 'a symbolic link needs extra rights on Windows' }, () => {
@@ -256,6 +317,59 @@ describe('SIMULATED files made by ffmpeg', { skip: SKIP }, () => {
     assert.equal(existsSync('PWNED'), false);
   });
 
+  test('F-T5-1: SIMULATED 20 s stereo MKV with 2 tracks: verified, with no channel warning', async () => {
+    const r = await check('stereoMkv', []);
+    assert.equal(r.state, 'verified', JSON.stringify(r.claims));
+    assert.equal(r.duration, '00:00:20.0');
+    assert.deepEqual(r.tracks.map((t) => [t.track, t.ends_at, t.silent_intervals.length]), [[1, '00:00:20.0', 0], [2, '00:00:20.0', 0]]);
+  });
+
+  test('F-T5-1: SIMULATED MKV cut to 50%: failed, each track "ends at 00:00:10.0, but the file runs to 00:00:20.0"', async () => {
+    const r = await check('cutMkv', []);
+    assert.equal(r.state, 'failed');
+    assert.equal(r.claims[0].verdict, 'fail');
+    assert.match(r.claims[0].evidence, /^Track 1 states no length, and its audio data ends at 00:00:10\.0, but the file runs to 00:00:20\.0; Track 2 states no length, and its audio data ends at 00:00:10\.0/);
+    // A track with no expected source shows the tail with no audio data too.
+    const t1 = r.claims.find((c) => c.claim === 'Track 1 has sound');
+    assert.equal(t1.verdict, 'warn');
+    assert.match(t1.evidence, /^No audio data for 10\.0 s\./);
+    assert.deepEqual(t1.gaps, [{ from: '00:00:10.0', to: '00:00:20.0', seconds: 10, why: 'no audio data' }]);
+  });
+
+  test('F-T5-7: SIMULATED 6 s gap on a voice: verified, and the track lists the gap 00:00:08.0 to 00:00:14.0', async () => {
+    const r = await check('shortGap', [{ name: 'Remote', kind: 'voice', track: 1 }]);
+    assert.equal(r.state, 'verified');
+    assert.deepEqual(r.tracks[0].silent_intervals, [{ from: '00:00:08.0', to: '00:00:14.0', seconds: 6, why: 'silent' }]);
+  });
+
+  test('F-T5-8: SIMULATED stereo track with a dead right channel: verified_with_warnings, "Channel 2 is silent"', async () => {
+    const r = await check('leftOnly', []);
+    assert.equal(r.state, 'verified_with_warnings');
+    assert.match(r.claims.find((c) => c.claim === 'Track 1 has sound').evidence, /^Channel 2 is silent \(peak -inf dB\), and channel 1 has sound\. Track 1: peak -/);
+  });
+
+  test('F-T5-6: SIMULATED playlist in the folder that points to a file outside: refused, ffmpeg never reads it', async () => {
+    const rec = mkdtempSync(join(tmpdir(), 'obs-mcp-playlist-'));
+    const list = join(rec, 'take.m3u8');
+    writeFileSync(list, `#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXTINF:10,\nfile:${f.healthy}\n#EXT-X-ENDLIST\n`);
+    await assert.rejects(verifyFile(list, 'take.m3u8', []), { message: 'The check reads only the file types that OBS records: .mov, .mp4, .m4v, .mkv, .flv, .ts. "take.m3u8" is not one of them.' });
+    // A playlist with the name of a recording is read as that type only: it fails, and nothing of the outside file shows.
+    const named = join(rec, 'take.mov');
+    writeFileSync(named, readFileSync(list));
+    const r = await verifyFile(named, 'take.mov', []);
+    assert.equal(r.state, 'failed');
+    assert.equal(r.duration, undefined);
+  });
+
+  test('F-T5-2: SIMULATED healthy MKV with the afinfo fallback (macOS): not_checked, "afinfo cannot read this format", not failed', { skip: !audioTools().afinfo && 'afinfo is a macOS tool and is not on PATH here' }, async () => {
+    const bin = mkdtempSync(join(tmpdir(), 'obs-mcp-afinfo-only-'));
+    symlinkSync(audioTools().afinfo, join(bin, 'afinfo'));
+    const r = await verifyFile(f.stereoMkv, 'stereo.mkv', [], { PATH: bin });
+    assert.equal(r.state, 'not_checked');
+    assert.equal(r.claims[0].verdict, 'not_checked');
+    assert.match(r.claims[0].evidence, /^afinfo cannot read this format or this file: it reads MOV and MP4, not MKV, FLV or TS\. Nothing in the file was checked\. Sound not checked: ffmpeg and ffprobe not found .*Install: brew install ffmpeg\.$/);
+  });
+
   test('SIMULATED afinfo fallback (macOS): not_checked, tracks counted, a missing track fails', { skip: !audioTools().afinfo && 'afinfo is a macOS tool and is not on PATH here' }, async () => {
     const bin = mkdtempSync(join(tmpdir(), 'obs-mcp-afinfo-only-'));
     symlinkSync(audioTools().afinfo, join(bin, 'afinfo'));
@@ -266,6 +380,9 @@ describe('SIMULATED files made by ffmpeg', { skip: SKIP }, () => {
     assert.match(r.claims[0].evidence, /^afinfo reads 2 audio tracks, track 1 00:00:10\.0, track 2 00:00:10\.0\. afinfo does not show a cut-short file or the video\. Sound not checked: ffmpeg and ffprobe not found/);
     const missing = await verifyFile(f.healthy, 'healthy', [{ name: 'Remote', kind: 'voice', track: 3 }], env);
     assert.equal(missing.state, 'failed');
+    // F-T5-9: one track is "1 audio track", not "1 audio tracks".
+    const one = await verifyFile(f.quiet, 'quiet', [{ name: 'Remote', kind: 'voice', track: 2 }], env);
+    assert.equal(one.claims.find((c) => c.claim.startsWith('Source "Remote"')).evidence, 'Track 2 is missing: the file has 1 audio track.');
   });
 });
 

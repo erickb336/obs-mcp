@@ -82,13 +82,18 @@ The list has 4 tools. Its size is about 690 tokens (method: compact JSON of `too
 
 ### The file check
 
-`obs_verify_file` takes a file name in the recording folder, and optional expected sources. Each expected source has a name, a kind, a track (1 is the first audio track) and an optional backup track. The check only reads the file: it never changes, moves or deletes it, whatever the result.
+`obs_verify_file` takes a file name in the recording folder, and optional expected sources. Each expected source has a name, a kind, a track and an optional backup track. The check only reads the file: it never changes, moves or deletes it, whatever the result.
+
+A track number is the Nth audio track in the file; OBS writes only the tracks that are on. For example, if only OBS tracks 1 and 3 are on, OBS track 3 is track 2 in the file.
+
+The check reads the file types that OBS records: `.mov`, `.mp4`, `.m4v`, `.mkv`, `.flv` and `.ts`. It refuses other types, for example an `.m3u8` playlist, and ffmpeg reads each file as the type of its name only.
 
 | It reports | How |
 | --- | --- |
-| A file that cannot be read, or is cut short (for example a MOV without its index, or a track whose audio data ends before its stated length) | ffprobe and ffmpeg errors, and decoded length against stated length |
+| A file that cannot be read, or is cut short (for example a MOV without its index, a track whose audio data ends 1 s or more before its stated length, or, in an MKV, which states no length per track, 1 s or more before the end of the file) | ffprobe and ffmpeg errors, and decoded length against stated length or file length |
 | Duration, the video stream and its duration | ffprobe |
-| Each audio track: peak, RMS, sound time, and every silent interval with its timecodes | One ffmpeg pass: `astats` and `silencedetect` on each track |
+| Each audio track: peak, RMS, sound time, and every silent interval of 0.5 s or more (less when a gap limit is set below 0.5 s) with its timecodes. Sound time counts only audio data that is not silent | One ffmpeg pass: `astats` and `silencedetect` on each track |
+| A channel of a stereo track that is silent while another channel has sound (a warning) | The peak of each channel, from `astats` |
 | One verdict per claim: per expected source, or per track when you name none | The rules below |
 
 The result has one state: `verified`, `verified_with_warnings`, `failed` or `not_checked`.
@@ -101,9 +106,11 @@ The result has one state: `verified`, `verified_with_warnings`, `failed` or `not
 
 A missing track or a file with no audio stream fails. A low level (peak below -40 dB) or a peak that may clip warns. If a source fails alone and its backup track has sound at those times, the result is a warning that names the backup track. **The gap limits have no basis in a real take yet.** They are settings with conservative defaults (see [Settings](#settings)).
 
-The check needs ffmpeg and ffprobe. Without them, the result is `not_checked` and says "Sound not checked", with the install line for your system. On macOS, `afinfo` then counts the audio tracks and their durations.
+The check needs ffmpeg and ffprobe. Without them, the result is `not_checked` and says "Sound not checked", with the install line for your system. On macOS, `afinfo` then counts the audio tracks and their durations in a MOV or MP4. afinfo cannot read MKV, FLV or TS: the result is then `not_checked`, not `failed`.
 
-The file must be inside the recording folder: the folder that OBS records to, or `OBS_MCP_RECORDING_DIR`. The check refuses a path with `..`, a path or a link that leads out of the folder, and anything that is not a regular file. ffmpeg runs with an argument list, never a shell, reads only local files, and stops at a time limit.
+The file must be inside the recording folder: the folder that OBS records to, or `OBS_MCP_RECORDING_DIR`. The check refuses a path with `..`, a path or a link that leads out of the folder, and anything that is not a regular file. It refuses a path outside the folder by its text, before it reads anything at that path: so a UNC path (`\\host\share`) or an automount never reaches the network, and the refusal is the same whether the file exists or not. ffmpeg runs with an argument list, never a shell, reads only local files, and stops at one time limit for the whole check.
+
+Two limits remain, and both need write access to the recording folder. A hard link in the folder to a file outside it is a regular file in the folder, so the check reads it. A file that another program swaps after the path check is read as it is when ffmpeg opens it.
 
 What `obs_read` runs in 0.0, from the class table in [`catalogue/classes.json`](catalogue/classes.json):
 
@@ -167,7 +174,7 @@ All are optional.
 | `OBS_MCP_VOICE_GAP_S` | The gap limit of a `voice` source, in seconds (default 30) |
 | `OBS_MCP_CONTINUOUS_GAP_S` | The gap limit of a `continuous` source, in seconds (default 2) |
 | `OBS_MCP_SILENCE_DB` | The level below which a track is silent, in dB (default -50) |
-| `OBS_MCP_VERIFY_TIMEOUT_S` | The time limit of one check, in seconds (default 900) |
+| `OBS_MCP_VERIFY_TIMEOUT_S` | The time limit of one check, ffprobe and every ffmpeg pass together, in seconds (default 900) |
 
 ## Under the hood
 

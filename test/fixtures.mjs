@@ -1,5 +1,6 @@
 // SIMULATED media for the file check: made by ffmpeg in a temporary folder, never by OBS, and never committed.
-// Each file has a small video stream (64x64, 2 fps) and AAC audio tracks in a MOV container, as OBS records by default.
+// Each file has a small video stream (64x64, 2 fps) and AAC audio tracks in a MOV container, as OBS records by default,
+// or in an MKV container, which states no length per track.
 import { execFileSync } from 'node:child_process';
 import { copyFileSync, mkdtempSync, statSync, truncateSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -13,6 +14,7 @@ export const FFMPEG_VERSION = SKIP ? undefined : execFileSync(tools.ffmpeg, ['-h
 
 const sine = (f, d, amp = 0.3) => ['-f', 'lavfi', '-i', `aevalsrc=${amp}*sin(${f}*2*PI*t):s=48000:d=${d}`];
 const silence = (d) => ['-f', 'lavfi', '-i', `anullsrc=r=48000:cl=mono:d=${d}`];
+const stereo = (left, right, d) => ['-f', 'lavfi', '-i', `aevalsrc=${left}|${right}:s=48000:c=stereo:d=${d}`];
 const video = (d) => ['-f', 'lavfi', '-i', `testsrc=size=64x64:rate=2:d=${d}`];
 
 function make(dir, name, inputs, extra = []) {
@@ -39,6 +41,12 @@ export function makeFixtures() {
     quiet: make(dir, 'SIMULATED-quiet-track.mov', [video(10), sine(440, 10, 0.005)]),
     // The same healthy file with the index first, so a cut copy keeps its index and loses audio data.
     faststart: make(dir, 'SIMULATED-faststart.mov', [video(10), sine(440, 10), sine(660, 10)], ['-movflags', '+faststart']),
+    // Track 1 has a 6 s gap from 8 s to 14 s: below the 10 s voice warning, above the detector minimum of 0.5 s.
+    shortGap: make(dir, 'SIMULATED-gap-8-14.mov', [video(20), ['-f', 'lavfi', '-i', 'aevalsrc=0.3*sin(440*2*PI*t)*not(between(t\\,8\\,14)):s=48000:d=20']]),
+    // Stereo: the left channel has a tone, the right channel is silent the whole time.
+    leftOnly: make(dir, 'SIMULATED-stereo-left-only.mov', [video(10), stereo('0.3*sin(440*2*PI*t)', '0', 10)]),
+    // 20 s MKV with 2 stereo tracks, both channels with sound.
+    stereoMkv: make(dir, 'SIMULATED-stereo-2-tracks.mkv', [video(20), stereo('0.3*sin(440*2*PI*t)', '0.3*sin(550*2*PI*t)', 20), stereo('0.3*sin(660*2*PI*t)', '0.3*sin(770*2*PI*t)', 20)]),
   };
   const cut = (from, name, fraction) => {
     const to = join(dir, name);
@@ -48,6 +56,8 @@ export function makeFixtures() {
   };
   f.truncatedNoIndex = cut(f.healthy, 'SIMULATED-truncated-no-index.mov', 0.6);
   f.truncatedIndexKept = cut(f.faststart, 'SIMULATED-truncated-index-kept.mov', 0.5);
+  // MKV keeps the 20 s length in its header, so a cut copy still says 20 s, and its audio ends near 10 s.
+  f.cutMkv = cut(f.stereoMkv, 'SIMULATED-cut-stereo.mkv', 0.5);
   // A name that a shell or an option parser would misread.
   f.odd = join(dir, "-i odd 'name' ;$(touch PWNED).mov");
   copyFileSync(f.healthy, f.odd);

@@ -102,7 +102,7 @@ function createServer() {
     'obs_verify_file',
     {
       description:
-        'Check a saved recording in the OBS recording folder: each audio track has sound, every silent gap with its timecode, video, and a cut-short file. Optional expect names the source on each track (track 1 is the first audio track). Reads only: never changes or deletes the file.',
+        'Check a saved recording in the OBS recording folder: each audio track has sound, every silent gap with its timecode, video, and a cut-short file. Optional expect names the source on each track. A track number counts the audio tracks in the file: track 1 is the first audio track in the file, not OBS track 1, because OBS writes only the tracks that are on. Reads only: never changes or deletes the file.',
       inputSchema: z.object({
         path: z.string().max(4096).describe('File name in the recording folder, or a full path inside it'),
         expect: z
@@ -110,7 +110,7 @@ function createServer() {
             z.object({
               name: z.string().min(1).max(100),
               kind: z.enum(['voice', 'continuous', 'any']).describe('voice allows pauses; continuous allows almost no gap; any needs some sound'),
-              track: z.number().int().min(1).max(64),
+              track: z.number().int().min(1).max(64).describe('The Nth audio track in the file; OBS writes only the tracks that are on'),
               backup: z.number().int().min(1).max(64).optional().describe('Another track that holds the same source'),
             }),
           )

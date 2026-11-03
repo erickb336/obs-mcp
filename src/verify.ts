@@ -3,9 +3,12 @@
 // ffprobe gives the streams and their durations. One ffmpeg pass on each audio track gives its level (astats) and
 // every silent interval (silencedetect). Without ffmpeg, afinfo (macOS) gives the tracks, and the sound is not checked.
 // The file path, the expected sources and every line that ffmpeg prints are untrusted input.
+// Limits that the check cannot close: a hard link inside the folder to a file outside it is a regular file inside the
+// folder, so the check reads it; and a file that another program swaps between the path check and the ffmpeg run is
+// read as it is at that time. Both need write access to the recording folder.
 import { spawn } from 'node:child_process';
 import { realpathSync, statSync } from 'node:fs';
-import { basename, isAbsolute, join, relative, sep } from 'node:path';
+import { basename, extname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { audioTools } from './platform.js';
 
 export type Kind = 'voice' | 'continuous' | 'any';
@@ -25,6 +28,13 @@ const LOW_PEAK_DB = -40; // a peak below this is a low level
 const CLIP_PEAK_DB = -0.1; // a peak at or above this may clip
 const MAX_GAPS = 20; // gaps listed in one claim or track
 const MAX_OUTPUT = 32 * 1024 * 1024; // bytes read from one tool run
+// A track whose audio data ends this much or more before its stated length, or before the end of the file when it
+// states no length (MKV), is cut short. OBS writes every track for the full recording; a healthy track ends within
+// one audio frame (about 0.02 s) of the file.
+const CUT_S = 1;
+// The container types that OBS records, and the ffmpeg demuxer for each. ffmpeg never guesses the type, so that a
+// playlist (hls) or a concat list in the folder cannot make it read a file outside the folder.
+const FORMATS: Record<string, string> = { '.mov': 'mov', '.mp4': 'mov', '.m4v': 'mov', '.mkv': 'matroska', '.flv': 'flv', '.ts': 'mpegts' };
 
 /** The gap limits per kind. No real take sets them yet, so they are settings with conservative defaults. */
 export function limitsFrom(env: NodeJS.ProcessEnv = process.env) {
@@ -46,27 +56,41 @@ export function limitsFrom(env: NodeJS.ProcessEnv = process.env) {
 }
 export type Limits = ReturnType<typeof limitsFrom>;
 
-/** The file inside the recording folder. Refuses "..", a path or a link that leads out of the folder, and anything that is not a regular file. */
+/** True when path is inside base, by the text of both paths only. */
+const inside = (base: string, path: string) => {
+  const r = relative(base, path);
+  return !!r && r !== '..' && !r.startsWith(`..${sep}`) && !isAbsolute(r);
+};
+
+/**
+ * The file inside the recording folder. Refuses "..", a path or a link that leads out of the folder, and anything that
+ * is not a regular file. A path outside the folder is refused by its text, before any file system call: so the server
+ * never touches it (a UNC path or an automount can reach the network), and one refusal text does not show whether it exists.
+ */
 export function resolveInFolder(folder: string, input: string): { path: string; name: string } {
   const shown = JSON.stringify(input.slice(0, 200));
+  const outside = new VerifyError(`${shown} is outside the recording folder, or a link leads out of it. The check reads only files inside the recording folder.`);
   if (!input || input.includes('\0')) throw new VerifyError('Give the name of a file in the recording folder.');
   if (input.split(/[\\/]/).includes('..')) throw new VerifyError(`The path ${shown} has "..". Give a file inside the recording folder.`);
+  // A UNC, device or namespace path: \\host\share, //host/share, \\?\ and \\.\
+  if (/^[\\/]{2}/.test(input)) throw outside;
   let root: string;
   try {
     root = realpathSync(folder);
   } catch {
     throw new VerifyError('The recording folder cannot be read.');
   }
+  const asked = resolve(root, input); // an absolute input stays as it is
+  if (!inside(resolve(folder), asked) && !inside(root, asked)) throw outside;
   let real: string;
   try {
-    real = realpathSync(isAbsolute(input) ? input : join(root, input));
+    real = realpathSync(asked);
   } catch {
     throw new VerifyError(`No file ${shown} in the recording folder.`);
   }
-  const name = relative(root, real);
-  if (!name || name === '..' || name.startsWith(`..${sep}`) || isAbsolute(name)) throw new VerifyError(`${shown} is outside the recording folder, or a link leads out of it. The check reads only files inside the recording folder.`);
+  if (!inside(root, real)) throw outside;
   if (!statSync(real).isFile()) throw new VerifyError(`${shown} is not a regular file.`);
-  return { path: real, name };
+  return { path: real, name: relative(root, real) };
 }
 
 /** Refuses expected sources that cannot be checked as given. */
@@ -135,8 +159,8 @@ export function parseProbe(json: string): Probe {
   };
 }
 
-/** What the ffmpeg pass of one track says: level, decoded samples and silent intervals. */
-export type TrackLog = { peakDb?: number; rmsDb?: number; samples?: number; silences: { start: number; end?: number }[] };
+/** What the ffmpeg pass of one track says: level, the peak of each channel, decoded samples and silent intervals. */
+export type TrackLog = { peakDb?: number; rmsDb?: number; samples?: number; channelPeaksDb?: number[]; silences: { start: number; end?: number }[] };
 
 const db = (s: string) => (s.trim() === '-inf' ? -Infinity : num(s.trim()));
 
@@ -148,6 +172,7 @@ const db = (s: string) => (s.trim() === '-inf' ? -Infinity : num(s.trim()));
 export function parseLog(text: string, file = ''): { track: TrackLog; errors: string[] } {
   const t: TrackLog = { silences: [] };
   const errors: string[] = [];
+  let channel = 0; // astats prints "Channel: n" before the lines of channel n, and "Overall" before the lines of the track
   for (const line of text.split(/\r?\n/)) {
     const m = /^\[(?:Parsed_)?(astats|silencedetect)[^\] ]* @ [^\]]*\] (.*)$/.exec(line);
     if (!m) {
@@ -167,6 +192,10 @@ export function parseLog(text: string, file = ''): { track: TrackLog; errors: st
         const open = t.silences.at(-1);
         if (open && open.end === undefined) open.end = Number(end[1]);
       }
+    } else if (m[2] === 'Overall') channel = 0;
+    else if (kv?.[1] === 'Channel') channel = num(kv[2]) ?? 0;
+    else if (kv && channel) {
+      if (kv[1] === 'Peak level dB') (t.channelPeaksDb ??= [])[channel - 1] = db(kv[2]) ?? NaN;
     } else if (kv) {
       if (kv[1] === 'Peak level dB') t.peakDb = db(kv[2]);
       if (kv[1] === 'RMS level dB') t.rmsDb = db(kv[2]);
@@ -176,8 +205,8 @@ export function parseLog(text: string, file = ''): { track: TrackLog; errors: st
   return { track: t, errors };
 }
 
-/** One audio track, measured: its end on the timeline, its levels and its silent intervals over the full timeline. */
-type Measure = { track: number; endS: number; declaredS?: number; peakDb?: number; rmsDb?: number; silences: Interval[]; soundS: number };
+/** One audio track, measured: where its audio data ends and should end, its levels and its silent intervals over the full timeline. */
+type Measure = { track: number; endS: number; expectedEndS: number; declaredS?: number; peakDb?: number; rmsDb?: number; channelPeaksDb?: number[]; silences: Interval[]; soundS: number };
 
 const total = (iv: Interval[]) => iv.reduce((a, g) => a + (g.end - g.start), 0);
 
@@ -213,12 +242,15 @@ export function measure(probe: Probe, logs: TrackLog[]): Measure[] {
     const start = a.startS && a.startS > 0 ? a.startS : 0;
     const decoded = t.samples !== undefined && a.sampleRate ? t.samples / a.sampleRate : (a.durationS ?? duration);
     const endS = Math.min(duration, start + decoded);
-    const silences: Interval[] = t.silences.map((s) => ({ start: s.start, end: s.end ?? endS, why: 'silent' as const }));
+    const silent: Interval[] = t.silences.map((s) => ({ start: Math.max(start, s.start), end: Math.min(endS, s.end ?? endS), why: 'silent' as const })).filter((s) => s.end > s.start);
+    // Sound is audio data that is not silent. A time with no audio data is never sound, however short.
+    const soundS = Math.max(0, endS - start - total(merge(silent)));
     // Before the track starts and after it ends, the file holds no audio data for it: that is silence too.
+    const silences = [...silent];
     if (start >= MIN_SOUND_S) silences.push({ start: 0, end: start, why: 'no audio data' });
     if (duration - endS >= MIN_SOUND_S) silences.push({ start: endS, end: duration, why: 'no audio data' });
-    const merged = merge(silences);
-    return { track: i + 1, endS, declaredS: a.durationS, peakDb: t.peakDb, rmsDb: t.rmsDb, silences: merged, soundS: Math.max(0, duration - total(merged)) };
+    const expectedEndS = a.durationS !== undefined ? start + a.durationS : duration;
+    return { track: i + 1, endS, expectedEndS, declaredS: a.durationS, peakDb: t.peakDb, rmsDb: t.rmsDb, channelPeaksDb: t.channelPeaksDb, silences: merge(silences), soundS };
   });
 }
 
@@ -245,7 +277,14 @@ export function judge(probe: Probe, measures: Measure[], expect: Expected[], lim
   const duration = probe.durationS ?? 0;
   const everything: Interval[] = [{ start: 0, end: duration, why: 'no audio data' }];
   const claims: Claim[] = [];
-  const levelNote = (m: Measure) => (m.peakDb !== undefined && m.peakDb < LOW_PEAK_DB ? `Low level: peak ${dbText(m.peakDb)} is below ${LOW_PEAK_DB} dB` : m.peakDb !== undefined && m.peakDb >= CLIP_PEAK_DB ? `Peak ${dbText(m.peakDb)}: it may clip` : undefined);
+  const levelNote = (m: Measure) => {
+    const peaks = m.channelPeaksDb ?? [];
+    const loud = peaks.map((p, i) => (p >= limits.silenceDb ? i + 1 : 0)).filter(Boolean);
+    const dead = loud.length ? peaks.map((p, i) => (p < limits.silenceDb ? `Channel ${i + 1} is silent (peak ${dbText(p)})` : '')).filter(Boolean) : [];
+    const level = m.peakDb !== undefined && m.peakDb < LOW_PEAK_DB ? `Low level: peak ${dbText(m.peakDb)} is below ${LOW_PEAK_DB} dB` : m.peakDb !== undefined && m.peakDb >= CLIP_PEAK_DB ? `Peak ${dbText(m.peakDb)}: it may clip` : '';
+    const notes = [...(dead.length ? [`${dead.join(', ')}, and ${loud.length === 1 ? `channel ${loud[0]} has` : `channels ${loud.join(', ')} have`} sound`] : []), level].filter(Boolean);
+    return notes.length ? notes.join('; ') : undefined;
+  };
   const summary = (m: Measure) => `Track ${m.track}: peak ${dbText(m.peakDb)}, RMS ${dbText(m.rmsDb)}, sound ${m.soundS.toFixed(1)} s of ${duration.toFixed(1)} s`;
 
   for (const e of expect) {
@@ -280,10 +319,11 @@ export function judge(probe: Probe, measures: Measure[], expect: Expected[], lim
   const named = new Set(expect.flatMap((e) => [e.track, e.backup ?? 0]));
   for (const m of measures.filter((x) => !named.has(x.track))) {
     const silent = m.soundS < MIN_SOUND_S;
-    const level = silent ? undefined : levelNote(m);
+    const missing = m.silences.filter((g) => g.why === 'no audio data');
+    const notes = silent ? ['Silent'] : [missing.length ? `No audio data for ${total(missing).toFixed(1)} s` : '', levelNote(m) ?? ''].filter(Boolean);
     // With expected sources, a track that none names only informs. Without them, each track counts.
-    const verdict: Verdict = expect.length ? 'info' : silent || level ? 'warn' : 'pass';
-    claims.push({ claim: `Track ${m.track} has sound`, verdict, evidence: `${silent ? 'Silent. ' : level ? `${level}. ` : ''}${summary(m)}.${expect.length ? ' No expected source names this track.' : ''}` });
+    const verdict: Verdict = expect.length ? 'info' : notes.length ? 'warn' : 'pass';
+    claims.push({ claim: `Track ${m.track} has sound`, verdict, evidence: `${notes.map((x) => `${x}. `).join('')}${summary(m)}.${expect.length ? ' No expected source names this track.' : ''}`, ...(silent ? {} : listed(missing)) });
   }
   if (!expect.length && measures.length) {
     const any = measures.some((m) => m.soundS >= MIN_SOUND_S);
@@ -295,6 +335,8 @@ export function judge(probe: Probe, measures: Measure[], expect: Expected[], lim
 /** The result for the model: the state first, then one verdict per claim with the timecode of each gap, then the measurements. */
 export async function verifyFile(path: string, name: string, expect: Expected[] = [], env: NodeJS.ProcessEnv = process.env) {
   checkExpect(expect);
+  const format = FORMATS[extname(path).toLowerCase()];
+  if (!format) throw new VerifyError(`The check reads only the file types that OBS records: ${Object.keys(FORMATS).join(', ')}. ${JSON.stringify(name)} is not one of them.`);
   const limits = limitsFrom(env);
   const tools = audioTools(env);
   const size = statSync(path).size;
@@ -307,6 +349,9 @@ export async function verifyFile(path: string, name: string, expect: Expected[] 
   };
   const note = 'The check only reads the file. It never changes, moves or deletes it, whatever the result.';
   const timeoutMs = limits.timeoutS * 1000;
+  // One deadline for the whole check, from before the first tool runs: ffprobe, the version line and every ffmpeg pass.
+  const deadline = Date.now() + timeoutMs;
+  const left = () => Math.max(1, deadline - Date.now());
   const done = (claims: Claim[], extra: Record<string, unknown> = {}) => ({ state: stateOf(claims), ...head, claims, ...extra, limits: settings, note });
 
   if (!tools.ffmpeg || !tools.ffprobe) {
@@ -317,8 +362,8 @@ export async function verifyFile(path: string, name: string, expect: Expected[] 
   }
 
   const input = `file:${path}`; // an absolute path with the file protocol: never read as an option or as another protocol
-  const p = await run(tools.ffprobe, ['-v', 'error', '-protocol_whitelist', 'file', '-show_entries', 'format=duration:stream=codec_type,sample_rate,duration,start_time', '-of', 'json', '-i', input], timeoutMs);
-  const version = p.stopped ? 'ffprobe' : (await run(tools.ffmpeg, ['-hide_banner', '-version'], 10000)).out.split('\n')[0].replace(/ Copyright.*$/, '');
+  const p = await run(tools.ffprobe, ['-v', 'error', '-protocol_whitelist', 'file', '-show_entries', 'format=duration:stream=codec_type,sample_rate,duration,start_time', '-of', 'json', '-f', format, '-i', input], left(), limits.timeoutS);
+  const version = p.stopped ? 'ffprobe' : (await run(tools.ffmpeg, ['-hide_banner', '-version'], Math.min(10000, left()), limits.timeoutS)).out.split('\n')[0].replace(/ Copyright.*$/, '');
   const clean = (s: string) => s.replace(/ @ 0x[0-9a-f]+/gi, '').split(path).join(name).trim().split('\n').slice(0, 3).join(' ').slice(0, 300);
   let probe: Probe | undefined;
   try {
@@ -340,15 +385,15 @@ export async function verifyFile(path: string, name: string, expect: Expected[] 
   let soundChecked = true;
   const fileFacts = [`Duration ${timecode(duration)}`, `${n} audio track${n === 1 ? '' : 's'}`, probe.video ? 'a video stream' : 'no video stream'];
   const fileProblems: string[] = [];
+  // The shortest silence that the detector reports: every gap that a rule can use, and no shorter.
+  const d = Math.min(...Object.values(limits.gap).map((g) => g.warn), MIN_SOUND_S);
   if (n) {
     // One pass per track, one after another, all within one time limit: see parseLog for why a pass holds one track.
-    const d = Math.min(...Object.values(limits.gap).map((g) => g.warn), MIN_SOUND_S);
-    const deadline = Date.now() + timeoutMs;
     const logs: TrackLog[] = [];
     const errors: string[] = [];
     for (let i = 0; i < n && soundChecked; i++) {
-      const filter = `astats=metadata=0:measure_perchannel=none,silencedetect=noise=${limits.silenceDb}dB:d=${d}`;
-      const f = await run(tools.ffmpeg, ['-hide_banner', '-nostdin', '-nostats', '-protocol_whitelist', 'file', '-i', input, '-map', `0:a:${i}`, '-af', filter, '-f', 'null', '-'], Math.max(1, deadline - Date.now()), limits.timeoutS);
+      const filter = `astats=metadata=0:measure_perchannel=Peak_level,silencedetect=noise=${limits.silenceDb}dB:d=${d}`;
+      const f = await run(tools.ffmpeg, ['-hide_banner', '-nostdin', '-nostats', '-protocol_whitelist', 'file', '-f', format, '-i', input, '-map', `0:a:${i}`, '-af', filter, '-f', 'null', '-'], left(), limits.timeoutS);
       const log = parseLog(f.err, path);
       logs.push(log.track);
       for (const e of log.errors) if (errors.length < 5 && !errors.includes(e)) errors.push(e);
@@ -359,8 +404,9 @@ export async function verifyFile(path: string, name: string, expect: Expected[] 
     }
     measures = measure(probe, logs);
     if (soundChecked) {
-      const short = measures.filter((m) => m.declaredS !== undefined && m.declaredS - (m.endS - (probe!.audio[m.track - 1].startS ?? 0)) >= 1);
-      for (const m of short) fileProblems.push(`Track ${m.track} says ${m.declaredS!.toFixed(1)} s, but its audio data ends at ${timecode(m.endS)}`);
+      for (const m of measures.filter((x) => x.expectedEndS - x.endS >= CUT_S)) {
+        fileProblems.push(m.declaredS !== undefined ? `Track ${m.track} says ${m.declaredS.toFixed(1)} s, but its audio data ends at ${timecode(m.endS)}` : `Track ${m.track} states no length, and its audio data ends at ${timecode(m.endS)}, but the file runs to ${timecode(duration)}`);
+      }
       if (errors.length) fileProblems.push(`ffmpeg reported: ${errors.join(' | ')}`);
     }
   }
@@ -387,8 +433,8 @@ export async function verifyFile(path: string, name: string, expect: Expected[] 
   }
   const tracks = soundChecked
     ? measures.map((m) => {
-        const kind = expect.find((e) => e.track === m.track)?.kind ?? 'any';
-        const shown = m.silences.filter((g) => g.end - g.start >= limits.gap[kind].warn);
+        // Every silent interval that the detector reports, from d up; the verdicts use the gap limits.
+        const shown = m.silences.filter((g) => g.end - g.start >= d);
         return {
           track: m.track,
           role: roles.get(m.track) ?? 'not named',
@@ -410,8 +456,9 @@ async function afinfoClaims(afinfo: string, path: string, expect: Expected[], no
   const count = Number(/Num Tracks:\s+(\d+)/.exec(r.out)?.[1] ?? (/estimated duration/.test(r.out) ? 1 : 0));
   const durations = [...r.out.matchAll(/estimated duration: ([\d.]+) sec/g)].map((m) => Number(m[1]));
   if (r.code !== 0 || r.stopped || !durations.length) {
+    // afinfo cannot tell a type it does not read from a damaged file, so this says nothing about the file.
     return [
-      { claim: 'The file is readable and complete', verdict: 'fail', evidence: `afinfo cannot read audio in it${r.stopped ? `: ${r.stopped}` : ''}. The file may be cut short, not finished, or hold no audio.` },
+      { claim: 'The file is readable and complete', verdict: 'not_checked', evidence: `afinfo cannot read this format or this file${r.stopped ? ` (${r.stopped})` : ''}: it reads MOV and MP4, not MKV, FLV or TS. Nothing in the file was checked. ${notChecked}.` },
       { claim: 'The file has sound', verdict: 'not_checked', evidence: notChecked },
     ];
   }
@@ -420,7 +467,7 @@ async function afinfoClaims(afinfo: string, path: string, expect: Expected[], no
   ];
   for (const e of expect) {
     const has = e.track <= count;
-    claims.push({ claim: `Source ${JSON.stringify(e.name)} (${e.kind}) has sound on track ${e.track}`, verdict: has || (e.backup && e.backup <= count) ? 'not_checked' : 'fail', evidence: has ? `Track ${e.track} is present. ${notChecked}.` : `Track ${e.track} is missing: the file has ${count} audio tracks.` });
+    claims.push({ claim: `Source ${JSON.stringify(e.name)} (${e.kind}) has sound on track ${e.track}`, verdict: has || (e.backup && e.backup <= count) ? 'not_checked' : 'fail', evidence: has ? `Track ${e.track} is present. ${notChecked}.` : `Track ${e.track} is missing: the file has ${count} audio track${count === 1 ? '' : 's'}.` });
   }
   if (!expect.length) claims.push({ claim: 'The file has sound', verdict: 'not_checked', evidence: notChecked });
   return claims;
