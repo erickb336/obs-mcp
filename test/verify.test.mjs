@@ -2,6 +2,7 @@
 // settings. Part 2 runs ffmpeg on SIMULATED files that test/fixtures.mjs makes; it skips, with the reason, when ffmpeg
 // is not on PATH. No file here comes from OBS: the real-file test is test/real-files.test.mjs, and it is opt-in.
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -156,6 +157,10 @@ describe('SIMULATED files made by ffmpeg', { skip: SKIP }, () => {
   console.log(`SIMULATED fixtures made and checked with ${FFMPEG_VERSION}`);
   const { f } = makeFixtures();
   const check = (key, expect) => verifyFile(f[key], key, expect);
+  if (process.env.CI) {
+    const r = spawnSync(audioTools().ffmpeg, ['-hide_banner', '-nostdin', '-nostats', '-i', f.gap, '-filter_complex', '[0:a:0]astats@t1=metadata=0:measure_perchannel=none,silencedetect@t1=noise=-50dB:d=0.5[o1]', '-map', '[o1]', '-f', 'null', '-'], { encoding: 'utf8' });
+    console.log(`DEBUG-CI stderr:\n${r.stderr.split('\n').filter((l) => !/^\s/.test(l)).join('\n').slice(0, 4000)}`);
+  }
 
   test('SIMULATED healthy file with 2 tracks: verified, with each track and the video measured', async () => {
     const r = await check('healthy', [{ name: 'Mic', kind: 'voice', track: 1 }, { name: 'Music', kind: 'continuous', track: 2 }]);
