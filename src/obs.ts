@@ -122,18 +122,47 @@ export type Version = {
   platformDescription: string;
 };
 
-/** One lazy connection to OBS, shared by every tool call. */
+/** An OBS event, or the close of a connection, with the number of the connection that carried it. */
+export type ObsEvent = { type: 'RecordStateChanged' | 'RecordFileChanged' | 'ExitStarted' | 'closed'; data: Record<string, unknown>; conn: number };
+const EVENTS = ['RecordStateChanged', 'RecordFileChanged', 'ExitStarted'] as const;
+
+/** Reconnect waits (P8): 0.5, 1, 2, 4 and 8 s, then each 10 s. */
+export const RECONNECT_MS = [500, 1000, 2000, 4000, 8000, 10000];
+
+/**
+ * One lazy connection to OBS, shared by every tool call. Each connection that opens gets the next number (F11), so
+ * a reading can say which connection it came from, and a recording request can go out only on the connection of the
+ * reading that allowed it.
+ */
 export class Obs {
   private ws?: OBSWebSocket;
   // The connection that is open or opening. Parallel first calls share it; a failure clears it, so a later call tries again.
   private opening?: Promise<Version>;
+  private listeners = new Set<(e: ObsEvent) => void>();
+  private retry?: { timer?: NodeJS.Timeout; step: number };
   version?: Version;
+  /** The number of the last connection that opened: 0 before the first. */
+  connection = 0;
 
-  /** connectMs limits the connection and its GetVersion; callMs limits each request. */
+  /** connectMs limits the connection and its GetVersion; callMs limits each request; reconnectMs are the reconnect waits. */
   constructor(
     private target: () => ReturnType<typeof connectionTarget>,
-    private limits = { connectMs: 3000, callMs: 10000 },
+    private limits: { connectMs: number; callMs: number; reconnectMs?: number[] } = { connectMs: 3000, callMs: 10000 },
   ) {}
+
+  get connected() {
+    return !!this.ws;
+  }
+
+  /** Gets each record event, ExitStarted, and the close of each connection. Returns the call that stops it. */
+  onEvent(fn: (e: ObsEvent) => void) {
+    this.listeners.add(fn);
+    return () => this.listeners.delete(fn);
+  }
+
+  private emit(e: ObsEvent) {
+    for (const fn of this.listeners) fn(e);
+  }
 
   connect(): Promise<Version> {
     this.opening ??= this.open().catch((e) => {
@@ -141,6 +170,29 @@ export class Obs {
       throw e;
     });
     return this.opening;
+  }
+
+  /**
+   * on: after a close, connect again with the waits of P8, until a connection opens or this is turned off. A reconnect
+   * sends only the handshake and GetVersion: never a recording request.
+   */
+  keepConnected(on: boolean) {
+    clearTimeout(this.retry?.timer);
+    this.retry = on ? { step: 0 } : undefined;
+    if (on && !this.ws) this.scheduleRetry(0);
+  }
+
+  private scheduleRetry(wait: number) {
+    const r = this.retry;
+    if (!r) return;
+    r.timer = setTimeout(() => {
+      if (this.retry !== r || this.ws) return;
+      this.connect().catch(() => {
+        const waits = this.limits.reconnectMs ?? RECONNECT_MS;
+        this.scheduleRetry(waits[Math.min(r.step++, waits.length - 1)]);
+      });
+    }, wait);
+    r.timer.unref?.();
   }
 
   private async open(): Promise<Version> {
@@ -152,7 +204,7 @@ export class Obs {
     try {
       // The limit covers GetVersion too: a program that accepts the connection and never answers does not hang the server.
       const opened = async () => {
-        await ws.connect(t.url, t.password, { rpcVersion: 1, eventSubscriptions: EventSubscription.None });
+        await ws.connect(t.url, t.password, { rpcVersion: 1, eventSubscriptions: EventSubscription.Outputs | EventSubscription.General });
         return (await ws.call('GetVersion')) as unknown as Version;
       };
       this.version = await Promise.race([
@@ -165,21 +217,43 @@ export class Obs {
     } finally {
       clearTimeout(timer);
     }
-    ws.on('ConnectionClosed', () => {
-      if (this.ws === ws) {
-        this.ws = undefined;
-        this.version = undefined;
-        this.opening = undefined;
+    const conn = ++this.connection;
+    for (const type of EVENTS) ws.on(type, (...a: unknown[]) => this.emit({ type, data: (a[0] ?? {}) as Record<string, unknown>, conn }));
+    ws.on('ConnectionClosed', (e: { code?: number }) => {
+      if (this.ws !== ws) return;
+      this.ws = undefined;
+      this.version = undefined;
+      this.opening = undefined;
+      this.emit({ type: 'closed', data: { code: e.code }, conn });
+      if (this.retry) {
+        this.retry.step = 1;
+        this.scheduleRetry((this.limits.reconnectMs ?? RECONNECT_MS)[0]);
       }
     });
     this.ws = ws;
+    if (this.retry) this.retry.step = 0;
     return this.version;
   }
 
-  /** Sends one request. obs-websocket-js has no timeout, and a close does not reject a call, so both are raced here. */
+  /** Sends one request, on a new connection when none is open. */
   async call(request: string, params?: Record<string, unknown>): Promise<Record<string, unknown>> {
+    return (await this.read(request, params)).data;
+  }
+
+  /** Sends one request, and gives its reply with the number of the connection that carried it. */
+  async read(request: string, params?: Record<string, unknown>): Promise<{ data: Record<string, unknown>; conn: number }> {
     await this.connect();
-    const ws = this.ws!;
+    const conn = this.connection;
+    return { data: await this.callOn(conn, request, params), conn };
+  }
+
+  /**
+   * Sends one request only on connection conn. It never opens a connection: when conn closed, it throws and sends
+   * nothing. obs-websocket-js has no timeout, and a close does not reject a call, so both are raced here.
+   */
+  async callOn(conn: number, request: string, params?: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const ws = this.ws;
+    if (!ws || conn !== this.connection) throw new ObsError(`The connection to OBS changed before ${request}, so it was not sent.`);
     const ms = this.limits.callMs;
     let timer: NodeJS.Timeout | undefined;
     let onClose: ((e: { code?: number }) => void) | undefined;
@@ -201,6 +275,7 @@ export class Obs {
   }
 
   async close() {
+    this.keepConnected(false);
     const ws = this.ws;
     this.ws = undefined;
     this.version = undefined;
