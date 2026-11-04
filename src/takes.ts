@@ -98,9 +98,11 @@ export class Takes {
 
   /** GetRecordStatus and, while active, the path field of the file output (check 3), both on one connection. */
   async read(): Promise<Reading> {
+    const asked = Date.now();
     const { data, conn } = await this.obs.read('GetRecordStatus');
     const r: Reading = {
       at: Date.now(),
+      asked,
       conn,
       ev: this.ev.get(conn) ?? 0,
       active: data.outputActive === true,
@@ -341,9 +343,11 @@ export class Takes {
   /** T22 and the spawn rows: open an external take, watched at once (F13), with the expected sources of the last preflight (E27). */
   private async openExternal(given?: Reading) {
     if (!this.lock.held) return;
-    // A read from before the last record event can show a recording that has ended since: read again.
-    const r = given?.active && given.at >= (this.lastEventAt ?? 0) ? given : await this.tryRead();
-    if (!r?.active || this.ended || this.waiting.size) return; // a waiting take may be this recording: its restart row decides
+    // A read asked before the last record event can show a recording that has ended since: read again. A record event
+    // during that read decides instead (a STARTED opens its own take), so a stop in the read opens no take with no path.
+    const fresh = (x?: Reading) => !!x && (x.asked ?? x.at) >= (this.lastEventAt ?? 0);
+    const r = given?.active && fresh(given) ? given : await this.tryRead();
+    if (!r?.active || !fresh(r) || this.ended || this.waiting.size) return; // a waiting take may be this recording: its restart row decides
     if ([...this.open.values()].some((o) => isOpen(o.take) && o.take.state !== 'checking' && o.take.state !== 'stopping' && o.take.state !== 'stop_uncertain')) return;
     // A new id for each take: a recording on the path of a closed take gets its own take (F-T7-62).
     const id = randomBytes(8).toString('hex');

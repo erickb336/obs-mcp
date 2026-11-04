@@ -9,7 +9,8 @@ export type Mark = 'offline' | 'stopped_in_obs' | 'unplanned_stop' | 'lost' | 'e
 export type Kind = 'normal' | 'test' | 'external';
 
 /** One GetRecordStatus read, with the file path (check 3), the connection number and the count of STARTED, STOPPING and STOPPED events seen on it. */
-export type Reading = { at: number; conn: number; ev: number; active: boolean; paused: boolean; duration: number; bytes: number; path?: string };
+/** A read of OBS. at: the time of the reply; asked: the time of the request, when a read of this process gave it. */
+export type Reading = { at: number; asked?: number; conn: number; ev: number; active: boolean; paused: boolean; duration: number; bytes: number; path?: string };
 
 export type Take = {
   id: string;

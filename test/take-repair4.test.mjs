@@ -105,8 +105,9 @@ test('F-T7-62: a new recording on the path of a closed take gets its own take, a
   assert.ok(await until(async () => /^Take closed/.test(last(await status(s)))));
   await wait(FAST.raceMs);
   w.fake.startInObs();
-  assert.ok(await until(() => takes(w).filter((t) => t.state === 'external').length === 1), 'the second recording has a take');
-  assert.deepEqual(takes(w).map((t) => basename(t.paths[0])), ['interview.mov', 'interview.mov'], JSON.stringify(takes(w)));
+  // A read in the moment before OBS has the new output active gives no path; the next watch read adds it.
+  assert.ok(await until(() => takes(w).filter((t) => t.state === 'external' && t.paths.length).length === 1), JSON.stringify(takes(w)));
+  assert.deepEqual(takes(w).map((t) => t.paths[0] && basename(t.paths[0])), ['interview.mov', 'interview.mov'], JSON.stringify(takes(w)));
   assert.match(last(await status(s)), /^OBS is recording \(.*file `interview\.mov`\)/);
   assert.deepEqual(recordRequests(w.fake), []);
   await done(w, s);
