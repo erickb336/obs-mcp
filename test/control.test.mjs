@@ -1,15 +1,12 @@
 // G32: exactly one obs-mcp process for each OBS endpoint controls recording. The lock is a TCP port of 127.0.0.1
-// (control.ts). These tests run real processes: lock children, and real server processes (dist/cli.js over stdio) on
-// one fake OBS and one journal folder. SIMULATED: no real OBS.
+// (control.ts). The races of many processes are in race/lock-race.test.mjs. These tests run locks in this process,
+// and real server processes (dist/cli.js over stdio) on a fake OBS. SIMULATED: no real OBS.
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
 import { readdirSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
 import { networkInterfaces } from 'node:os';
 import { join } from 'node:path';
-import { createInterface } from 'node:readline';
 import { test } from 'node:test';
-import { fileURLToPath } from 'node:url';
 import { Control, lockPorts } from '../dist/control.js';
 import { Journal } from '../dist/journal.js';
 import { TEXT } from '../dist/take.js';
@@ -56,32 +53,6 @@ const listenOn = (port, onConnection) =>
 /** A temporary folder holds no lock file: no socket, and no file with the lock name of round 4. */
 const lockFiles = (dir) => readdirSync(dir).filter((f) => /\.sock$|^obs-mcp-[0-9a-f]{16}/.test(f));
 
-const CHILD = fileURLToPath(new URL('./lock-child.mjs', import.meta.url));
-/** n lock children of one endpoint take the lock at the same moment. Returns their answers. */
-async function race(n, ep) {
-  const kids = Array.from({ length: n }, () => spawn(process.execPath, [CHILD, ep], { stdio: ['pipe', 'pipe', 'inherit'] }));
-  const kill = tracked(() => kids.forEach((k) => k.kill()));
-  const lines = kids.map((k) => createInterface({ input: k.stdout })[Symbol.asyncIterator]());
-  for (const l of lines) assert.equal((await l.next()).value, 'ready');
-  for (const k of kids) k.stdin.write('go\n');
-  const answers = await Promise.all(lines.map(async (l) => (await l.next()).value));
-  await Promise.all(kids.map((k) => new Promise((r) => (k.once('exit', r), k.stdin.end()))));
-  await kill();
-  return answers;
-}
-
-for (const n of [2, 3, 8]) {
-  test(`F-T7-63, F-T7-68, F-T7-71, F-T7-72: ${n} processes take the lock of one OBS at the same moment, 40 rounds: exactly one controls each time`, async () => {
-    const ep = endpoint();
-    const bad = [];
-    for (let round = 1; round <= 40; round++) {
-      const answers = await race(n, ep);
-      if (answers.filter((a) => a === 'controls').length !== 1 || answers.filter((a) => a === 'reads').length !== n - 1) bad.push(`round ${round}: ${answers.join(',')}`);
-    }
-    assert.deepEqual(bad, []);
-  });
-}
-
 test('F-T7-74: a program on the first lock port is passed, silent or with another line; a copy that comes when it goes still reads', async () => {
   const ep = endpoint();
   const { id, ports } = lockPorts(ep);
@@ -107,22 +78,45 @@ test('F-T7-74: a program on the first lock port is passed, silent or with anothe
   await closeOther();
 });
 
-test('F-T7-70: a listen error other than EADDRINUSE makes a reader whose X16 says that it cannot confirm control', async () => {
+/** Makes each listen on a port of ports fail with code, as the OS does. */
+const failListen = (code, ports) => {
   const listen = net.Server.prototype.listen;
-  net.Server.prototype.listen = function () {
-    process.nextTick(() => this.emit('error', Object.assign(new Error('listen EACCES'), { code: 'EACCES' })));
-    return this;
+  net.Server.prototype.listen = function (port, ...rest) {
+    if (!ports || ports.includes(port)) {
+      process.nextTick(() => this.emit('error', Object.assign(new Error(`listen ${code}`), { code })));
+      return this;
+    }
+    return listen.call(this, port, ...rest);
   };
+  return () => (net.Server.prototype.listen = listen);
+};
+
+test('F-T7-70: a listen error other than EADDRINUSE or EACCES makes a reader whose X16 says that it cannot confirm control', async () => {
+  const undo = failListen('EADDRNOTAVAIL');
   try {
     const c = new Control(endpoint);
     assert.equal(await c.acquire(), false);
-    assert.equal(c.error, 'EACCES');
+    assert.equal(c.error, 'EADDRNOTAVAIL');
     assert.equal(
       TEXT.X16('start', c.error),
-      'I did not send the start. I cannot confirm that this obs-mcp copy alone controls recording in this OBS (the controller lock gave EACCES), so this copy only reads. To start the recording, click Start Recording in the Controls dock of OBS.',
+      'I did not send the start. I cannot confirm that this obs-mcp copy alone controls recording in this OBS (the controller lock gave EADDRNOTAVAIL), so this copy only reads. To start the recording, click Start Recording in the Controls dock of OBS.',
     );
   } finally {
-    net.Server.prototype.listen = listen;
+    undo();
+  }
+});
+
+test('G32: a lock port that the OS keeps from programs (EACCES, as in a reserved range of Windows) is passed', async () => {
+  const ep = endpoint();
+  const { id, ports } = lockPorts(ep);
+  const undo = failListen('EACCES', [ports[0]]);
+  const c = new Control(() => ep);
+  try {
+    assert.equal(await c.acquire(), true, c.error);
+    assert.match(await lineOn(ports[1]), new RegExp(`^obs-mcp-control ${id} `));
+  } finally {
+    c.close();
+    undo();
   }
 });
 
@@ -145,7 +139,7 @@ test('G32: the lock listens on 127.0.0.1 only: another address of this computer 
   if (!lan) return t.skip('this computer has no other IPv4 address');
   const ep = endpoint();
   const c = new Control(() => ep);
-  assert.equal(await c.acquire(), true);
+  assert.equal(await c.acquire(), true, c.error);
   try {
     assert.notEqual((await lineOn(lockPorts(ep).ports[0], lan)).slice(0, 15), 'obs-mcp-control');
   } finally {
@@ -215,7 +209,7 @@ test('F-T7-63, F-T7-68, G32: two real server processes on one OBS: one controlle
       if (round < 3) continue;
       // The controller crashes (SIGKILL). The OS frees its port; the reader's next tool call takes over.
       await crash(ctl);
-      assert.equal(await lineOn(lockPorts(`ws://127.0.0.1:${w.fake.port}`).ports[0]), 'free');
+      assert.doesNotMatch(await lineOn(lockPorts(`ws://127.0.0.1:${w.fake.port}`).ports[0]), /^obs-mcp-control/, 'the OS freed the port');
       const after = (await reader.call('obs_take_status')).text;
       assert.match(after, /^OBS still records the take that I started \(00:00:0\d, file `[^`]+`\)\. I watch it again from \d\d:\d\d:\d\d\./, after);
       assert.match(last(after), /^Recording for /);

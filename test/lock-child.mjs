@@ -5,7 +5,7 @@ import { Control } from '../dist/control.js';
 const control = new Control(() => process.argv[2]);
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', async (d) => {
-  if (d.includes('go')) process.stdout.write(`${(await control.acquire()) ? 'controls' : 'reads'}\n`);
+  if (d.includes('go')) process.stdout.write(`${(await control.acquire()) ? 'controls' : `reads${control.error ? ` ${control.error}` : ''}`}\n`);
 });
 process.stdin.on('end', () => process.exit(0));
 process.stdout.write('ready\n');

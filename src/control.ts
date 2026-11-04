@@ -95,7 +95,8 @@ export class Control {
 
   /**
    * The first free port of the sequence is the lock. A port that answers with the banner of this endpoint is another
-   * controller: this copy reads. A port that another program holds is passed (F-T7-74). After the listen, a banner
+   * controller: this copy reads. A port that another program holds is passed (F-T7-74), and so is a port that the OS
+   * keeps from programs (EACCES: Windows reserves ranges of these ports, the same for every process). After the listen, a banner
    * on any other port of the sequence means that a controller took a later port while an earlier one was held: this
    * copy lets its port go and reads, so that two copies never both control.
    */
@@ -105,6 +106,7 @@ export class Control {
     for (const [i, port] of ports.entries()) {
       const got = await listen(port, `${WORD} ${id} ${process.pid}\n`);
       if (got instanceof Error) {
+        if (got.code === 'EACCES') continue;
         if (got.code !== 'EADDRINUSE') {
           this.error = got.code ?? 'unknown';
           return false;
@@ -121,7 +123,7 @@ export class Control {
       this.at = endpoint;
       return true;
     }
-    this.error = 'EADDRINUSE';
+    this.error = 'no free port';
     return false;
   }
 
