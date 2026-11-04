@@ -1,6 +1,6 @@
 // The capture script, against the fake OBS only. SIMULATED: no real OBS.
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -16,15 +16,15 @@ const PASSWORD = 'capture-test-password-W3q8';
 const STOP_PROMPT = 'type stop and press Enter';
 /**
  * Runs the capture. answer is what the operator types at each stop prompt: a string, an async function that gives it, or
- * null for an open input with no answer. With no answer, the input is empty, as when no one is at the terminal. early is a
- * line that the operator types at once, before any prompt.
+ * null for an open input with no answer. With no answer, the input is empty, as when no one is at the terminal. early is
+ * text that the operator types at once, before any prompt: a line ends with a newline.
  */
 function run(args, env = {}, answer, early) {
   return new Promise((resolve) => {
     const base = { ...process.env, ...env };
     if (!('OBS_WEBSOCKET_PASSWORD' in env)) delete base.OBS_WEBSOCKET_PASSWORD;
     const p = spawn(process.execPath, [SCRIPT, ...args], { env: base, stdio: [answer === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'] });
-    if (early !== undefined) p.stdin.write(`${early}\n`);
+    if (early !== undefined) p.stdin.write(early);
     let stderr = '';
     let prompts = 0;
     p.stderr.on('data', (d) => {
@@ -289,7 +289,7 @@ for (const [name, answer, early] of [
     let prompt = 0;
     return async () => (++prompt === 1 ? (await new Promise((r) => setTimeout(r, 700)), 'stop') : null);
   })()],
-  ['the operator types stop before the first prompt, and gives no answer at the prompts', null, 'stop'],
+  ['the operator types stop before the first prompt, and gives no answer at the prompts', null, 'stop\n'],
 ]) {
   test(`F-T25-2: when ${name}, the capture sends no StopRecord`, async (t) => {
     const { fake } = await userAndFake(t);
@@ -313,8 +313,81 @@ test('F-T25-2: a stop typed after the second prompt shows still stops the take, 
   let prompt = 0;
   // A stop typed before the first prompt is dropped, the first prompt times out and gets a late "no", and the second gets stop.
   const answer = async () => (++prompt === 1 ? (await new Promise((r) => setTimeout(r, 700)), 'no') : 'stop');
-  const r = await run(['--url', `ws://127.0.0.1:${fake.port}`, '--out', f.out, '--plan', f.plan, '--settle-ms', '1500', '--confirm-ms', '5000', '--allow-record'], {}, answer, 'stop');
+  const r = await run(['--url', `ws://127.0.0.1:${fake.port}`, '--out', f.out, '--plan', f.plan, '--settle-ms', '1500', '--confirm-ms', '5000', '--allow-record'], {}, answer, 'stop\n');
   assert.equal(r.code, 0, r.stderr);
+  assert.equal(fake.state.recording, false);
+  assert.deepEqual(fake.stops, [{ requestType: 'StopRecord', cause: 'request' }]);
+});
+
+// F-T25-6: the part of a line typed before the prompt is dropped. "st" with no newline, then "op" after the prompt, is
+// the line "op", not "stop".
+test('F-T25-6: a part of a line typed before the prompt does not join the answer typed after it', async (t) => {
+  const { fake } = await userAndFake(t);
+  const f = files();
+  writeFileSync(f.plan, JSON.stringify([{ requestType: 'StartRecord' }, { requestType: 'StopRecord' }]));
+  const r = await run(['--url', `ws://127.0.0.1:${fake.port}`, '--out', f.out, '--plan', f.plan, '--settle-ms', '0', '--confirm-ms', '5000', '--allow-record'], {}, 'op', 'st');
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(fake.state.recording, true);
+  assert.deepEqual(fake.stops, []);
+  assert.deepEqual(JSON.parse(readFileSync(f.out, 'utf8')).refused.map((x) => `${x.requestType}: ${x.refused}`), [`StopRecord: ${NO_ANSWER}`]);
+});
+
+// F-T25-5: the hidden password prompt pauses the input when it ends. The stop prompt must still get the operator's line.
+test('F-T25-5: when the input is paused before the capture reads it, a stop typed at the prompt still stops the take', async (t) => {
+  const { fake } = await userAndFake(t);
+  const f = files();
+  writeFileSync(f.plan, JSON.stringify([{ requestType: 'StartRecord' }, { requestType: 'StopRecord' }]));
+  // The preload pauses the input, as the end of the password prompt does.
+  const r = await run(['--url', `ws://127.0.0.1:${fake.port}`, '--out', f.out, '--plan', f.plan, '--settle-ms', '0', '--confirm-ms', '5000', '--allow-record'], { NODE_OPTIONS: '--import=data:text/javascript,process.stdin.pause()' }, 'stop');
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(fake.state.recording, false);
+  assert.deepEqual(fake.stops, [{ requestType: 'StopRecord', cause: 'request' }]);
+});
+
+// F-T25-5 on a terminal: a pseudo-terminal from the Python standard library (pty) runs the capture. The operator types
+// the password at the hidden prompt, then stop at the stop prompt. Python's pty module works only on Unix.
+const PTY_OPERATOR = `
+import os, pty, select, sys, time
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv(sys.argv[1], sys.argv[1:])
+out, typed, deadline = b'', set(), time.time() + 30
+while time.time() < deadline:
+    if select.select([fd], [], [], 0.1)[0]:
+        try:
+            data = os.read(fd, 4096)
+        except OSError:
+            break
+        if not data:
+            break
+        out += data
+    for cue, line in ((b'password:', os.environ['CAPTURE_PASSWORD'].encode()), (b'type stop and press Enter', b'stop')):
+        if cue in out and cue not in typed:
+            os.write(fd, line + b'\\r')
+            typed.add(cue)
+else:
+    os.kill(pid, 9)
+sys.stdout.write(out.decode(errors='replace'))
+sys.exit(os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]))
+`;
+const noPty = process.platform === 'win32' ? 'Python\'s pty module works only on Unix' : spawnSync('python3', ['-c', 'import pty']).status !== 0 ? 'python3 with its pty module is not on this machine' : false;
+test('F-T25-5: on a terminal, after the hidden password prompt, a stop typed at the stop prompt stops the take once', { skip: noPty }, async (t) => {
+  const fake = await startFakeObs({ password: PASSWORD });
+  t.after(() => fake.close());
+  const f = files();
+  writeFileSync(f.plan, JSON.stringify([{ requestType: 'StartRecord' }, { requestType: 'StopRecord' }]));
+  const env = { ...process.env, CAPTURE_PASSWORD: PASSWORD };
+  delete env.OBS_WEBSOCKET_PASSWORD;
+  const args = [SCRIPT, '--url', `ws://127.0.0.1:${fake.port}`, '--out', f.out, '--plan', f.plan, '--settle-ms', '0', '--confirm-ms', '5000', '--allow-record'];
+  const r = await new Promise((resolve) => {
+    const p = spawn('python3', ['-c', PTY_OPERATOR, process.execPath, ...args], { env, stdio: ['ignore', 'pipe', 'inherit'] });
+    let output = '';
+    p.stdout.on('data', (d) => (output += d));
+    p.on('close', (code) => resolve({ code, output }));
+  });
+  assert.equal(r.code, 0, r.output);
+  assert.ok(r.output.includes('obs-websocket password: '), r.output);
+  assert.equal(r.output.includes(PASSWORD), false);
   assert.equal(fake.state.recording, false);
   assert.deepEqual(fake.stops, [{ requestType: 'StopRecord', cause: 'request' }]);
 });

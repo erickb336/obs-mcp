@@ -88,7 +88,8 @@ function prompt() {
 /**
  * The operator's input. With --allow-record, it is read from the connection to the end, so that a line typed while no prompt shows
  * (a late answer to an earlier prompt, or a line typed before the first prompt) is dropped and never answers a prompt
- * (F-T25-2). The input does not keep the process alive.
+ * (F-T25-2). The input does not keep the process alive. The password prompt pauses the input when it ends, and a data
+ * listener does not resume a paused stream, so the input is resumed here (F-T25-5).
  */
 const input = { answer: undefined, partial: '', ended: false };
 function readInput() {
@@ -102,6 +103,7 @@ function readInput() {
     input.ended = true;
     input.answer?.();
   });
+  process.stdin.resume();
   process.stdin.unref?.();
 }
 
