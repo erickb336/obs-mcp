@@ -348,5 +348,5 @@ test('E26: the server restarts while a prompt is open: the late answer to the ne
 test('E27, F-T7-22: an external take with no obs_preflight names no expected sources and points to obs_preflight of a later version', () => {
   const r = { at: Date.now(), duration: 1000, path: 'rec/a.mov' };
   assert.match(TEXT.X15(r, []), /I check the file when it ends\. No expected sources\. To name them, run obs_preflight \(in a later version\)\.$/);
-  assert.match(TEXT.X15(r, ['Mic', 'Guest audio']), /I watch Mic and Guest audio, and I check the file when it ends\.$/);
+  assert.match(TEXT.X15(r, ['Mic', 'Guest audio']), /I watch `Mic` and `Guest audio`, and I check the file when it ends\.$/);
 });

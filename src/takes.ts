@@ -6,12 +6,14 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { FencedError, Journal, type Source } from './journal.js';
 import { Obs, ObsError, type ObsEvent } from './obs.js';
-import { clock, fileName, hms, isOpen, journalReading, newTake, sameRecording, stateLine, step, TEXT, type Input, type Limits, type Reading, type Step, type Take } from './take.js';
+import { clock, fileName, hms, isOpen, journalReading, newTake, sameRecording, stateLine, step, TEST_MARK, TEXT, type Input, type Limits, type Reading, type Step, type Take } from './take.js';
 
 /** The file check of a take: its result and one line for the reply. */
 export type Check = (path: string, sources: Source[]) => Promise<{ result: 'verified' | 'verified_with_warnings' | 'failed' | 'not_checked'; summary: string }>;
 type Open = { take: Take; client: string; sources: Source[]; tokenHash?: string; timers: NodeJS.Timeout[]; reading?: Reading };
 
+/** The states in which a test take gets reminder W8 (O4). */
+const reminds = (t: Take) => t.state === 'recording' || t.state === 'paused';
 const sha = (s: string) => createHash('sha256').update(s).digest('hex');
 const STATES: Record<string, 'STARTED' | 'STOPPING' | 'STOPPED' | 'PAUSED' | 'RESUMED'> = {
   OBS_WEBSOCKET_OUTPUT_STARTED: 'STARTED',
@@ -56,14 +58,18 @@ export class Takes {
     this.notify(level, text);
   }
 
-  /** The reply of a tool: the waiting notices first, then the lines. An open test take adds reminder W8 once (F-T7-21). */
+  /**
+   * The reply of a tool: the waiting notices first, then the lines. A test take that records adds reminder W8 once
+   * (O4, F-T7-21); W8 says what the test mark says, so the state line leaves the mark out (F-T7-33).
+   */
   reply(...lines: string[]): string {
     const waiting = this.notices.splice(0);
     const out = [...waiting.map((n) => n.text), ...lines];
-    if (!waiting.some((n) => n.key === 'W8')) {
-      for (const o of this.open.values()) if (o.take.kind === 'test' && isOpen(o.take) && o.reading) out.push(TEXT.W8(this.newest(o.reading)));
+    let w8 = waiting.some((n) => n.key === 'W8');
+    for (const o of this.open.values()) {
+      if (!w8 && o.take.kind === 'test' && reminds(o.take) && o.reading) (out.push(TEXT.W8(this.newest(o.reading))), (w8 = true));
     }
-    return out.join('\n');
+    return (w8 ? out.map((l) => l.replace(TEST_MARK, '')) : out).join('\n');
   }
 
   /** The newer of a take's reading and the last read of this process, while OBS records (F-T7-19). */
@@ -170,6 +176,8 @@ export class Takes {
       o.timers.push(t);
     };
     const s = o.take.state;
+    // A waiting W8 says that the test recording runs: it goes when the take stops (F-T7-33).
+    if (!reminds(o.take)) this.notices = this.notices.filter((n) => n.key !== 'W8');
     // The owner beats in every open state, so that no live take looks dead to another process (F-T7-4).
     if (isOpen(o.take)) this.beating(o);
     if (s === 'start_uncertain' || s === 'stop_held') {
@@ -369,7 +377,6 @@ export class Takes {
       const same = r.active && a ? sameRecording(a, r, o.take.paths) : false;
       const before = o.take.state;
       const s = this.apply(o, { type: 'restart', reading: r, same, at: Date.now() });
-      if (s.row === 'R1') this.notice(TEXT.X15(r, o.sources.map((x) => x.name)));
       if (s.row === 'R3') this.notice(`OBS still records the take that I started (${hms(r.duration)}, file ${fileName(o.take.paths.at(-1))}). The watch had a gap from ${clock(lastBeat)} to ${clock(Date.now())}.`);
       if (s.row === 'R3' && o.take.kind === 'test') this.notice(TEXT.W8(r), 'warning', 'W8');
       if (o.take.state === before) this.entered(o); // R3, R7 and R8 keep the state: the watch or the check starts again
@@ -478,8 +485,8 @@ export class Takes {
         // A fenced or full journal does not change what OBS did.
       }
     };
-    // An OBS code goes to the state machine. No reply in callMs on a live connection is a timeout (T3, T16), not a
-    // drop, so that no text says "I lost the connection" then.
+    // An OBS code goes to the state machine. No reply on a live connection is not a step: the take waits for its own
+    // limit (P3, P5), so that X8 and X9 name the time that passed (F-T7-28), and no text says "I lost the connection".
     this.obs.callOn(conn, request).then(
       () => record(100),
       (e) => {
@@ -487,7 +494,7 @@ export class Takes {
         if (code !== undefined && code >= 200 && code < 1000) {
           record(code);
           this.apply(o, { type: 'reply', request, code, at: Date.now() });
-        } else if (o.take.state === state) this.apply(o, code === undefined && this.obs.connected ? { type: 'timeout', phase, at: Date.now() } : { type: 'disconnect', at: Date.now() });
+        } else if (o.take.state === state && !this.obs.connected) this.apply(o, { type: 'disconnect', at: Date.now() });
       },
     );
     const seen = await this.until(() => o.take.state !== state, ms, () => o.take);

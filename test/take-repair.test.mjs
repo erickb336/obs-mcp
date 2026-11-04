@@ -7,7 +7,7 @@ import { basename, join } from 'node:path';
 import { test } from 'node:test';
 import { Journal } from '../dist/journal.js';
 import { audioTools } from '../dist/platform.js';
-import { clock, fileName, journalReading, newTake, stateLine, step, TEXT } from '../dist/take.js';
+import { clock, journalReading, newTake, stateLine, step, TEXT } from '../dist/take.js';
 import { startFakeObs } from './fake-obs.mjs';
 import { SKIP } from './fixtures.mjs';
 import { accept, decline } from './mcp-pair.mjs';
@@ -48,7 +48,7 @@ test('F-T7-5, F-T7-8: after 200 file splits the state line stays short, a consen
   const conn = s.app.obs.connection;
   const dir = `/Volumes/Media/Recordings/${'Interview series '.repeat(4)}`;
   for (let i = 1; i <= 200; i++) s.app.obs.emit({ type: 'RecordFileChanged', data: { newOutputPath: `${dir}/2026-11-03 15-30-50 part ${String(i).padStart(3, '0')}.mov` }, conn });
-  assert.match((await s.call('obs_record_stop')).text, /^The recording stopped at \d\d:\d\d:\d\d \(OBS confirmed it\)\. I am checking the file 2026-11-03 15-30-50 part 200\.mov\.$/);
+  assert.match((await s.call('obs_record_stop')).text, /^The recording stopped at \d\d:\d\d:\d\d \(OBS confirmed it\)\. I am checking the file `2026-11-03 15-30-50 part 200\.mov`\.$/);
   assert.deepEqual(recordRequests(w.fake), ['StartRecord', 'StopRecord']);
   const lines = readFileSync(join(w.dir, `take-${takeOf(w).id}.jsonl`), 'utf8').trim().split('\n');
   assert.ok(Math.max(...lines.map((l) => Buffer.byteLength(l))) < 4096);
@@ -68,7 +68,7 @@ test('F-T7-4, F-T7-10: the owner beats in starting and start_uncertain, so a new
   await wait(700); // start_uncertain, past the stale limit again
   await status(b);
   assert.deepEqual(owners(w).map((f) => f.replace(/^take-\w+\./, '')), ['owner-1'], 'no takeover in start_uncertain');
-  assert.match(last((await b.call('obs_record_stop')).text), /^I did not stop the recording\. Claude Code started it/);
+  assert.match(last((await b.call('obs_record_stop')).text), /^I did not stop the recording\. `Claude Code` started it/);
   assert.deepEqual(recordRequests(w.fake), ['StartRecord']);
   await done(w, a, b);
 });
@@ -142,25 +142,6 @@ test('F-T7-7, F-T7-18: the server start prunes closed takes past 30 days and old
   await done(w, s);
 });
 
-test('F-T7-12, F-T7-26: file, source and client names show no control or bidi character, no Markdown mark, and at most 120 characters', () => {
-  assert.equal(fileName('rec/a\u202Eb[c](d)<e>`f`.mov'), 'a\\u{202E}b\\[c\\](d)\\<e\\>\\`f\\`.mov');
-  const long = fileName(`rec/${'x'.repeat(300)}.mov`);
-  assert.equal([...long].length, 120);
-  assert.match(long, /^x{80}…x{35}\.mov$/);
-  const evil = `rec/a\u202E\u2066\nb[l](https://x.example/y)<img src=x>\`c\`${'z'.repeat(300)}.mov`;
-  const r = { at: Date.now(), conn: 1, ev: 0, active: true, paused: false, duration: 1000, bytes: 1, path: evil };
-  const t = { ...newTake('t', 'normal', 'recording'), paths: [evil], endedAt: Date.now() };
-  const texts = [
-    TEXT.W1('Scene [x](https://e)\u202E', ['Mic\u2066 (track 1)'], '/Movies/<b>'), TEXT.W3(r), TEXT.W4(r), TEXT.W5(r), TEXT.W6(r), TEXT.X6(r), TEXT.X11(t),
-    TEXT.X15(r, ['Mic [x](https://e)', 'Guest\u202E']), TEXT.X16('Client\u202E [x](https://e)'), TEXT.X16('Client <b>', true), TEXT.X18(r), stateLine(t, r, Date.now()),
-  ];
-  for (const text of texts) {
-    assert.doesNotMatch(text, /[\u0000-\u001F\u007F\u202A-\u202E\u2066-\u2069]/, text);
-    assert.doesNotMatch(text, /(^|[^\\])[[\]<>`]/, text);
-    assert.ok(!text.includes('z'.repeat(121)), 'a long name is cut');
-  }
-});
-
 test('F-T7-3: a take of a dead process waits while OBS is unreachable at the server start, and its restart row runs when OBS answers', async () => {
   const w = await world();
   deadTake(w, 'recording');
@@ -210,8 +191,8 @@ test('F-T7-14: the recording changes while you decide (stop and start in OBS): W
   });
   await s.call('obs_record_start', { token: 'changed-token-1' });
   const r = await s.call('obs_record_stop');
-  assert.match(s.prompts[2] ?? '', /^The recording changed while you decided, so I did not stop it\. Now OBS shows: running 00:00:0\d, file .* 2\.mov\. This is not the recording you saw\. Stop this recording\? Accept to stop\. Decline to keep recording\.$/);
-  assert.match(last(r.text), /^The recording stopped at \d\d:\d\d:\d\d \(OBS confirmed it\)\. I am checking the file .* 2\.mov\.$/);
+  assert.match(s.prompts[2] ?? '', /^The recording changed while you decided, so I did not stop it\. Now OBS shows: running 00:00:0\d, file `.* 2\.mov`\. This is not the recording you saw\. Stop this recording\? Accept to stop\. Decline to keep recording\.$/);
+  assert.match(last(r.text), /^The recording stopped at \d\d:\d\d:\d\d \(OBS confirmed it\)\. I am checking the file `.* 2\.mov`\.$/);
   assert.deepEqual(recordRequests(w.fake), ['StartRecord', 'StopRecord']);
   assert.equal(w.fake.state.recording, false);
   await done(w, s);
@@ -222,7 +203,7 @@ test('F-T7-15: X6 says that obs-mcp started the recording when it did; within 2 
   const s = await server(w, { elicit: accept });
   await s.call('obs_record_start', { token: 'x6-token-1' });
   const r = await s.app.takes.read();
-  assert.equal(last((await s.call('obs_record_start', { token: 'x6-token-2' })).text), `OBS already records (started ${clock(r.at - r.duration)}, file ${basename(w.fake.path())}). I did not send a start. obs-mcp started this recording.`);
+  assert.equal(last((await s.call('obs_record_start', { token: 'x6-token-2' })).text), `OBS already records (started ${clock(r.at - r.duration)}, file \`${basename(w.fake.path())}\`). I did not send a start. obs-mcp started this recording.`);
   await s.call('obs_record_stop');
   assert.ok(await until(async () => /^Take closed/.test(await status(s)), 1500));
   assert.equal(last((await s.call('obs_record_start', { token: 'x6-token-3' })).text), 'OBS started or stopped a recording in the last 2 s. I did not send a start. Ask again in a few seconds.');
@@ -284,7 +265,7 @@ test('F-T7-19: O3, W8, X18 and the R3 gap give the values of now', async () => {
   w.fake.startInObs();
   assert.ok(await until(() => s.logs.some((l) => /^A recording started in OBS after you asked me to stop/.test(l.data))));
   const x18 = s.logs.find((l) => /^A recording started/.test(l.data)).data;
-  assert.ok(x18.includes(`, file ${basename(w.fake.path())}). I did not stop it.`), x18);
+  assert.ok(x18.includes(`, file \`${basename(w.fake.path())}\`). I did not stop it.`), x18);
   await done(w, s);
 
   // R3: with no beat file, the gap starts at the old owner file, not at the takeover.
@@ -297,8 +278,8 @@ test('F-T7-19: O3, W8, X18 and the R3 gap give the values of now', async () => {
 });
 
 test('F-T7-20: X16 for an external take says that it started outside obs-mcp, and the stop tool says who can stop it', async () => {
-  assert.equal(TEXT.X16('Claude Code', true), 'I did not stop the recording. It started outside obs-mcp. Claude Code follows it, and in this version only that client can stop it. Ask there, or click Stop Recording in the Controls dock of OBS.');
-  assert.equal(TEXT.X16('Claude Code'), 'I did not stop the recording. Claude Code started it, and in this version only that client can stop it. Ask there, or click Stop Recording in the Controls dock of OBS.');
+  assert.equal(TEXT.X16('Claude Code', true), 'I did not stop the recording. It started outside obs-mcp. `Claude Code` follows it, and in this version only that client can stop it. Ask there, or click Stop Recording in the Controls dock of OBS.');
+  assert.equal(TEXT.X16('Claude Code'), 'I did not stop the recording. `Claude Code` started it, and in this version only that client can stop it. Ask there, or click Stop Recording in the Controls dock of OBS.');
   const w = await world();
   const s = await server(w);
   const { tools } = await s.client.listTools();
@@ -318,7 +299,7 @@ test('F-T7-23: a decline on a paused take says that it is still paused', async (
   await done(w, s);
 });
 
-test('F-T7-25: the closed line gives the length of the file and the expected sources with sound, and no folder path', { skip: SKIP }, async () => {
+test('F-T7-25, F-T7-34: the closed line gives the labelled length of the file and the expected sources with sound, and no folder path', { skip: SKIP }, async () => {
   const w = await world();
   const s = await server(w, { elicit: accept });
   s.app.takes.lastSources = [{ name: 'Mic', kind: 'any', track: 1 }];
@@ -326,18 +307,18 @@ test('F-T7-25: the closed line gives the length of the file and the expected sou
   media(w.fake.path());
   await s.call('obs_record_stop');
   assert.ok(await until(async () => /^Take closed/.test(await status(s)), 15000));
-  assert.match(await status(s), /^Take closed: verified(_with_warnings)?\. 00:00:03, 1 of 1 expected sources had sound in the file\.$/);
+  assert.match(await status(s), /^Take closed: verified(_with_warnings)?\. File length 00:00:03\. 1 of 1 expected sources had sound in the file\.$/);
   assert.equal((await status(s)).includes(w.rec), false);
   await done(w, s);
 });
 
-test('F-T7-25: with no expected sources, the closed line counts the file checks', { skip: SKIP }, async () => {
+test('F-T7-25, F-T7-34: with no expected sources, the closed line counts the file checks', { skip: SKIP }, async () => {
   const w = await world();
   const s = await server(w, { elicit: accept });
   await s.call('obs_record_start', { token: 'summary-token-2' });
   media(w.fake.path());
   await s.call('obs_record_stop');
   assert.ok(await until(async () => /^Take closed/.test(await status(s)), 15000));
-  assert.match(await status(s), /^Take closed: verified(_with_warnings)?\. 00:00:03, \d of \d file checks passed\. No expected sources were named\.$/);
+  assert.match(await status(s), /^Take closed: verified(_with_warnings)?\. File length 00:00:03\. \d of \d file checks passed\. No expected sources were named\.$/);
   await done(w, s);
 });

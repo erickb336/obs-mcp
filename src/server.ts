@@ -71,11 +71,12 @@ export function createApp(o: { target?: () => ReturnType<typeof connectionTarget
   const journal = new Journal(o.dir ?? stateDir(env), 'unknown client');
   journal.prune(); // G28 at the server start (F-T7-7)
   const folder = () => recordingFolder(obs, env);
-  // The closed line (F-T7-25): the length of the file, and the expected sources with sound, or the count of checks.
+  // The closed line (F-T7-25): the length of the file, with a label so that it does not read as a clock time (F-T7-34),
+  // and the expected sources with sound, or the count of checks.
   const check: Check = async (path, sources) => {
     const file = resolveInFolder(await folder(), path);
     const v = await verifyFile(file.path, file.name, sources.map(({ name, kind, track, backup }) => ({ name, kind, track, backup }) as Expected), env);
-    const length = 'duration' in v && typeof v.duration === 'string' ? `${v.duration.slice(0, 8)}, ` : '';
+    const length = 'duration' in v && typeof v.duration === 'string' ? `File length ${v.duration.slice(0, 8)}. ` : '';
     const heard = v.claims.filter((c) => /^Source /.test(c.claim) && (c.verdict === 'pass' || c.verdict === 'warn')).length;
     const passed = v.claims.filter((c) => c.verdict === 'pass').length;
     const what = sources.length ? `${heard} of ${sources.length} expected sources had sound in the file.` : `${passed} of ${v.claims.length} file checks passed. No expected sources were named.`;
@@ -208,10 +209,9 @@ export function createServer(app: App) {
         if (a.action === 'none') {
           const refused = await takes.refusal(r);
           if (refused) return say(refused);
-          const sources = takes.lastSources.map((s) => `${s.name} (track ${s.track})`);
-          const scene = await obs.call('GetCurrentProgramScene').then((x) => String(x.sceneName ?? x.currentProgramSceneName ?? 'unknown'), () => 'unknown');
-          const dir = await app.folder().catch(() => 'the OBS recording folder');
-          return consents.ask(test ? TEXT.W2() : TEXT.W1(scene, sources, dir), { kind: 'start', token, test: !!test });
+          const scene = await obs.call('GetCurrentProgramScene').then((x) => String(x.sceneName ?? x.currentProgramSceneName ?? '') || undefined, () => undefined);
+          const dir = await app.folder().catch(() => undefined);
+          return consents.ask(test ? TEXT.W2() : TEXT.W1(scene, takes.lastSources, dir), { kind: 'start', token, test: !!test });
         }
         const v = a.action === 'accept' ? consents.use(a.id) : (consents.drop(a.id), undefined);
         if (a.action !== 'accept') return say('You declined. I did not start a recording.');

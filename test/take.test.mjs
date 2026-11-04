@@ -65,8 +65,9 @@ const ROWS = [
   ['E10 late 500 after our stop', take('stopping'), { type: 'reply', request: 'StartRecord', code: 500, at: T0 }, 'stopping', { row: 'E10', kind: 'external', marks: ['external'] }],
   ['P14 race guard', take('idle'), { type: 'start', at: T0, reading: R({ active: false }), lastEventAt: T0 - 1500 }, 'idle', { row: undefined, refuse: 'X6' }],
   ['X6 while OBS records', take('idle'), { type: 'start', at: T0, reading: R() }, 'idle', { row: undefined, refuse: 'X6' }],
-  ['R1', take('start_uncertain'), { type: 'restart', reading: R(), same: false, at: T0 + 60000 }, 'external', { row: 'R1', kind: 'external' }],
-  ['R1 held stop', take('stop_held'), { type: 'restart', reading: R(), same: false, at: T0 + 60000 }, 'external', { row: 'R1', notice: 'X18' }],
+  // F-T7-27: a restart row never attaches a take to a recording that fails the same-recording test, or that no path ties to it.
+  ['R1', take('start_uncertain'), { type: 'restart', reading: R(), same: false, at: T0 + 60000 }, 'closed', { row: 'R1', result: 'not_checked', spawn: true }],
+  ['R1 held stop', take('stop_held'), { type: 'restart', reading: R(), same: false, at: T0 + 60000 }, 'closed', { row: 'R1', result: 'not_checked', spawn: true, notice: 'X18' }],
   ['R2', take('starting'), { type: 'restart', reading: R({ active: false }), same: false, at: T0 + 60000 }, 'closed', { row: 'R2', result: 'not_started' }],
   ['R3', take('recording'), { type: 'restart', reading: R(), same: true, at: T0 + 60000 }, 'recording', { row: 'R3' }],
   ['R3 paused', take('recording'), { type: 'restart', reading: R({ paused: true }), same: true, at: T0 + 60000 }, 'paused', { row: 'R3' }],
@@ -74,7 +75,11 @@ const ROWS = [
   ['R5', take('recording'), { type: 'restart', reading: R({ active: false }), same: false, at: T0 + 60000 }, 'checking', { row: 'R5', marks: ['unplanned_stop'], notice: 'X11' }],
   ['R6 stopping', take('stopping'), { type: 'restart', reading: R(), same: true, at: T0 + 60000 }, 'stop_uncertain', { row: 'R6' }],
   ['R6 stop_uncertain', take('stop_uncertain'), { type: 'restart', reading: R({ active: false }), same: false, at: T0 + 60000 }, 'stop_uncertain', { row: 'R6' }],
-  ['R7', take('external'), { type: 'restart', reading: R({ path: Q }), same: false, at: T0 + 60000 }, 'external', { row: 'R7', paths: [P, Q] }],
+  ['R6 another recording', take('stopping'), { type: 'restart', reading: R({ path: Q }), same: false, at: T0 + 60000 }, 'closed', { row: 'T19', result: 'not_checked', spawn: true }],
+  ['R7', take('external'), { type: 'restart', reading: R({ path: Q }), same: true, at: T0 + 60000 }, 'external', { row: 'R7', paths: [P, Q] }],
+  ['R7 another recording', take('external'), { type: 'restart', reading: R({ path: Q }), same: false, at: T0 + 60000 }, 'closed', { row: 'R4', result: 'not_checked', spawn: true }],
+  // F-T7-29: OBS records nothing at the restart, so the external take ends (T23) and does not say that OBS records.
+  ['R7 OBS idle', take('external'), { type: 'restart', reading: R({ active: false }), same: false, at: T0 + 60000 }, 'checking', { row: 'T23', marks: ['external'] }],
   ['R8', take('checking'), { type: 'restart', reading: R({ active: false }), same: false, at: T0 + 60000 }, 'checking', { row: 'R8' }],
 ];
 
@@ -141,11 +146,11 @@ test('the state line of each state, and the marks that change it', () => {
   const at = T0 + 10000;
   const r = R({ duration: 724000 });
   assert.equal(stateLine(undefined, undefined, at), 'OBS is not recording.');
-  assert.match(stateLine(take('recording'), r, at), /^Recording for 00:12:04 \(OBS confirmed it\)\. File: 2026-11-03 15-30-50\.mov\.$/);
+  assert.match(stateLine(take('recording'), r, at), /^Recording for 00:12:04 \(OBS confirmed it\)\. File: `2026-11-03 15-30-50\.mov`\.$/);
   assert.match(stateLine(take('paused', { pausedAt: at - 63000 }), r, at), /^The recording is paused at 00:12:04, for 1 min 03 s now\. Nothing goes into the file\.$/);
-  assert.match(stateLine(take('external'), r, at), /^OBS is recording \(00:12:04, file 2026-11-03 15-30-50\.mov\), but obs-mcp did not start this recording\. I do not stop it unless you ask\.$/);
+  assert.match(stateLine(take('external'), r, at), /^OBS is recording \(00:12:04, file `2026-11-03 15-30-50\.mov`\), but obs-mcp did not start this recording\. I do not stop it unless you ask\.$/);
   assert.match(stateLine(take('recording', { marks: ['offline'] }), r, at), /^I lost the connection to OBS at \d\d:\d\d:\d\d\. OBS keeps recording on its own\./);
   assert.match(stateLine(take('recording', { kind: 'test' }), r, at), /This is a test recording\. obs-mcp does not stop it by itself\.$/);
   assert.match(stateLine(take('closed', { result: 'not_started', row: 'T7' }), r, at), /^Take closed: not_started\. OBS did not start the recording\. OBS gives no reason, so look in the OBS log\.$/);
-  assert.equal(TEXT.W3(r), 'Stop the OBS recording? It has run 00:12:04. File: 2026-11-03 15-30-50.mov. OBS then finishes the file. This takes about 1 s. Accept to stop. Decline to keep recording.');
+  assert.equal(TEXT.W3(r), 'Stop the OBS recording? It has run 00:12:04. File: `2026-11-03 15-30-50.mov`. OBS then finishes the file. This takes about 1 s. Accept to stop. Decline to keep recording.');
 });

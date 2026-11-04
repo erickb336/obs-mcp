@@ -271,8 +271,20 @@ export class Journal {
     return best?.take;
   }
 
-  /** G28: removes closed takes older than 30 days, and the oldest closed takes past 100, with their files; old claims, and temp files a crash left. */
+  /**
+   * G28: removes closed takes older than 30 days, and the oldest closed takes past 100, with their files; old claims,
+   * and temp files a crash left. Best effort: a file that cannot be removed is logged and kept, and prune never throws,
+   * so it never stops the server (F-T7-32). The log names the file only, not the folder.
+   */
   prune(now = Date.now()) {
+    try {
+      this.pruneFiles(now);
+    } catch (e) {
+      console.error(`obs-mcp: could not clean the take journal: ${(e as { code?: string }).code ?? (e as Error).message}`);
+    }
+  }
+
+  private pruneFiles(now: number) {
     const old = now - RETENTION.days * 864e5;
     const closed = this.list()
       .map((f) => /^take-([\w-]+)\.jsonl$/.exec(f)?.[1])
@@ -294,7 +306,12 @@ export class Journal {
       const id = /^take-([\w-]+)\./.exec(f)?.[1];
       const claim = CLAIM.exec(f);
       const stale = (claim && Number(claim[1]) !== top && mtime(f) < old) || (f.endsWith('.tmp') && mtime(f) < now - 864e5);
-      if ((id && gone.has(id)) || stale) rmSync(join(this.dir, f), { force: true });
+      if (!((id && gone.has(id)) || stale)) continue;
+      try {
+        rmSync(join(this.dir, f), { force: true });
+      } catch (e) {
+        console.error(`obs-mcp: could not remove the old journal file ${f}: ${(e as { code?: string }).code ?? (e as Error).message}`);
+      }
     }
   }
 }
