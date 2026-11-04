@@ -28,7 +28,8 @@ const TEXT = /^[\w .,;:()'+-]*$/;
 // for example a scene, input or profile name (a user can type a real name there) and every settings value.
 const KEEP = new Map([
   ['format', /^obs-mcp-trace\/1$/],
-  ['source', /^(simulated|captured)$/],
+  // captured: the output of the capture script. real: a stored capture from a real OBS.
+  ['source', /^(simulated|captured|real)$/],
   // basis, refused and incomplete: the texts of the trace capture. comment: the text of a failed request.
   ...['basis', 'refused', 'incomplete', 'comment', 'platformDescription'].map((k) => [k, TEXT]),
   ...['requestType', 'eventType', 'availableRequests', 'supportedImageFormats', 'platform', 'outputName', 'outputKind', 'inputKind',

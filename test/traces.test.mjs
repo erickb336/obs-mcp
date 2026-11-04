@@ -135,8 +135,8 @@ test('each stored trace is labelled, documented, and holds no password, stream k
   assert.ok(traces.length >= 3, `${traces.length} trace files in ${fileURLToPath(TRACE_DIR)}`);
   for (const t of traces) {
     assert.equal(t.format, 'obs-mcp-trace/1', t.file);
-    // This release holds SIMULATED traces only. A captured trace says "captured".
-    assert.ok(['simulated', 'captured'].includes(t.source), `${t.file}: source ${t.source}`);
+    // A stored trace is real (captured from a running OBS) or simulated (written by hand), and its file name says which.
+    assert.equal(t.file.split('-')[0], t.source, t.file);
     assert.match(t.basis, /\S/, t.file);
     for (const e of t.entries) {
       assert.ok(DOCUMENTED.has(e.requestType), `${t.file}: ${e.requestType}`);
@@ -146,7 +146,7 @@ test('each stored trace is labelled, documented, and holds no password, stream k
     const { file, ...stored } = t;
     assert.deepEqual(findLeaks(stored), [], file);
   }
-  assert.deepEqual([...new Set(traces.map((t) => t.source))], ['simulated']);
+  assert.deepEqual(traces.map((t) => `${t.file}: ${t.source}`), ['real-reads.json: real', 'real-record.json: real', 'simulated-live-output.json: simulated', 'simulated-record.json: simulated']);
 });
 
 test('the scrub command line scrubs a file, and its check fails on a raw file and passes on a scrubbed one', () => {
@@ -190,7 +190,7 @@ test('the fake OBS replays the T20 output blocks: SetVideoSettings gives 500 dur
   assert.deepEqual(codes, { idle: [100, 100, 100, 100], recording: [500, 100, 500, 500], streaming: [500, 500, 100, 100], 'virtual camera': [500, 100, 100, 100] });
 });
 
-test('the fake OBS replays a record stop: STOPPING, then STOPPED about 1 s later, and counts the stop', async () => {
+test('the fake OBS replays the real record stop: STOPPING, then STOPPED 235 ms later, and counts the stop', async () => {
   const fake = await startFakeObs({ recording: true });
   const c = await client(fake);
   const t = performance.now();
@@ -198,7 +198,7 @@ test('the fake OBS replays a record stop: STOPPING, then STOPPED about 1 s later
   assert.deepEqual(await c.call('StopRecord'), { code: 100, d: { outputPath: '[path]' } });
   assert.equal((await c.call('GetRecordStatus')).d.outputActive, true, 'OBS still records until STOPPED');
   assert.deepEqual(await stopped, { outputActive: false, outputState: 'OBS_WEBSOCKET_OUTPUT_STOPPED', outputPath: '[path]' });
-  assert.ok(performance.now() - t >= 900, `${Math.round(performance.now() - t)} ms`);
+  assert.ok(performance.now() - t >= 235, `${Math.round(performance.now() - t)} ms`);
   assert.equal((await c.call('GetRecordStatus')).d.outputActive, false);
   assert.deepEqual(c.events, ['OBS_WEBSOCKET_OUTPUT_STOPPING', 'OBS_WEBSOCKET_OUTPUT_STOPPED']);
   assert.deepEqual(fake.stops, [{ requestType: 'StopRecord', cause: 'request' }]);
@@ -232,7 +232,8 @@ test('the fake OBS sends events only to a client that subscribed to their catego
   const none = await client(fake, EventSubscription.None);
   const outputs = await client(fake);
   await none.call('StartRecord');
-  await new Promise((r) => setTimeout(r, 200));
+  // The real trace has STARTED 272 ms after StartRecord.
+  await new Promise((r) => setTimeout(r, 400));
   assert.deepEqual(outputs.events, ['OBS_WEBSOCKET_OUTPUT_STARTING', 'OBS_WEBSOCKET_OUTPUT_STARTED']);
   assert.deepEqual(none.events, []);
   await none.obs.disconnect();

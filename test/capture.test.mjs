@@ -109,7 +109,8 @@ test('with --allow-record, the capture records a take with its events and its ef
     ['GetRecordStatus', true, undefined, undefined],
     ['StopRecord', true, ['STOPPING', 'STOPPED'], { recording: false }],
   ]);
-  assert.ok(take[2].events[1].delayMs >= 1000, `STOPPED after ${take[2].events[1].delayMs} ms`);
+  // The stored real trace (real-record.json) has STOPPED 235 ms after StopRecord.
+  assert.ok(take[2].events[1].delayMs >= 235, `STOPPED after ${take[2].events[1].delayMs} ms`);
   assert.deepEqual(fake.stops, [{ requestType: 'StopRecord', cause: 'request' }]);
 });
 

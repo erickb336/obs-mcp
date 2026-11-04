@@ -1,0 +1,344 @@
+{
+  "format": "obs-mcp-trace/1",
+  "source": "real",
+  "basis": "REAL. Captured on 2026-11-03 with the trace capture script and its default read plan from a running OBS 33.0.1, obs-websocket 5.7.6, on macOS, then scrubbed. Kept: the reads that the fake does not answer from its own model of options and output state. Left out: GetMonitorList (the screens of the machine), GetVideoSettings, GetCanvasList and GetSpecialInputs (settings of the owner), the virtual camera status (the fake models the output state), and each failed read (codes 300, 506 and 604: they depend on a missing field or on a state that the trace cannot match, so the fake would give them to every call). In GetStats, availableDiskSpace is set to 100000 to hide the disk of the machine.",
+  "obs": {
+    "obsVersion": "33.0.1",
+    "obsWebSocketVersion": "5.7.6",
+    "rpcVersion": 1,
+    "platform": "macos"
+  },
+  "entries": [
+    {
+      "requestType": "GetSceneCollectionList",
+      "when": {
+        "recording": false,
+        "streaming": false
+      },
+      "status": {
+        "code": 100,
+        "result": true
+      },
+      "responseData": {
+        "currentSceneCollectionName": "[scrubbed]",
+        "sceneCollections": [
+          "[scrubbed]",
+          "[scrubbed]"
+        ]
+      }
+    },
+    {
+      "requestType": "GetProfileList",
+      "when": {
+        "recording": false,
+        "streaming": false
+      },
+      "status": {
+        "code": 100,
+        "result": true
+      },
+      "responseData": {
+        "currentProfileName": "[scrubbed]",
+        "profiles": [
+          "[scrubbed]",
+          "[scrubbed]"
+        ]
+      }
+    },
+    {
+      "requestType": "GetSourceFilterKindList",
+      "when": {
+        "recording": false,
+        "streaming": false
+      },
+      "status": {
+        "code": 100,
+        "result": true
+      },
+      "responseData": {
+        "sourceFilterKinds": [
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]"
+        ]
+      }
+    },
+    {
+      "requestType": "GetStats",
+      "when": {
+        "recording": false,
+        "streaming": false
+      },
+      "status": {
+        "code": 100,
+        "result": true
+      },
+      "responseData": {
+        "activeFps": 30.000000300000007,
+        "availableDiskSpace": 100000,
+        "averageFrameRenderTime": 3.831951,
+        "cpuUsage": 1.818570693340268,
+        "memoryUsage": 95.28125,
+        "outputSkippedFrames": 0,
+        "outputTotalFrames": 0,
+        "renderSkippedFrames": 0,
+        "renderTotalFrames": 8967,
+        "webSocketSessionIncomingMessages": 13,
+        "webSocketSessionOutgoingMessages": 13
+      }
+    },
+    {
+      "requestType": "GetHotkeyList",
+      "when": {
+        "recording": false,
+        "streaming": false
+      },
+      "status": {
+        "code": 100,
+        "result": true
+      },
+      "responseData": {
+        "hotkeys": [
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]"
+        ]
+      }
+    },
+    {
+      "requestType": "GetInputKindList",
+      "when": {
+        "recording": false,
+        "streaming": false
+      },
+      "status": {
+        "code": 100,
+        "result": true
+      },
+      "responseData": {
+        "inputKinds": [
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]"
+        ]
+      }
+    },
+    {
+      "requestType": "GetSceneList",
+      "when": {
+        "recording": false,
+        "streaming": false
+      },
+      "status": {
+        "code": 100,
+        "result": true
+      },
+      "responseData": {
+        "currentPreviewSceneName": null,
+        "currentPreviewSceneUuid": null,
+        "currentProgramSceneName": "[scrubbed]",
+        "currentProgramSceneUuid": "ba8b98d2-c982-443c-b5e8-e637b938c1cc",
+        "scenes": [
+          {
+            "sceneIndex": 0,
+            "sceneName": "[scrubbed]",
+            "sceneUuid": "ba8b98d2-c982-443c-b5e8-e637b938c1cc"
+          }
+        ]
+      }
+    },
+    {
+      "requestType": "GetGroupList",
+      "when": {
+        "recording": false,
+        "streaming": false
+      },
+      "status": {
+        "code": 100,
+        "result": true
+      },
+      "responseData": {
+        "groups": []
+      }
+    },
+    {
+      "requestType": "GetCurrentProgramScene",
+      "when": {
+        "recording": false,
+        "streaming": false
+      },
+      "status": {
+        "code": 100,
+        "result": true
+      },
+      "responseData": {
+        "currentProgramSceneName": "[scrubbed]",
+        "currentProgramSceneUuid": "ba8b98d2-c982-443c-b5e8-e637b938c1cc",
+        "sceneName": "[scrubbed]",
+        "sceneUuid": "ba8b98d2-c982-443c-b5e8-e637b938c1cc"
+      }
+    },
+    {
+      "requestType": "GetTransitionKindList",
+      "when": {
+        "recording": false,
+        "streaming": false
+      },
+      "status": {
+        "code": 100,
+        "result": true
+      },
+      "responseData": {
+        "transitionKinds": [
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]",
+          "[scrubbed]"
+        ]
+      }
+    },
+    {
+      "requestType": "GetSceneTransitionList",
+      "when": {
+        "recording": false,
+        "streaming": false
+      },
+      "status": {
+        "code": 100,
+        "result": true
+      },
+      "responseData": {
+        "currentSceneTransitionKind": "[scrubbed]",
+        "currentSceneTransitionName": "[scrubbed]",
+        "currentSceneTransitionUuid": "41305527-8884-4b0e-9a78-0e1f9b4d4219",
+        "transitions": [
+          {
+            "transitionConfigurable": false,
+            "transitionFixed": false,
+            "transitionKind": "fade_transition",
+            "transitionName": "[scrubbed]",
+            "transitionUuid": "41305527-8884-4b0e-9a78-0e1f9b4d4219"
+          },
+          {
+            "transitionConfigurable": false,
+            "transitionFixed": true,
+            "transitionKind": "cut_transition",
+            "transitionName": "[scrubbed]",
+            "transitionUuid": "03adc841-d762-4ab7-81ad-13a788ecb3b9"
+          }
+        ]
+      }
+    },
+    {
+      "requestType": "GetCurrentSceneTransitionCursor",
+      "when": {
+        "recording": false,
+        "streaming": false
+      },
+      "status": {
+        "code": 100,
+        "result": true
+      },
+      "responseData": {
+        "transitionCursor": 1
+      }
+    },
+    {
+      "requestType": "GetStudioModeEnabled",
+      "when": {
+        "recording": false,
+        "streaming": false
+      },
+      "status": {
+        "code": 100,
+        "result": true
+      },
+      "responseData": {
+        "studioModeEnabled": false
+      }
+    }
+  ]
+}

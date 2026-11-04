@@ -189,13 +189,16 @@ All are optional.
 | `protocol/` | The pinned protocol description and its source |
 | `scripts/` | The catalogue generator, the packed-package smoke test, the trace capture, the trace scrub and the timing loop |
 | `test/` | Tests, the fake OBS, and a script that makes SIMULATED media with ffmpeg for the file check. `test/real-files.test.mjs` checks real recordings of your own: it runs only when `OBS_MCP_REAL_DIR` names their folder |
-| `test/traces/` | The stored traces that the fake OBS replays. Each file says its `source`: all of them are `simulated` now |
+| `test/traces/` | The stored traces that the fake OBS replays. Each file says its `source` (`real` or `simulated`), and its name starts with it |
 
 ### The fake OBS and its traces
 
 All tests run against a fake OBS (`test/fake-obs.mjs`). It replays the stored traces: a request, its data and the output state give the status code, the reply, the events and the change of state of the trace. A request with no trace gets sample values in the shape of the protocol. The fake closes the socket with code 1006 on a list request that is not tested on real OBS, as real OBS does when it crashes. It counts each recording that stops.
 
-The traces in this release are SIMULATED: written by hand from the protocol and from facts measured on real OBS 33.0.1 (for example, `SetVideoSettings` gives code 500 during any output, and `STOPPED` comes about 1 s after `StopRecord`). A capture from real OBS replaces them later.
+The traces are of two kinds:
+
+- **Real** (`real-*.json`): captured from a running OBS 33.0.1 with obs-websocket 5.7.6 on macOS, then scrubbed. `real-reads.json` holds the reads of the default capture plan that the fake does not answer from its own model. `real-record.json` holds `StartRecord` and `StopRecord`, each when idle and while recording, from one test recording. Names and settings are `[scrubbed]`, and each file's `basis` says what was left out.
+- **Simulated** (`simulated-*.json`): written by hand from the protocol and from facts measured on real OBS 33.0.1 (for example, `SetVideoSettings` gives code 500 during any output). These are the requests that the capture does not send to a real OBS: `ToggleRecord`, pause and resume, `StopOutput`, `ToggleOutput`, the stop hotkey, `GetOutputSettings` and the live-output blocks.
 
 | Tool | What it does |
 | --- | --- |
