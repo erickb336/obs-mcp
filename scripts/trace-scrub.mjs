@@ -1,6 +1,6 @@
 // The trace scrub. A trace goes into this public repository only after the scrub. The scrub works from an allow-list:
 // a string stays only when its form or its field says that it cannot hold a secret, a name or a path. Every other
-// string, and every object key that is not a plain identifier, becomes a placeholder. A string that stays must also
+// string, and every object key that does not have the form of an obs-websocket field, becomes a placeholder. A string that stays must also
 // pass a second, separate check: a deny list of secrets, addresses and the names of this machine.
 // findLeaks() lists each place where scrub() changes a value, so a stored trace is clean when the scrub leaves it as it is.
 //
@@ -18,24 +18,43 @@ const PLACEHOLDER = /^\[(scrubbed|path)\]$/;
 const SECRET_FIELD = /pass(word|wd)?$|^pwd$|secret|token|key$|^psk$|salt|challenge|^auth(entication|orization)?$|^(user(name)?|login|email)$|cookie|bearer/i;
 // A whole value that looks like a file path: POSIX, home (~), Windows drive, network share or file URL.
 const PATH = /^(\/|~[/\\]|[A-Za-z]:[\\/]|\\\\|file:)/i;
-// Forms that hold no free text, in any field: an OBS enum value, and a number, time code or version.
-const FORM = /^(OBS_[A-Z0-9_]+|[\d.:+-]*\d[\d.:+-]*)$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-// The value of an identifier field: a name that OBS or a plugin fixes in code, such as "adv_file_output".
-const IDENT = /^[\w. -]{1,64}$/;
-// The value of a text field: a sentence with no path, URL, address mark, quote or "=" in it.
+// The value of a text field that the capture or a person writes: a sentence with no path, URL, address mark, quote or "=" in it.
 const TEXT = /^[\w .,;:()'+-]*$/;
+const escape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const exactly = (list) => new RegExp(`^(${[...list].map(escape).join('|')})$`);
+const protocol = JSON.parse(readFileSync(new URL('../protocol/protocol.json', import.meta.url), 'utf8'));
+// The text of a failed request: only the obs-websocket messages that hold no value of the request (F-T27-2). A message
+// such as "No source was found by the name of ..." holds a name, so it goes.
+const COMMENTS = ['Video settings cannot be changed while an output is active.', 'You cannot change stream service settings while streaming.'];
+// The outputs that OBS itself makes, by their fixed names. A name field holds any other value only as a placeholder.
+const OUTPUT_NAMES = ['adv_stream', 'adv_file_output', 'adv_ffmpeg_output', 'simple_stream', 'simple_file_output', 'simple_ffmpeg_output', 'virtualcam_output', 'Replay Buffer'];
+// A kind id that OBS or a plugin fixes in code: lower case, with at least one "_", such as "ffmpeg_muxer".
+const KIND = /^[a-z][a-z0-9]*(_[a-z0-9]+)+$/;
 // The fields whose strings may stay, each with the form that its value must have. Any other field loses its strings,
-// for example a scene, input or profile name (a user can type a real name there) and every settings value.
+// for example every name field but the fixed ones below (a user can type a real name there) and every settings value.
 const KEEP = new Map([
   ['format', /^obs-mcp-trace\/1$/],
   // captured: the output of the capture script. real: a stored capture from a real OBS.
   ['source', /^(simulated|captured|real)$/],
-  // basis, refused and incomplete: the texts of the trace capture. comment: the text of a failed request.
-  ...['basis', 'refused', 'incomplete', 'comment', 'platformDescription'].map((k) => [k, TEXT]),
-  ...['requestType', 'eventType', 'availableRequests', 'supportedImageFormats', 'platform', 'outputName', 'outputKind', 'inputKind',
-    'unversionedInputKind', 'filterKind', 'transitionKind', 'sourceType', 'hotkeyName', 'imageFormat'].map((k) => [k, IDENT]),
+  // basis, refused and incomplete: the texts of the trace capture.
+  ...['basis', 'refused', 'incomplete', 'platformDescription'].map((k) => [k, TEXT]),
+  ['comment', exactly(COMMENTS)],
+  ...['requestType', 'eventType', 'availableRequests'].map((k) => [k, exactly([...protocol.requests.map((r) => r.requestType), ...protocol.events.map((e) => e.eventType)])]),
+  ['outputName', exactly(OUTPUT_NAMES)],
+  // The hotkeys that OBS, its browser source and its media sources fix in code, such as "OBSBasic.StopRecording".
+  ['hotkeyName', /^(OBSBasic|libobs|ObsBrowser|MediaSource|VLCSource)\.[A-Za-z][\w-]{0,63}$/],
+  ...['outputKind', 'inputKind', 'unversionedInputKind', 'filterKind', 'transitionKind'].map((k) => [k, KIND]),
+  ['platform', /^(macos|windows|linux|freebsd)$/],
+  ...['supportedImageFormats', 'imageFormat'].map((k) => [k, /^[a-z][a-z0-9]{1,4}$/]),
 ]);
+// The fields that hold a form with no free text, by the end of their name (F-T27-2: only there, never in any field):
+// a version or a time code, and an OBS enum value.
+const FORMS = [
+  [/(Version|Timecode)$/, /^[\d.:+-]*\d[\d.:+-]*$/],
+  [/(State|Type|Mode)$/, /^OBS_[A-Z0-9_]+$/],
+];
+const shapeOf = (key) => KEEP.get(key) ?? FORMS.find(([field]) => field.test(key))?.[1];
 // A settings value: the free-form values that OBS, plugins and scripts keep (README, "what the AI sees"), and the value
 // of a profile parameter. Every string and number in it goes, whatever its shape, because a PIN, a phone number or a
 // card number can be a number. A boolean or null stays. Each key in it becomes "hidden_key_<n>" (n is its place in its
@@ -51,8 +70,11 @@ const freeData = (o) => FREE_TYPE.test(o.eventType) || FREE_TYPE.test(o.requestT
 // It has no word boundary, so that a UUID right after a letter, a digit or "_" is found too.
 const ANY_UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
 const FAKE_UUID = /^00000000-0000-4000-8000-\d{12}$/;
-// An object key stays only when it is a plain identifier.
-const KEY = /^[A-Za-z_][\w.-]{0,63}$/;
+// An object key outside settings stays only when it has the form of an obs-websocket field (F-T27-2): camel case, as
+// every field of protocol.json and of a trace is, an OBS enum name (a key of outputFlags) or a number (an audio track).
+// So a key such as "SamExample" goes. A UUID in a key counts as a word, so that it can become its fake.
+const KEY = /^([a-z][\w-]{0,63}|OBS_[A-Z0-9_]{1,60}|\d{1,6})$/;
+const keyForm = (k) => KEY.test(k.replace(ANY_UUID, 'uuid'));
 
 // The deny list: each string that the allow-list keeps, and each key, must also match none of these.
 // A rule marked "text" runs on text fields only, because an identifier such as "libobs.mute" has the shape of a host name.
@@ -66,7 +88,6 @@ const DENY = [
   ['host name', /\b[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z][a-z0-9-]+\b/i, 'text'],
 ];
 
-const escape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 /**
  * The values of this machine and the run: the account name and the host name (4 characters or more, as a whole word,
  * so that a short name such as "obs" does not match common text), and each secret that the caller gives.
@@ -88,8 +109,8 @@ function why(key, s, rules, inSettings) {
   if (SECRET_FIELD.test(key)) return `secret field "${key}"`;
   if (PATH.test(s)) return 'file path';
   if (inSettings) return 'settings value';
-  const shape = KEEP.get(key);
-  if (!(FORM.test(s) || shape?.test(s) || (/Uuid$/.test(key) && UUID.test(s)))) return 'not on the allow-list';
+  const shape = shapeOf(key);
+  if (!(shape?.test(s) || (/Uuid$/.test(key) && UUID.test(s)))) return 'not on the allow-list';
   return denied(s, rules, shape === TEXT);
 }
 
@@ -143,8 +164,8 @@ function walk(value, options = {}) {
       }
       const free = freeData(v);
       return Object.fromEntries(Object.entries(v).map(([k, x]) => {
-        // A key that is not a plain identifier can be a path, a URL or a name: it goes, and the scan output never shows it.
-        const bad = PLACEHOLDER.test(k) || FAKE_UUID.test(k) ? undefined : KEY.test(k) ? denied(k, rules, false) : 'not an identifier';
+        // A key that is not a field name can be a path, a URL or a name: it goes, and the scan output never shows it.
+        const bad = PLACEHOLDER.test(k) || FAKE_UUID.test(k) ? undefined : keyForm(k) ? denied(k, rules, false) : 'not an identifier';
         // A UUID in a key becomes its fake, also in the path that the scan shows.
         const name = bad ? '[scrubbed]' : k.replace(ANY_UUID, fakeUuid);
         const at = path ? `${path}.${name}` : name;
