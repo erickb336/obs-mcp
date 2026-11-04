@@ -32,6 +32,15 @@ export function obsConfigDir(env: NodeJS.ProcessEnv = process.env): string {
   return !existsSync(native) && existsSync(flatpak) ? flatpak : native;
 }
 
+/** The take journal folder (T7 section 6). OBS_MCP_STATE_DIR overrides it. */
+export function stateDir(env: NodeJS.ProcessEnv = process.env, os: string = OS): string {
+  if (env.OBS_MCP_STATE_DIR) return env.OBS_MCP_STATE_DIR;
+  const home = homedir();
+  if (os === 'darwin') return join(home, 'Library', 'Application Support', 'obs-mcp', 'takes');
+  if (os === 'win32') return join(env.LOCALAPPDATA ?? join(home, 'AppData', 'Local'), 'obs-mcp', 'takes');
+  return join(env.XDG_STATE_HOME ?? join(home, '.local', 'state'), 'obs-mcp', 'takes');
+}
+
 const isFile = (p: string) => {
   try {
     return statSync(p).isFile();
