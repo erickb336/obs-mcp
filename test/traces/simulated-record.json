@@ -55,6 +55,6 @@
       "effect": { "recording": false }
     },
     { "requestType": "GetOutputSettings", "requestData": { "outputName": "adv_file_output" }, "when": { "recording": false }, "status": { "result": true, "code": 100 }, "responseData": { "outputSettings": {} } },
-    { "requestType": "GetOutputSettings", "requestData": { "outputName": "adv_file_output" }, "when": { "recording": true }, "status": { "result": true, "code": 100 }, "responseData": { "outputSettings": { "path": "[path]", "muxer_settings": "" } } }
+    { "requestType": "GetOutputSettings", "requestData": { "outputName": "adv_file_output" }, "when": { "recording": true }, "status": { "result": true, "code": 100 }, "responseData": { "outputSettings": { "hidden_key_1": "[path]", "hidden_key_2": "" } } }
   ]
 }

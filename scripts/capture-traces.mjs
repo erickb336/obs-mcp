@@ -9,6 +9,11 @@
 // - reads GetStreamStatus and GetRecordStatus first, and stops when either output is active;
 // - sends only what obs_read of the server runs, with the same guards (a list request only on a cleared row and with
 //   no output active, a profile parameter only from the safe list), and a record start or stop only with --allow-record;
+// - starts a take only when GetRecordStatus, read just before, says that no recording is active, and the last record
+//   event (if any) is STOPPED: a take that is STARTING is not active yet;
+// - stops only its own take: GetRecordStatus, read just before, says that a recording is active, and no record event
+//   came after the STARTED event of its own StartRecord. A take that the user starts at any time is never its own.
+//   When that is not certain, it does not stop. It never sends ToggleRecord;
 // - stops when OBS closes the connection or gives no reply in --timeout-ms, and then writes the partial trace;
 // - writes the trace only after the scrub.
 // plan.json is a list of { requestType, requestData }. With no plan, it sends each catalogue read that needs no field.
@@ -20,8 +25,9 @@ import { CATALOGUE, entry, READ_GUARDED } from '../dist/catalogue.js';
 import { listGuard, SAFE_PROFILE_PARAMETERS } from '../dist/read.js';
 import { scrub } from './trace-scrub.mjs';
 
-const RECORD = ['StartRecord', 'StopRecord', 'ToggleRecord'];
+const RECORD = ['StartRecord', 'StopRecord'];
 const ALL_EVENTS = 2047;
+const START_QUIET_MS = 600;
 
 const fail = (message, code = 1) => {
   console.error(`capture-traces: ${message}`);
@@ -165,7 +171,18 @@ const guardObs = {
 };
 /** Why the capture does not send a request, or { data } to send. The rules are those of obs_read in the server. */
 async function check({ requestType, requestData }) {
-  if (RECORD.includes(requestType)) return args['allow-record'] ? { data: requestData } : { why: 'it starts or stops a recording; give --allow-record to send it.' };
+  if (RECORD.includes(requestType)) {
+    if (!args['allow-record']) return { why: 'it starts or stops a recording; give --allow-record to send it.' };
+    const active = async () => (await guardObs.call('GetRecordStatus')).outputActive;
+    if (requestType === 'StartRecord') {
+      // A take that the user starts reads as not active while it is STARTING, and its first event comes about 50 ms after
+      // its request (real-record.json). So the capture reads the state twice, START_QUIET_MS apart, with no record event between.
+      const from = events.length;
+      const quiet = (await active()) === false && idle() && (await wait(START_QUIET_MS), (await active()) === false) && !events.slice(from).some(isRecordEvent);
+      return quiet ? { data: requestData } : { why: 'a recording is active, or its state is not known: the capture starts a take only when no recording is active.' };
+    }
+    return (await active()) === true && ownTake() ? { data: requestData } : { why: 'the active recording is not a take that the capture started, or that is not certain: the capture stops only its own take.' };
+  }
   const e = entry(requestType);
   if (!e) return { why: 'it is not in the catalogue of documented requests.' };
   if (e.class !== 'read' && !READ_GUARDED.has(requestType)) return { why: `it is in the class ${e.class}. The capture sends what obs_read runs, and a record start or stop with --allow-record.` };
@@ -179,6 +196,12 @@ async function check({ requestType, requestData }) {
   return { data: requestData };
 }
 
+// The index in events of the STARTED event of the capture's own take. OBS has one record output, so after a StartRecord
+// that succeeded, the next STARTED event is that take. Any later record event (a stop, or another take) ends the claim.
+let take;
+const isRecordEvent = (ev) => ev.eventType === 'RecordStateChanged';
+const ownTake = () => take !== undefined && events.slice(take + 1).every((ev) => !isRecordEvent(ev) || /_(PAUSED|RESUMED)$/.test(ev.eventData.outputState));
+const idle = () => [undefined, 'OBS_WEBSOCKET_OUTPUT_STOPPED'].includes(events.findLast(isRecordEvent)?.eventData.outputState);
 const refused = [];
 let stopped;
 try {
@@ -192,7 +215,14 @@ try {
   for (const r of plan) {
     const { why, data } = await check(r);
     if (why) refused.push({ requestType: r.requestType, ...(r.requestData ? { requestData: r.requestData } : {}), refused: why });
-    else await record(r.requestType, data);
+    else {
+      const from = events.length;
+      const reply = await record(r.requestType, data);
+      if (r.requestType === 'StartRecord') {
+        const i = events.findIndex((ev, k) => k >= from && isRecordEvent(ev) && ev.eventData.outputState === 'OBS_WEBSOCKET_OUTPUT_STARTED');
+        take = reply.requestStatus.result && i >= 0 ? i : undefined;
+      }
+    }
   }
 } catch (e) {
   stopped = e.message;

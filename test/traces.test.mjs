@@ -36,14 +36,20 @@ const RAW = {
   },
 };
 
+/** A settings object as the scrub leaves it: the keys hidden_key_1, hidden_key_2 and so on, in order. */
+const hidden = (values) => Object.fromEntries(values.map((v, i) => [`hidden_key_${i + 1}`, v]));
+/** The leaks of a settings object: a key leak for each key, and then a value leak when the value goes. */
+const settingsLeaks = (path, rules) => rules.flatMap((rule, i) => [`${path}.hidden_key_${i + 1}: key: settings key`, ...(rule ? [`${path}.hidden_key_${i + 1}: ${rule}`] : [])]);
+
 test('the scrub keeps only allow-listed forms and fields, and replaces every other string', () => {
   assert.deepEqual(scrub(RAW, MACHINE), {
     hello: { obsWebSocketVersion: '5.7.6', authentication: '[scrubbed]' },
     identify: { rpcVersion: 1, authentication: '[scrubbed]' },
-    streamServiceSettings: { server: '[scrubbed]', key: '[scrubbed]', service: '[scrubbed]', use_auth: true, username: '[scrubbed]', password: '[scrubbed]' },
-    outputSettings: { path: '[path]', muxer_settings: '', bitrate: 6000 },
+    // F-T6-16: in settings, each key is hidden as in the server's redact, and each number goes too.
+    streamServiceSettings: hidden(['[scrubbed]', '[scrubbed]', '[scrubbed]', true, '[scrubbed]', '[scrubbed]']),
+    outputSettings: hidden(['[path]', '', '[scrubbed]']),
     recordDirectory: '[path]',
-    inputSettings: { display_uuid: '[scrubbed]', type: 0, device_id: '[scrubbed]', window_name: '[scrubbed]' },
+    inputSettings: hidden(['[scrubbed]', '[scrubbed]', '[scrubbed]', '[scrubbed]']),
     scene: { sceneName: '[scrubbed]', sceneUuid: '00000000-0000-4000-8000-000000000001', sceneIndex: 0 },
     kept: RAW.kept,
   });
@@ -53,10 +59,9 @@ test('the leak scan names each place and rule of a raw trace, never the value, a
   const leaks = findLeaks(RAW, MACHINE);
   assert.deepEqual(leaks.map((l) => `${l.path}: ${l.rule}`), [
     'hello.authentication: secret field "authentication"', 'identify.authentication: secret field "authentication"',
-    'streamServiceSettings.server: settings value', 'streamServiceSettings.key: secret field "key"', 'streamServiceSettings.service: settings value',
-    'streamServiceSettings.username: secret field "username"', 'streamServiceSettings.password: secret field "password"',
-    'outputSettings.path: file path', 'recordDirectory: file path',
-    'inputSettings.display_uuid: settings value', 'inputSettings.device_id: settings value', 'inputSettings.window_name: settings value',
+    ...settingsLeaks('streamServiceSettings', ['settings value', 'settings value', 'settings value', undefined, 'settings value', 'settings value']),
+    ...settingsLeaks('outputSettings', ['file path', undefined, 'settings value']), 'recordDirectory: file path',
+    ...settingsLeaks('inputSettings', ['settings value', 'settings value', 'settings value', 'settings value']),
     'scene.sceneName: not on the allow-list',
   ]);
   assert.equal(JSON.stringify(leaks).includes('hunter22'), false);
@@ -94,7 +99,8 @@ const MISSED = {
 };
 for (const [name, value] of Object.entries(MISSED)) {
   test(`the scan finds, and the scrub removes, a value that R131 missed: ${name}`, () => {
-    const leaks = findLeaks(value, MACHINE);
+    // A key that settings hide is a leak of its own (F-T6-16); the value leak is the one this test is about.
+    const leaks = findLeaks(value, MACHINE).filter((l) => l.rule !== 'key: settings key');
     assert.equal(leaks.length, 1, JSON.stringify(leaks));
     const out = JSON.stringify(scrub(value, MACHINE));
     assert.match(out, /^\{"\[scrubbed\]":1\}$|^\{"\w+":(\{"\w+":)?"\[(scrubbed|path)\]"\}?\}$/);
@@ -110,14 +116,16 @@ test('F-T6-11: the scrub removes every settings and slot string, also one in the
     kept: { outputTimecode: '00:00:01.234', obsVersion: '33.0.1', cpuUsage: '4711' },
   };
   assert.deepEqual(scrub(raw, MACHINE), {
-    inputSettings: { pin: '[scrubbed]', phone: '[scrubbed]', nested: { card: '[scrubbed]' }, list: ['[scrubbed]', '[scrubbed]'], fps: 30 },
+    inputSettings: hidden(['[scrubbed]', '[scrubbed]', hidden(['[scrubbed]']), ['[scrubbed]', '[scrubbed]'], '[scrubbed]']),
     slotValue: '[scrubbed]',
     propertyItems: [{ itemName: '[scrubbed]', itemValue: '[scrubbed]', itemEnabled: true }],
     kept: raw.kept,
   });
   assert.deepEqual(findLeaks(raw, MACHINE).map((l) => `${l.path}: ${l.rule}`), [
-    'inputSettings.pin: settings value', 'inputSettings.phone: settings value', 'inputSettings.nested.card: settings value',
-    'inputSettings.list[0]: settings value', 'inputSettings.list[1]: settings value', 'slotValue: settings value',
+    ...settingsLeaks('inputSettings', ['settings value', 'settings value']),
+    'inputSettings.hidden_key_3: key: settings key', ...settingsLeaks('inputSettings.hidden_key_3', ['settings value']),
+    'inputSettings.hidden_key_4: key: settings key', 'inputSettings.hidden_key_4[0]: settings value', 'inputSettings.hidden_key_4[1]: settings value',
+    ...settingsLeaks('inputSettings', [undefined, undefined, undefined, undefined, 'settings value']).slice(-2), 'slotValue: settings value',
     'propertyItems[0].itemName: settings value', 'propertyItems[0].itemValue: settings value',
   ]);
 });
@@ -148,22 +156,22 @@ test('F-T6-12: the scrub removes every string of a profile parameter value and o
       { requestType: 'GetProfileParameter', responseData: { parameterValue: S, defaultParameterValue: S } },
       {
         requestType: 'CallVendorRequest',
-        requestData: { vendorName: S, requestType: S, requestData: { pin: S } },
-        responseData: { vendorName: S, requestType: S, responseData: { account: S, pin: S, n: 2 } },
+        requestData: hidden([S, S, hidden([S])]),
+        responseData: hidden([S, S, hidden([S, S, S])]),
       },
       {
         requestType: 'GetStats',
         events: [
-          { eventType: 'CustomEvent', eventData: { pin: S, note: S, nested: [S] } },
-          { eventType: 'VendorEvent', eventData: { vendorName: S, eventType: S, eventData: { phone: S } } },
+          { eventType: 'CustomEvent', eventData: hidden([S, S, [S]]) },
+          { eventType: 'VendorEvent', eventData: hidden([S, S, hidden([S])]) },
           { eventType: 'RecordStateChanged', eventData: { outputActive: true, outputState: 'OBS_WEBSOCKET_OUTPUT_STARTED' } },
         ],
       },
     ],
   });
   const leaks = findLeaks(raw, MACHINE);
-  assert.equal(leaks.length, 15);
-  assert.ok(leaks.every((l) => l.rule === 'settings value'), JSON.stringify(leaks));
+  // 16 values (the number n too) and 17 keys.
+  assert.deepEqual([leaks.filter((l) => l.rule === 'settings value').length, leaks.filter((l) => l.rule === 'key: settings key').length, leaks.length], [16, 17, 33]);
   assert.equal(JSON.stringify(leaks).includes(card), false);
 });
 
@@ -184,6 +192,16 @@ test('F-T6-14: the scrub gives each real UUID a fake one, the same fake in every
   const clean = scrub(reads, MACHINE);
   assert.deepEqual(findLeaks(clean, MACHINE), []);
   assert.deepEqual(scrub(clean, MACHINE), clean);
+});
+
+test('F-T6-17: the scrub finds a real UUID right after a letter, a digit or "_", and right before one', () => {
+  const A = 'a1b2c3d4-1111-4222-8333-444455556666';
+  const F = '00000000-0000-4000-8000-000000000001';
+  const raw = { comment: `x_${A} scene${A} 7${A}z`, [`id_${A}`]: 1 };
+  assert.deepEqual(scrub(raw, MACHINE), { comment: `x_${F} scene${F} 7${F}z`, [`id_${F}`]: 1 });
+  assert.deepEqual(findLeaks(raw, MACHINE).map((l) => `${l.path}: ${l.rule}`), ['comment: UUID of a real OBS', `id_${F}: key: UUID of a real OBS`]);
+  const clean = scrub(raw, MACHINE);
+  assert.deepEqual(findLeaks(clean, MACHINE), []);
 });
 
 test('the scrub removes the account name and host name of this machine, and a secret of the run, in a text it keeps', () => {
@@ -322,5 +340,6 @@ test('the fake OBS gives an output path in GetOutputSettings only while it recor
     await c.obs.disconnect();
     await fake.close();
   }
-  assert.deepEqual(paths, [{}, { path: '[path]', muxer_settings: '' }]);
+  // The stored trace hides the settings keys (F-T6-16); the path placeholder shows the path.
+  assert.deepEqual(paths, [{}, { hidden_key_1: '[path]', hidden_key_2: '' }]);
 });

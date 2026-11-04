@@ -37,8 +37,9 @@ const KEEP = new Map([
     'unversionedInputKind', 'filterKind', 'transitionKind', 'sourceType', 'hotkeyName', 'imageFormat'].map((k) => [k, IDENT]),
 ]);
 // A settings value: the free-form values that OBS, plugins and scripts keep (README, "what the AI sees"), and the value
-// of a profile parameter. Every string in it goes, whatever its shape, because a PIN, a phone number or a card number
-// has the form of a number.
+// of a profile parameter. Every string and number in it goes, whatever its shape, because a PIN, a phone number or a
+// card number can be a number. A boolean or null stays. Each key in it becomes "hidden_key_<n>" (n is its place in its
+// object, from 1), as in the server's redact, because a key can be a name too.
 const SETTINGS = /Settings$|^(slotValue|itemName|itemValue|parameterValue|defaultParameterValue)$/;
 // The data of a custom or vendor event and of a vendor request is free-form too: the field eventData, requestData or
 // responseData of an object whose eventType or requestType is one of these, or that names a vendor.
@@ -47,7 +48,8 @@ const FREE_DATA = /^(eventData|requestData|responseData)$/;
 const freeData = (o) => FREE_TYPE.test(o.eventType) || FREE_TYPE.test(o.requestType) || 'vendorName' in o;
 // A UUID of the OBS of the capture becomes a fake one: the same fake for the same UUID in all files of one scrub.
 // A fake UUID has the form 00000000-0000-4000-8000-<12 digits>, and stays as it is.
-const ANY_UUID = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
+// It has no word boundary, so that a UUID right after a letter, a digit or "_" is found too.
+const ANY_UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
 const FAKE_UUID = /^00000000-0000-4000-8000-\d{12}$/;
 // An object key stays only when it is a plain identifier.
 const KEY = /^[A-Za-z_][\w.-]{0,63}$/;
@@ -127,9 +129,18 @@ function walk(value, options = {}) {
       changes.push({ path, rule });
       return rule === 'file path' ? '[path]' : '[scrubbed]';
     }
+    if (typeof v === 'number' && inSettings) return changes.push({ path, rule: 'settings value' }), '[scrubbed]';
     if (Array.isArray(v)) return v.map((x, i) => go(x, `${path}[${i}]`, key, inSettings));
     if (v && typeof v === 'object') {
       if (SECRET_FIELD.test(key) && Object.keys(v).length) return changes.push({ path, rule: `secret field "${key}"` }), '[scrubbed]';
+      if (inSettings) {
+        return Object.fromEntries(Object.entries(v).map(([k, x], i) => {
+          const name = `hidden_key_${i + 1}`;
+          const at = path ? `${path}.${name}` : name;
+          if (k !== name) changes.push({ path: at, rule: 'key: settings key' });
+          return [name, go(x, at, name, true)];
+        }));
+      }
       const free = freeData(v);
       return Object.fromEntries(Object.entries(v).map(([k, x]) => {
         // A key that is not a plain identifier can be a path, a URL or a name: it goes, and the scan output never shows it.

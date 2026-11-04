@@ -225,15 +225,19 @@ test('the repository holds no machine-specific path, address or e-mail', () => {
   assert.deepEqual(hits, []);
 });
 
-// F-T6-13: the owner's real first and last name are in no file but LICENSE (its copyright line). The pattern is built
-// from parts, so that this file does not hold the name. The GitHub account name of the repository, which holds the
-// first name, is the address of the repository and stays in its URLs and the package scope.
-test('the repository holds the name of its owner in LICENSE only', () => {
+// F-T6-13 and F-T6-20: no file holds the owner's real first name or either last name, in any letter case or Unicode
+// form. The pattern is built from parts, so that this file does not hold the name. NFKD splits an accented letter into
+// the letter and a combining mark, and a full-width letter into a plain one; the marks go before the match. The GitHub
+// account name of the repository, which holds the first name, is the address of the repository and stays in its URLs,
+// the package scope and LICENSE.
+test('the repository does not hold the name of its owner', () => {
   const root = fileURLToPath(new URL('..', import.meta.url));
-  const owner = new RegExp(`${['er', 'ick'].join('')}(?!${['b', '336'].join('')})|${['ben', 'itez'].join('')}`, 'i');
-  // The scan finds a planted name, in any letter case, and lets the account name through.
-  assert.deepEqual(['Er' + 'ick SSD', 'BEN' + 'ITEZ', 'sam', `github.com/${'er' + 'ick'}b336/obs-mcp`].map((s) => owner.test(s)), [true, true, false, false]);
+  const pattern = new RegExp(`${['er', 'ick'].join('')}(?!${['b', '336'].join('')})|${['ben', 'itez'].join('')}|\\b${['ra', 'mos'].join('')}\\b`, 'i');
+  const owner = { test: (s) => pattern.test(s.normalize('NFKD').replace(/\p{M}/gu, '')) };
+  // The scan finds a planted name, in any letter case and Unicode form, and lets the account name through.
+  const planted = ['Er' + 'ick SSD', 'BEN' + 'ITEZ', 'Ben\u00edtez', 'Beni\u0301tez', '\uff22\uff45\uff4e\uff49\uff54\uff45\uff5a', 'Ra' + 'mos', 'RA' + 'MOS', 'sam', 'panoramas', `github.com/${'er' + 'ick'}b336/obs-mcp`];
+  assert.deepEqual(planted.map((s) => owner.test(s)), [true, true, true, true, true, true, true, false, false, false]);
   const files = execFileSync('git', ['ls-files', '--cached', '--others', '--exclude-standard'], { cwd: root, encoding: 'utf8' }).split('\n').filter(Boolean);
-  const hits = files.filter((f) => f !== 'LICENSE' && existsSync(join(root, f)) && owner.test(readFileSync(join(root, f), 'utf8')));
+  const hits = files.filter((f) => existsSync(join(root, f)) && owner.test(readFileSync(join(root, f), 'utf8')));
   assert.deepEqual(hits, []);
 });

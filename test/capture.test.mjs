@@ -79,8 +79,9 @@ test('the capture sends only what obs_read runs, with its guards, and writes a s
     'StopRecord: it starts or stops a recording; give --allow-record to send it.',
   ]);
   // The fake's stream settings hold a server URL with a key, a user name and the password: the scrub took them out.
+  // The keys of settings are hidden too (F-T6-16): server, protocol, key, use_auth, username, password.
   assert.deepEqual(trace.entries.find((e) => e.requestType === 'GetStreamServiceSettings').responseData.streamServiceSettings, {
-    server: '[scrubbed]', protocol: '[scrubbed]', key: '[scrubbed]', use_auth: true, username: '[scrubbed]', password: '[scrubbed]',
+    hidden_key_1: '[scrubbed]', hidden_key_2: '[scrubbed]', hidden_key_3: '[scrubbed]', hidden_key_4: true, hidden_key_5: '[scrubbed]', hidden_key_6: '[scrubbed]',
   });
   for (const secret of [PASSWORD, 'live_123456789_captureKey', 'someone']) assert.equal(text.includes(secret), false, secret);
   assert.deepEqual(findLeaks(trace), []);
@@ -128,7 +129,8 @@ test('F-T6-1: during a take that --allow-record started, the capture still refus
   const r = await run(['--url', `ws://127.0.0.1:${fake.port}`, '--out', f.out, '--plan', f.plan, '--settle-ms', '0', '--allow-record']);
   await fake.close();
   assert.equal(r.code, 0, r.stderr);
-  assert.deepEqual(fake.log, ['GetVersion', 'GetStreamStatus', 'GetRecordStatus', 'StartRecord', ...GUARD_READS, 'StopRecord']);
+  // Before its own StartRecord (twice) and StopRecord, the capture reads GetRecordStatus again (F-T6-19).
+  assert.deepEqual(fake.log, ['GetVersion', 'GetStreamStatus', 'GetRecordStatus', 'GetRecordStatus', 'GetRecordStatus', 'StartRecord', ...GUARD_READS, 'GetRecordStatus', 'StopRecord']);
   assert.deepEqual(JSON.parse(readFileSync(f.out, 'utf8')).refused.map((x) => `${x.requestType}: ${x.refused}`), [
     `OpenInputPropertiesDialog: ${NOT_A_READ('change')}`,
     `CallVendorRequest: ${NOT_A_READ('guarded')}`,
@@ -137,6 +139,75 @@ test('F-T6-1: during a take that --allow-record started, the capture still refus
   ]);
   assert.deepEqual(fake.stops, [{ requestType: 'StopRecord', cause: 'request' }]);
   assert.equal(fake.crashes(), 0);
+});
+
+// F-T6-19: a take that the user starts is never stopped by the capture, whenever the user starts it. The user is a
+// second client of the fake OBS. Each plan asks for every record request; ToggleRecord is never sent.
+const until = async (ok) => {
+  const deadline = Date.now() + 10000;
+  while (!ok()) {
+    if (Date.now() > deadline) throw new Error('the fake OBS did not reach the state in 10 s');
+    await new Promise((r) => setTimeout(r, 5));
+  }
+};
+/** A fake OBS with a second client, the user. Both close after the test, also when it fails. */
+const userAndFake = async (t) => {
+  const fake = await startFakeObs();
+  const user = new OBSWebSocket();
+  await user.connect(`ws://127.0.0.1:${fake.port}`);
+  t.after(async () => {
+    await user.disconnect();
+    await fake.close();
+  });
+  return { fake, user };
+};
+const NOT_OWN = 'the active recording is not a take that the capture started, or that is not certain: the capture stops only its own take.';
+const NOT_IDLE = 'a recording is active, or its state is not known: the capture starts a take only when no recording is active.';
+const TAKE_PLAN = [{ requestType: 'GetStats' }, { requestType: 'GetStats' }, { requestType: 'StopRecord' }, { requestType: 'ToggleRecord' }, { requestType: 'StartRecord' }, { requestType: 'StopRecord' }];
+for (const [moment, ready] of [
+  // The R154 reproduction: the user starts a take just after the capture's first GetRecordStatus has its reply.
+  ['just after the first record status read', (log) => log.includes('GetRecordStatus')],
+  ['between two plan steps', (log) => log.includes('GetStats')],
+  ['while the capture checks a StopRecord', (log) => log.filter((x) => x === 'GetRecordStatus').length >= 2],
+  ['while the capture checks a StartRecord', (log) => log.filter((x) => x === 'GetRecordStatus').length >= 3],
+]) {
+  test(`F-T6-19: a user take started ${moment} is never stopped, and ToggleRecord is never sent`, async (t) => {
+    const { fake, user } = await userAndFake(t);
+    const f = files();
+    writeFileSync(f.plan, JSON.stringify(TAKE_PLAN));
+    const capture = run(['--url', `ws://127.0.0.1:${fake.port}`, '--out', f.out, '--plan', f.plan, '--settle-ms', '400', '--allow-record']);
+    await until(() => ready(fake.log));
+    await user.call('StartRecord');
+    const r = await capture;
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(fake.state.recording, true);
+    assert.deepEqual(fake.stops, []);
+    assert.equal(fake.log.includes('ToggleRecord'), false);
+    // The user's StartRecord is the only one that OBS got.
+    assert.equal(fake.log.filter((x) => x === 'StartRecord').length, 1);
+    const refused = JSON.parse(readFileSync(f.out, 'utf8')).refused.map((x) => `${x.requestType}: ${x.refused}`);
+    assert.deepEqual(refused.filter((x) => !x.startsWith('ToggleRecord')).slice(-2), [`StartRecord: ${NOT_IDLE}`, `StopRecord: ${NOT_OWN}`]);
+    assert.deepEqual(refused.find((x) => x.startsWith('ToggleRecord')), `ToggleRecord: ${NOT_A_READ('guarded')}`);
+  });
+}
+
+test('F-T6-19: when the user stops the capture\'s take and starts a new one, the capture does not stop the new take', async (t) => {
+  const { fake, user } = await userAndFake(t);
+  const f = files();
+  writeFileSync(f.plan, JSON.stringify([{ requestType: 'StartRecord' }, { requestType: 'GetStats' }, { requestType: 'StopRecord' }]));
+  const capture = run(['--url', `ws://127.0.0.1:${fake.port}`, '--out', f.out, '--plan', f.plan, '--settle-ms', '1500', '--allow-record']);
+  await until(() => fake.log.includes('GetStats'));
+  await user.call('StopRecord');
+  await until(() => !fake.state.recording);
+  await user.call('StartRecord');
+  await until(() => fake.state.recording);
+  const r = await capture;
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(fake.state.recording, true);
+  // The one stop is the user's own stop of the capture's take.
+  assert.deepEqual(fake.stops, [{ requestType: 'StopRecord', cause: 'request' }]);
+  assert.equal(fake.log.filter((x) => x === 'StopRecord').length, 1);
+  assert.deepEqual(JSON.parse(readFileSync(f.out, 'utf8')).refused.map((x) => `${x.requestType}: ${x.refused}`), [`StopRecord: ${NOT_OWN}`]);
 });
 
 // F-T6-4 and F-T6-9: a crash of OBS or a request with no reply ends the capture with the reason, and the partial trace is written.
