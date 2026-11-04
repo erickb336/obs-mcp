@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { OBSWebSocket, EventSubscription } from 'obs-websocket-js/json';
-import { findLeaks, scrub } from '../scripts/trace-scrub.mjs';
+import { findLeaks, scrub, uuidFaker } from '../scripts/trace-scrub.mjs';
 import { loadTraces, startFakeObs, TRACE_DIR } from './fake-obs.mjs';
 
 const SCRUB_CLI = fileURLToPath(new URL('../scripts/trace-scrub.mjs', import.meta.url));
@@ -73,10 +73,10 @@ const MISSED = {
   accessKey: { responseData: { accessKey: 'sk-live-0123456789abcdefABCDEF0123' } },
   'short key in a profile value': { parameterValue: 'abcd-efgh-ijkl-mnop-qrst' },
   'one-word secret in a slot': { slotValue: 'hunter2secret' },
-  'real name in an input name': { inputName: 'Erick Benitez iPhone Camera' },
-  'path under /Volumes': { comment: `Failed to open ${['', 'Vol' + 'umes', 'Erick SSD', 'take.mkv'].join('/')}` },
+  'real name in an input name': { inputName: 'Sam Example iPhone Camera' },
+  'path under /Volumes': { comment: `Failed to open ${['', 'Vol' + 'umes', 'Sam SSD', 'take.mkv'].join('/')}` },
   'path under /private/var/folders': { comment: `Wrote ${['', 'private', 'var', 'folders', 'ab', 'T', 'obs.log'].join('/')}` },
-  'host name with no port': { comment: 'connected to erick-studio-mbp.lan' },
+  'host name with no port': { comment: 'connected to sam-studio.lan' },
   'escaped Windows home in text': { comment: `saved to C:${BS}${BS}Us${'ers'}${BS}${BS}zelda${BS}${BS}Videos ok` },
   'escaped Windows home in a name': { outputPath: `saved to C:${BS}${BS}Us${'ers'}${BS}${BS}zelda${BS}${BS}Videos ok` },
   'lower-case Windows home': { comment: 'in c:/us' + 'ers/zelda/x' },
@@ -122,6 +122,70 @@ test('F-T6-11: the scrub removes every settings and slot string, also one in the
   ]);
 });
 
+test('F-T6-12: the scrub removes every string of a profile parameter value and of custom and vendor data', () => {
+  const card = '4111111111111111';
+  const raw = {
+    entries: [
+      { requestType: 'GetProfileParameter', responseData: { parameterValue: card, defaultParameterValue: '1234' } },
+      {
+        requestType: 'CallVendorRequest',
+        requestData: { vendorName: 'sam-plugin', requestType: 'get', requestData: { pin: '4711' } },
+        responseData: { vendorName: 'sam-plugin', requestType: 'get', responseData: { account: 'Sam Example', pin: '4711', n: 2 } },
+      },
+      {
+        requestType: 'GetStats',
+        events: [
+          { eventType: 'CustomEvent', eventData: { pin: '4711', note: 'call me', nested: ['0042'] } },
+          { eventType: 'VendorEvent', eventData: { vendorName: 'sam-plugin', eventType: 'x', eventData: { phone: '+1 555-0100' } } },
+          { eventType: 'RecordStateChanged', eventData: { outputActive: true, outputState: 'OBS_WEBSOCKET_OUTPUT_STARTED' } },
+        ],
+      },
+    ],
+  };
+  const S = '[scrubbed]';
+  assert.deepEqual(scrub(raw, MACHINE), {
+    entries: [
+      { requestType: 'GetProfileParameter', responseData: { parameterValue: S, defaultParameterValue: S } },
+      {
+        requestType: 'CallVendorRequest',
+        requestData: { vendorName: S, requestType: S, requestData: { pin: S } },
+        responseData: { vendorName: S, requestType: S, responseData: { account: S, pin: S, n: 2 } },
+      },
+      {
+        requestType: 'GetStats',
+        events: [
+          { eventType: 'CustomEvent', eventData: { pin: S, note: S, nested: [S] } },
+          { eventType: 'VendorEvent', eventData: { vendorName: S, eventType: S, eventData: { phone: S } } },
+          { eventType: 'RecordStateChanged', eventData: { outputActive: true, outputState: 'OBS_WEBSOCKET_OUTPUT_STARTED' } },
+        ],
+      },
+    ],
+  });
+  const leaks = findLeaks(raw, MACHINE);
+  assert.equal(leaks.length, 15);
+  assert.ok(leaks.every((l) => l.rule === 'settings value'), JSON.stringify(leaks));
+  assert.equal(JSON.stringify(leaks).includes(card), false);
+});
+
+test('F-T6-14: the scrub gives each real UUID a fake one, the same fake in every place and every file of one scrub', () => {
+  const A = 'a1b2c3d4-1111-4222-8333-444455556666';
+  const B = '9F8E7D6C-AAAA-4BBB-8CCC-DDDDEEEEFFFF';
+  const F = (n) => `00000000-0000-4000-8000-00000000000${n}`;
+  // F(1) is already in the input as a fake, so the first real UUID gets F(2).
+  const reads = { a: { sceneUuid: A }, b: [{ transitionUuid: B }, { sceneUuid: A }], c: { sceneUuid: F(1) }, comment: `scene ${A} ok`, [A]: 1 };
+  const record = { sceneUuid: B.toLowerCase(), inputUuid: 'ffffffff-0000-4000-8000-000000000009' };
+  const fakeUuid = uuidFaker(JSON.stringify([reads, record]));
+  assert.deepEqual(scrub(reads, { ...MACHINE, fakeUuid }), { a: { sceneUuid: F(2) }, b: [{ transitionUuid: F(3) }, { sceneUuid: F(2) }], c: { sceneUuid: F(1) }, comment: `scene ${F(2)} ok`, [F(2)]: 1 });
+  assert.deepEqual(scrub(record, { ...MACHINE, fakeUuid }), { sceneUuid: F(3), inputUuid: F(4) });
+  assert.deepEqual(findLeaks(reads, MACHINE).map((l) => `${l.path}: ${l.rule}`), [
+    'a.sceneUuid: UUID of a real OBS', 'b[0].transitionUuid: UUID of a real OBS', 'b[1].sceneUuid: UUID of a real OBS',
+    'comment: UUID of a real OBS', `${F(2)}: key: UUID of a real OBS`,
+  ]);
+  const clean = scrub(reads, MACHINE);
+  assert.deepEqual(findLeaks(clean, MACHINE), []);
+  assert.deepEqual(scrub(clean, MACHINE), clean);
+});
+
 test('the scrub removes the account name and host name of this machine, and a secret of the run, in a text it keeps', () => {
   const out = scrub({ comment: 'Alice ran OBS', basis: 'on studio-mac', platformDescription: 'macOS 15', outputName: 'hunter22' }, { ...MACHINE, secrets: ['hunter22'] });
   assert.deepEqual(out, { comment: '[scrubbed]', basis: '[scrubbed]', platformDescription: 'macOS 15', outputName: '[scrubbed]' });
@@ -130,6 +194,14 @@ test('the scrub removes the account name and host name of this machine, and a se
 });
 
 const traces = loadTraces();
+
+test('F-T6-14: the stored traces hold only fake UUIDs, and one scene UUID links the scene reads', () => {
+  const all = traces.map((t) => JSON.stringify(t)).join('\n').match(/\b[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}\b/gi);
+  assert.deepEqual([...new Set(all)].sort(), ['00000000-0000-4000-8000-000000000001', '00000000-0000-4000-8000-000000000002', '00000000-0000-4000-8000-000000000003']);
+  const reads = traces.find((t) => t.file === 'real-reads.json').entries;
+  const program = reads.find((e) => e.requestType === 'GetCurrentProgramScene').responseData.sceneUuid;
+  assert.equal(reads.find((e) => e.requestType === 'GetSceneList').responseData.scenes[0].sceneUuid, program);
+});
 
 test('each stored trace is labelled, documented, and holds no password, stream key, user name, home path or address', () => {
   assert.ok(traces.length >= 3, `${traces.length} trace files in ${fileURLToPath(TRACE_DIR)}`);

@@ -5,6 +5,7 @@
 // findLeaks() lists each place where scrub() changes a value, so a stored trace is clean when the scrub leaves it as it is.
 //
 //   node scripts/trace-scrub.mjs <in.json> <out.json>    scrub one trace file
+//   node scripts/trace-scrub.mjs --in-place <file.json>... scrub files in place, with one map of fake UUIDs
 //   node scripts/trace-scrub.mjs --check <file.json>...  exit 1 when a file holds a value that the scrub removes
 //
 // The scan output names the place and the rule, never the value, so that a log does not hold the leak.
@@ -35,9 +36,19 @@ const KEEP = new Map([
   ...['requestType', 'eventType', 'availableRequests', 'supportedImageFormats', 'platform', 'outputName', 'outputKind', 'inputKind',
     'unversionedInputKind', 'filterKind', 'transitionKind', 'sourceType', 'hotkeyName', 'imageFormat'].map((k) => [k, IDENT]),
 ]);
-// A settings value: the free-form values that OBS, plugins and scripts keep (README, "what the AI sees"). Every string
-// in it goes, whatever its shape, because a PIN, a phone number or a card number has the form of a number.
-const SETTINGS = /Settings$|^(slotValue|itemName|itemValue)$/;
+// A settings value: the free-form values that OBS, plugins and scripts keep (README, "what the AI sees"), and the value
+// of a profile parameter. Every string in it goes, whatever its shape, because a PIN, a phone number or a card number
+// has the form of a number.
+const SETTINGS = /Settings$|^(slotValue|itemName|itemValue|parameterValue|defaultParameterValue)$/;
+// The data of a custom or vendor event and of a vendor request is free-form too: the field eventData, requestData or
+// responseData of an object whose eventType or requestType is one of these, or that names a vendor.
+const FREE_TYPE = /^(CustomEvent|VendorEvent|BroadcastCustomEvent|CallVendorRequest)$/;
+const FREE_DATA = /^(eventData|requestData|responseData)$/;
+const freeData = (o) => FREE_TYPE.test(o.eventType) || FREE_TYPE.test(o.requestType) || 'vendorName' in o;
+// A UUID of the OBS of the capture becomes a fake one: the same fake for the same UUID in all files of one scrub.
+// A fake UUID has the form 00000000-0000-4000-8000-<12 digits>, and stays as it is.
+const ANY_UUID = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
+const FAKE_UUID = /^00000000-0000-4000-8000-\d{12}$/;
 // An object key stays only when it is a plain identifier.
 const KEY = /^[A-Za-z_][\w.-]{0,63}$/;
 
@@ -80,27 +91,55 @@ function why(key, s, rules, inSettings) {
   return denied(s, rules, shape === TEXT);
 }
 
+/**
+ * The function that gives the fake UUID of a real one. text is all the input of the scrub: a fake UUID that is already
+ * in it is not given again to another UUID.
+ */
+export function uuidFaker(text = '') {
+  const map = new Map();
+  const used = new Set((text.match(ANY_UUID) ?? []).filter((u) => FAKE_UUID.test(u)));
+  let n = 0;
+  return (u) => {
+    if (FAKE_UUID.test(u)) return u;
+    const real = u.toLowerCase();
+    while (!map.has(real)) {
+      const fake = `00000000-0000-4000-8000-${String(++n).padStart(12, '0')}`;
+      if (!used.has(fake)) map.set(real, fake);
+    }
+    return map.get(real);
+  };
+}
+
 /** Each change that the scrub makes, as { path, rule }, with the scrubbed value. */
-function walk(value, options) {
+function walk(value, options = {}) {
   const rules = [...localRules(options), ...DENY];
+  const fakeUuid = options.fakeUuid ?? uuidFaker(JSON.stringify(value));
   const changes = [];
+  const unreal = (s, path) => {
+    const out = s.replace(ANY_UUID, fakeUuid);
+    if (out !== s) changes.push({ path, rule: 'UUID of a real OBS' });
+    return out;
+  };
   const go = (v, path, key, inSettings = SETTINGS.test(key)) => {
     if (typeof v === 'string') {
       const rule = why(key, v, rules, inSettings);
-      if (!rule) return v;
+      if (!rule) return unreal(v, path);
       changes.push({ path, rule });
       return rule === 'file path' ? '[path]' : '[scrubbed]';
     }
     if (Array.isArray(v)) return v.map((x, i) => go(x, `${path}[${i}]`, key, inSettings));
     if (v && typeof v === 'object') {
       if (SECRET_FIELD.test(key) && Object.keys(v).length) return changes.push({ path, rule: `secret field "${key}"` }), '[scrubbed]';
+      const free = freeData(v);
       return Object.fromEntries(Object.entries(v).map(([k, x]) => {
         // A key that is not a plain identifier can be a path, a URL or a name: it goes, and the scan output never shows it.
-        const bad = PLACEHOLDER.test(k) ? undefined : KEY.test(k) ? denied(k, rules, false) : 'not an identifier';
-        const name = bad ? '[scrubbed]' : k;
+        const bad = PLACEHOLDER.test(k) || FAKE_UUID.test(k) ? undefined : KEY.test(k) ? denied(k, rules, false) : 'not an identifier';
+        // A UUID in a key becomes its fake, also in the path that the scan shows.
+        const name = bad ? '[scrubbed]' : k.replace(ANY_UUID, fakeUuid);
         const at = path ? `${path}.${name}` : name;
         if (bad) changes.push({ path: at, rule: `key: ${bad}` });
-        return [name, go(x, at, name, inSettings || SETTINGS.test(name))];
+        else if (name !== k) changes.push({ path: at, rule: 'key: UUID of a real OBS' });
+        return [name, go(x, at, name, inSettings || SETTINGS.test(name) || (free && FREE_DATA.test(name)))];
       }));
     }
     return v;
@@ -108,7 +147,10 @@ function walk(value, options) {
   return { value: go(value, '', ''), changes };
 }
 
-/** The value with every secret and machine detail replaced. options: { secrets, user, host } (defaults: this machine). */
+/**
+ * The value with every secret and machine detail replaced, and each real UUID replaced by a fake one.
+ * options: { secrets, user, host } (defaults: this machine), and fakeUuid (from uuidFaker) to share fakes between values.
+ */
 export const scrub = (value, options) => walk(value, options).value;
 /** Each place where the value holds something that scrub() removes, as { path, rule }. An empty list means clean. */
 export const findLeaks = (value, options) => walk(value, options).changes;
@@ -124,12 +166,22 @@ if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.me
     }
     console.log(bad ? `${bad} value(s) to scrub.` : `clean: ${rest.length} file(s).`);
     process.exit(bad ? 1 : 0);
+  } else if (first === '--in-place' && rest.length) {
+    // All the files share one map of fake UUIDs, so that a UUID in two files stays one UUID.
+    const texts = rest.map((file) => readFileSync(file, 'utf8'));
+    const fakeUuid = uuidFaker(texts.join('\n'));
+    rest.forEach((file, i) => {
+      const { value, changes } = walk(JSON.parse(texts[i]), { fakeUuid });
+      // A clean file stays as it is, also its layout.
+      if (changes.length) writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
+      console.log(`scrubbed ${changes.length} value(s) in ${file}.`);
+    });
   } else if (first && rest.length === 1) {
     const { value, changes } = walk(JSON.parse(readFileSync(first, 'utf8')));
     writeFileSync(rest[0], `${JSON.stringify(value, null, 2)}\n`);
     console.log(`scrubbed ${changes.length} value(s) into ${rest[0]}.`);
   } else {
-    console.error('Usage:\n  node scripts/trace-scrub.mjs <in.json> <out.json>\n  node scripts/trace-scrub.mjs --check <file.json>...');
+    console.error('Usage:\n  node scripts/trace-scrub.mjs <in.json> <out.json>\n  node scripts/trace-scrub.mjs --in-place <file.json>...\n  node scripts/trace-scrub.mjs --check <file.json>...');
     process.exit(2);
   }
 }

@@ -224,3 +224,16 @@ test('the repository holds no machine-specific path, address or e-mail', () => {
     .flatMap((f) => patterns.filter((p) => p.test(readFileSync(join(root, f), 'utf8'))).map((p) => `${f}: ${p}`));
   assert.deepEqual(hits, []);
 });
+
+// F-T6-13: the owner's real first and last name are in no file but LICENSE (its copyright line). The pattern is built
+// from parts, so that this file does not hold the name. The GitHub account name of the repository, which holds the
+// first name, is the address of the repository and stays in its URLs and the package scope.
+test('the repository holds the name of its owner in LICENSE only', () => {
+  const root = fileURLToPath(new URL('..', import.meta.url));
+  const owner = new RegExp(`${['er', 'ick'].join('')}(?!${['b', '336'].join('')})|${['ben', 'itez'].join('')}`, 'i');
+  // The scan finds a planted name, in any letter case, and lets the account name through.
+  assert.deepEqual(['Er' + 'ick SSD', 'BEN' + 'ITEZ', 'sam', `github.com/${'er' + 'ick'}b336/obs-mcp`].map((s) => owner.test(s)), [true, true, false, false]);
+  const files = execFileSync('git', ['ls-files', '--cached', '--others', '--exclude-standard'], { cwd: root, encoding: 'utf8' }).split('\n').filter(Boolean);
+  const hits = files.filter((f) => f !== 'LICENSE' && existsSync(join(root, f)) && owner.test(readFileSync(join(root, f), 'utf8')));
+  assert.deepEqual(hits, []);
+});

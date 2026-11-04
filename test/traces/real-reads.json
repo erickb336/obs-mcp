@@ -217,12 +217,12 @@
         "currentPreviewSceneName": null,
         "currentPreviewSceneUuid": null,
         "currentProgramSceneName": "[scrubbed]",
-        "currentProgramSceneUuid": "ba8b98d2-c982-443c-b5e8-e637b938c1cc",
+        "currentProgramSceneUuid": "00000000-0000-4000-8000-000000000001",
         "scenes": [
           {
             "sceneIndex": 0,
             "sceneName": "[scrubbed]",
-            "sceneUuid": "ba8b98d2-c982-443c-b5e8-e637b938c1cc"
+            "sceneUuid": "00000000-0000-4000-8000-000000000001"
           }
         ]
       }
@@ -253,9 +253,9 @@
       },
       "responseData": {
         "currentProgramSceneName": "[scrubbed]",
-        "currentProgramSceneUuid": "ba8b98d2-c982-443c-b5e8-e637b938c1cc",
+        "currentProgramSceneUuid": "00000000-0000-4000-8000-000000000001",
         "sceneName": "[scrubbed]",
-        "sceneUuid": "ba8b98d2-c982-443c-b5e8-e637b938c1cc"
+        "sceneUuid": "00000000-0000-4000-8000-000000000001"
       }
     },
     {
@@ -293,21 +293,21 @@
       "responseData": {
         "currentSceneTransitionKind": "[scrubbed]",
         "currentSceneTransitionName": "[scrubbed]",
-        "currentSceneTransitionUuid": "41305527-8884-4b0e-9a78-0e1f9b4d4219",
+        "currentSceneTransitionUuid": "00000000-0000-4000-8000-000000000002",
         "transitions": [
           {
             "transitionConfigurable": false,
             "transitionFixed": false,
             "transitionKind": "fade_transition",
             "transitionName": "[scrubbed]",
-            "transitionUuid": "41305527-8884-4b0e-9a78-0e1f9b4d4219"
+            "transitionUuid": "00000000-0000-4000-8000-000000000002"
           },
           {
             "transitionConfigurable": false,
             "transitionFixed": true,
             "transitionKind": "cut_transition",
             "transitionName": "[scrubbed]",
-            "transitionUuid": "03adc841-d762-4ab7-81ad-13a788ecb3b9"
+            "transitionUuid": "00000000-0000-4000-8000-000000000003"
           }
         ]
       }

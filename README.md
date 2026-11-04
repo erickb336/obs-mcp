@@ -6,7 +6,12 @@ An agent can find any of the 147 documented obs-websocket requests and run the r
 
 [![CI](https://github.com/erickb336/obs-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/erickb336/obs-mcp/actions/workflows/ci.yml) [![Licence: MIT](https://img.shields.io/github/license/erickb336/obs-mcp)](LICENSE)
 
-> **Status: pre-release 0.0. Not yet published to npm. Not tested on real OBS**, except the one cleared list row in [Safety rules](#safety-rules). All tests run against a simulated OBS.
+> **Status: pre-release 0.0. Not yet published to npm.** All tests run against a fake OBS that replays stored traces ([The fake OBS and its traces](#the-fake-obs-and-its-traces)):
+>
+> - **Real traces:** the default reads, and `StartRecord` and `StopRecord`. They were captured from a real OBS 33.0.1 on macOS, then scrubbed.
+> - **Simulated behaviour:** `ToggleRecord`, pause and resume, `StopOutput`, `ToggleOutput`, the stop hotkey, the live-output blocks and the crash of a list request. These traces are written by hand, so the stop-rule sweep runs against a simulated take.
+>
+> The one cleared list row in [Safety rules](#safety-rules) was also tested on real OBS.
 
 Contents: [Quick start](#quick-start) · [Usage](#usage) · [Tools](#tools) · [Safety rules](#safety-rules) · [How it works](#how-it-works) · [Settings](#settings) · [Under the hood](#under-the-hood) · [Licence](#licence)
 
@@ -203,7 +208,7 @@ The traces are of two kinds:
 | Tool | What it does |
 | --- | --- |
 | `node scripts/capture-traces.mjs --url ws://127.0.0.1:4455 --out trace.json` | Records requests, replies and events. It reads the password from `OBS_WEBSOCKET_PASSWORD` or a hidden prompt. It stops when a stream or recording is active. It sends only the requests that `obs_read` runs, behind the same guards as the server, and starts or stops a recording only with `--allow-record`. When OBS closes the connection or gives no reply in `--timeout-ms` (default 10000), it stops with the reason and writes the partial trace. It writes a trace only after the scrub. |
-| `node scripts/trace-scrub.mjs --check test/traces/*.json` | Fails when a trace holds a string that the allow-list does not keep, or a key that is not a plain identifier. A string stays only in a form that holds no text (an OBS enum value, a number, a time code, a version) or in a short list of fields that OBS fixes, such as `requestType` and `outputState`. So scene, input and profile names and every settings value are removed. A string that stays must also pass a deny list of secrets, host names, addresses and the names of this machine. `npm test` runs the same scan on every stored trace. |
+| `node scripts/trace-scrub.mjs --check test/traces/*.json` | Fails when a trace holds a string that the allow-list does not keep, or a key that is not a plain identifier. A string stays only in a form that holds no text (an OBS enum value, a number, a time code, a version) or in a short list of fields that OBS fixes, such as `requestType` and `outputState`. So scene, input and profile names, every settings value, profile parameter value and the data of custom and vendor events and requests are removed. A real UUID fails the check, and the scrub replaces it with a fake one (`00000000-0000-4000-8000-<n>`). `node scripts/trace-scrub.mjs --in-place <file>...` gives the same fake to the same UUID in all the files. A string that stays must also pass a deny list of secrets, host names, addresses and the names of this machine. `npm test` runs the same scan on every stored trace. |
 | `node scripts/timing-loop.mjs` | Measures the time that the server adds to each request over loopback, against the fake OBS. Add `--url ws://127.0.0.1:4455` to measure a running OBS. |
 
 The stop rule has its own test (`test/sweep.test.mjs`): during a simulated take, it sends each of the 147 requests through the server, and the two list requests that crash OBS. Result: 0 stops and 0 crashes. The same requests sent straight to the fake OBS stop the take 6 times, so the test can see a stop.
