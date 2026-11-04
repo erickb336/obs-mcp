@@ -45,17 +45,17 @@ test('E1: OBS crashes during a take: unplanned_stop and alert X11 at once (level
 test('E2: a socket drop while OBS records: the take stays, marked offline, and the reconnect finds the same recording; nothing is sent again', async () => {
   const { w, s } = await recording();
   w.fake.drop();
-  await wait(30);
-  assert.match(await status(s), /^I lost the connection to OBS at \d\d:\d\d:\d\d\. OBS keeps recording on its own\. I reconnect, and I send no recording request\. Recording for /);
-  assert.ok(await until(async () => /^Recording for /.test(await status(s))), 'the reconnect clears the offline mark');
+  assert.ok(await until(() => take(w).rows.includes('O1') && take(w).take.marks.includes('offline')), 'the drop marks the take offline (O1)');
+  assert.ok(await until(() => !take(w).take.marks.includes('offline')), 'the reconnect clears the offline mark');
+  assert.match(await status(s), /^Recording for /);
   assert.deepEqual(recordRequests(w.fake), ['StartRecord']);
   await done(w, s);
 });
 
-test('E2: a drop right after StopRecord: stop_uncertain (X8), never a second stop; the read after the reconnect ends it (T17)', async () => {
+test('E2, F-T7-17: a drop right after StopRecord: stop_uncertain with the text of 7.1, never a second stop; the read after the reconnect ends it (T17)', async () => {
   const { w, s } = await recording({}, { closeAfter: ['StopRecord'] });
   const r = await s.call('obs_record_stop');
-  assert.match(r.text, /^I lost the connection to OBS at .*I sent the stop at \d\d:\d\d:\d\d, but OBS did not confirm it in 15 s\. I will not send it again, because a second stop can cut the file short\./);
+  assert.equal(r.text, 'I lost the connection to OBS right after I sent the stop. I will not send it again. I reconnect and read what OBS shows.');
   assert.ok(await until(() => take(w).rows.includes('T17')));
   assert.deepEqual(recordRequests(w.fake), ['StartRecord', 'StopRecord']);
   await done(w, s);
@@ -134,7 +134,7 @@ test('E9, E27: a start in a client with no elicitation: X2; then Start Recording
   const s = await server(w);
   assert.equal((await s.call('obs_record_start', { token: 'plain-token-1' })).text, TEXT.X2);
   w.fake.startInObs();
-  assert.ok(await until(() => s.logs.some((l) => /I check the file when it ends\. No expected sources: run obs_preflight to name them\.$/.test(l.data))));
+  assert.ok(await until(() => s.logs.some((l) => /I check the file when it ends\. No expected sources\. To name them, run obs_preflight \(in a later version\)\.$/.test(l.data))));
   assert.deepEqual(recordRequests(w.fake), []);
   await done(w, s);
 });
@@ -324,7 +324,7 @@ test('E25: two processes see one external take: one owner file; the other proces
   // The process that made the owner file first owns the take; the other gets X16 with no prompt.
   const ownerName = new Journal(w.dir, 'x').owner(take(w).id).client;
   const [owner, other] = ownerName === 'Claude Code' ? [a, b] : [b, a];
-  assert.equal((await other.call('obs_record_stop')).text.split('\n').at(-1), TEXT.X16(ownerName));
+  assert.equal((await other.call('obs_record_stop')).text.split('\n').at(-1), TEXT.X16(ownerName, true));
   assert.deepEqual(other.prompts, []);
   assert.match((await owner.call('obs_record_stop')).text.split('\n').at(-1), /^The recording stopped at /);
   assert.deepEqual(recordRequests(w.fake), ['StopRecord']);
@@ -345,8 +345,8 @@ test('E26: the server restarts while a prompt is open: the late answer to the ne
   await done(w, s2);
 });
 
-test('E27: an external take with no obs_preflight names no expected sources and points to obs_preflight', () => {
+test('E27, F-T7-22: an external take with no obs_preflight names no expected sources and points to obs_preflight of a later version', () => {
   const r = { at: Date.now(), duration: 1000, path: 'rec/a.mov' };
-  assert.match(TEXT.X15(r, []), /I check the file when it ends\. No expected sources: run obs_preflight to name them\.$/);
+  assert.match(TEXT.X15(r, []), /I check the file when it ends\. No expected sources\. To name them, run obs_preflight \(in a later version\)\.$/);
   assert.match(TEXT.X15(r, ['Mic', 'Guest audio']), /I watch Mic and Guest audio, and I check the file when it ends\.$/);
 });

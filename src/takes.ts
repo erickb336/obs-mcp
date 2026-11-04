@@ -6,7 +6,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { FencedError, Journal, type Source } from './journal.js';
 import { Obs, ObsError, type ObsEvent } from './obs.js';
-import { clock, fileName, hms, isOpen, journalReading, newTake, sameRecording, step, TEXT, type Input, type Limits, type Reading, type Step, type Take } from './take.js';
+import { clock, fileName, hms, isOpen, journalReading, newTake, sameRecording, stateLine, step, TEXT, type Input, type Limits, type Reading, type Step, type Take } from './take.js';
 
 /** The file check of a take: its result and one line for the reply. */
 export type Check = (path: string, sources: Source[]) => Promise<{ result: 'verified' | 'verified_with_warnings' | 'failed' | 'not_checked'; summary: string }>;
@@ -24,9 +24,14 @@ const STATES: Record<string, 'STARTED' | 'STOPPING' | 'STOPPED' | 'PAUSED' | 'RE
 export class Takes {
   /** The takes this process owns and follows. */
   private open = new Map<string, Open>();
-  private notices: string[] = [];
+  /** The notices that wait for the next tool reply. A keyed notice replaces the waiting one with the same key. */
+  private notices: { text: string; key?: string }[] = [];
   private ev = new Map<number, number>();
   private lastEventAt?: number;
+  /** The newest read of this process. */
+  private latest?: Reading;
+  /** Takes taken over at a server start whose restart row waits for a read of OBS, with the time of their last beat. */
+  private waiting = new Map<string, number>();
   private seq = 0;
   /** The last take that closed in this process, for obs_take_status. */
   last?: Take;
@@ -45,16 +50,25 @@ export class Takes {
 
   // ---- Notices (rule 6): a log notification now, and the same text at the top of the next tool reply, once.
 
-  notice(text: string, level: 'warning' | 'error' = 'warning') {
-    this.notices.push(text);
+  notice(text: string, level: 'warning' | 'error' = 'warning', key?: string) {
+    if (key) this.notices = this.notices.filter((n) => n.key !== key);
+    this.notices.push({ text, key });
     this.notify(level, text);
   }
 
-  /** The reply of a tool: the waiting notices first, then the lines, then the reminder of an open test take. */
+  /** The reply of a tool: the waiting notices first, then the lines. An open test take adds reminder W8 once (F-T7-21). */
   reply(...lines: string[]): string {
-    const out = [...this.notices.splice(0), ...lines];
-    for (const o of this.open.values()) if (o.take.kind === 'test' && isOpen(o.take) && o.reading) out.push(TEXT.W8(o.reading));
+    const waiting = this.notices.splice(0);
+    const out = [...waiting.map((n) => n.text), ...lines];
+    if (!waiting.some((n) => n.key === 'W8')) {
+      for (const o of this.open.values()) if (o.take.kind === 'test' && isOpen(o.take) && o.reading) out.push(TEXT.W8(this.newest(o.reading)));
+    }
     return out.join('\n');
+  }
+
+  /** The newer of a take's reading and the last read of this process, while OBS records (F-T7-19). */
+  private newest(r: Reading): Reading {
+    return this.latest?.active && this.latest.at > r.at ? this.latest : r;
   }
 
   // ---- Reads
@@ -72,6 +86,7 @@ export class Takes {
       bytes: Number(data.outputBytes) || 0,
     };
     if (r.active) r.path = await this.filePath(conn);
+    this.latest = r;
     return r;
   }
 
@@ -108,19 +123,19 @@ export class Takes {
     const changed = s.take !== o.take;
     o.take = s.take;
     if (changed) this.write(o);
-    if (s.notice) this.notice(this.noticeText(s.notice.id, o, input), s.notice.level);
+    if (s.notice?.id === 'X11') this.notice(TEXT.X11(o.take), s.notice.level);
+    if (s.notice?.id === 'X18') void this.x18(input);
     if (s.row === 'E10') this.notice('OBS already recorded when my start arrived. Your stop applied to that recording.');
     if (s.spawn) void this.openExternal(input.type === 'event' ? undefined : (input as { reading?: Reading }).reading);
-    if (o.take.state !== before) this.entered(o, before);
+    if (o.take.state !== before) this.entered(o);
     for (const w of this.waiters) w();
     return s;
   }
 
-  private noticeText(id: 'X11' | 'X15' | 'X18', o: Open, input: Input): string {
-    const r = (input as { reading?: Reading }).reading ?? o.reading;
-    if (id === 'X11') return TEXT.X11(o.take);
-    if (id === 'X18') return TEXT.X18(r ?? { at: Date.now(), duration: 0, path: o.take.paths[0] } as Reading);
-    return ''; // X15 is sent by openExternal, which knows the new take
+  /** X18 with the recording that runs now: an event has no reading, so it reads (F-T7-19). X15 comes from openExternal. */
+  private async x18(input: Input) {
+    const r = (input as { reading?: Reading }).reading ?? (await this.tryRead());
+    this.notice(TEXT.X18(r ?? { at: Date.now(), conn: 0, ev: 0, active: true, paused: false, duration: 0, bytes: 0 }));
   }
 
   private write(o: Open) {
@@ -138,38 +153,44 @@ export class Takes {
     this.open.delete(o.take.id);
   }
 
-  /** What a state starts: the timers of section 4, the watch and the file check. */
-  private entered(o: Open, before: string) {
+  private every(o: Open, ms: number, fn: () => void) {
+    const t = setInterval(fn, ms);
+    t.unref?.();
+    o.timers.push(t);
+  }
+
+  /** What a state starts: the beat, the timers of section 4, the watch and the file check. */
+  private entered(o: Open) {
     for (const t of o.timers) clearTimeout(t);
     o.timers = [];
     const L = this.limits;
-    const every = (ms: number, fn: () => void) => {
-      const t = setInterval(fn, ms);
-      t.unref?.();
-      o.timers.push(t);
-    };
     const once = (ms: number, fn: () => void) => {
       const t = setTimeout(fn, ms);
       t.unref?.();
       o.timers.push(t);
     };
     const s = o.take.state;
+    // The owner beats in every open state, so that no live take looks dead to another process (F-T7-4).
+    if (isOpen(o.take)) this.beating(o);
     if (s === 'start_uncertain' || s === 'stop_held') {
-      every(L.holdReadMs, () => void this.tick(o));
+      this.every(o, L.holdReadMs, () => void this.tick(o));
       once(L.holdMs, () => this.apply(o, { type: 'timeout', phase: 'hold', at: Date.now() }));
     }
-    if (s === 'stop_uncertain') every(L.stopReadMs, () => void this.tick(o));
+    if (s === 'stop_uncertain') this.every(o, L.stopReadMs, () => void this.tick(o));
     if (s === 'recording' || s === 'paused' || s === 'external') {
-      every(L.beatMs, () => void this.tick(o));
+      this.every(o, L.beatMs, () => void this.tick(o));
       if (o.take.kind === 'test') {
-        const remind = () => o.reading && this.notice(TEXT.W8(o.reading));
+        // The reminder reads OBS, so that it gives the time now (F-T7-19).
+        const remind = async () => {
+          const now = (await this.tryRead()) ?? o.reading;
+          if (this.open.get(o.take.id) === o && now?.active) this.notice(TEXT.W8(now), 'warning', 'W8');
+        };
         once(Math.max(0, (o.take.startedAt ?? Date.now()) + L.reminderFirstMs - Date.now()), () => {
-          remind();
-          every(L.reminderMs, remind);
+          void remind();
+          this.every(o, L.reminderMs, () => void remind());
         });
       }
     }
-    if (s === 'recording' || s === 'paused' || s === 'external' || s === 'stop_uncertain' || s === 'stop_held') every(L.beatMs, () => this.beat(o));
     if (s === 'checking') void this.runCheck(o);
     if (s === 'closed') {
       this.open.delete(o.take.id);
@@ -177,21 +198,29 @@ export class Takes {
       this.journal.prune();
       if (!this.open.size) this.obs.keepConnected(false);
     }
-    void before;
   }
 
-  private beat(o: Open) {
-    try {
-      this.journal.beat(o.take.id);
-    } catch (e) {
-      if (e instanceof FencedError) this.release(o);
-    }
+  /** A beat now, and one each beatMs (P13). */
+  private beating(o: Open) {
+    const beat = () => {
+      try {
+        this.journal.beat(o.take.id);
+      } catch (e) {
+        if (e instanceof FencedError) this.release(o);
+      }
+    };
+    beat();
+    this.every(o, this.limits.beatMs, beat);
   }
 
-  /** One watch read. After a reconnect, the same-recording test runs against the journal (T24). */
+  /** One watch read. */
   private async tick(o: Open) {
     const r = await this.tryRead();
-    if (!r || this.ended || !this.open.has(o.take.id)) return;
+    if (r && !this.ended && this.open.get(o.take.id) === o) this.observe(o, r);
+  }
+
+  /** A read on a take. After a reconnect, the same-recording test runs against the journal (T24). */
+  private observe(o: Open, r: Reading) {
     const s = o.take.state;
     let same: boolean | undefined;
     if (s === 'stop_uncertain' && r.active && o.reading) same = sameRecording(o.reading, r, o.take.paths);
@@ -207,8 +236,9 @@ export class Takes {
     let out: Awaited<ReturnType<Check>>;
     try {
       out = path ? await this.check(path, o.sources) : { result: 'not_checked', summary: 'The file path is not known, so I did not check a file.' };
-    } catch (e) {
-      out = { result: 'not_checked', summary: `The file check did not run: ${(e as Error).message}` };
+    } catch {
+      // The reason can name the folder; obs_verify_file gives it in full (F-T7-25).
+      out = { result: 'not_checked', summary: `I could not check the file ${fileName(path)}. obs_verify_file with this file name gives the reason.` };
     }
     if (this.open.get(o.take.id) === o) this.apply(o, { type: 'checked', ...out });
   }
@@ -216,9 +246,16 @@ export class Takes {
   // ---- OBS events
 
   private onEvent(e: ObsEvent) {
+    if (e.type === 'opened') {
+      // A connection is up: the waiting restart rows run (F-T7-3), and each take reads at once, so that the offline
+      // mark ends with the reconnect (F-T7-16).
+      void this.restartWaiting();
+      for (const o of this.open.values()) if (!this.waiting.has(o.take.id)) void this.tick(o);
+      return;
+    }
     if (e.type === 'closed') {
       for (const o of this.open.values()) {
-        const s = this.apply(o, { type: 'disconnect' });
+        const s = this.apply(o, { type: 'disconnect', at: Date.now() });
         if (s.row === 'O1' && (o.take.state === 'recording' || o.take.state === 'paused')) {
           const t = setTimeout(() => !this.obs.connected && this.apply(o, { type: 'timeout', phase: 'gone', at: Date.now() }), this.limits.goneMs);
           t.unref?.();
@@ -244,16 +281,31 @@ export class Takes {
       this.lastEventAt = at;
     }
     const path = typeof e.data.outputPath === 'string' ? e.data.outputPath : undefined;
-    if (state === 'STARTED' && !this.anyOpen()) {
+    if (state === 'STARTED' && !this.open.size) {
       void this.openExternal(undefined);
       return;
     }
     for (const o of [...this.open.values()]) this.apply(o, { type: 'event', state, at, path });
   }
 
-  /** An open take in the journal, from any process. Then a STARTED is not a new external take. */
-  private anyOpen(): boolean {
-    return this.open.size > 0 || this.journal.openTakes().length > 0;
+  /**
+   * A take of another process whose owner stopped beating (P16), and that is not the recording OBS shows now: it holds
+   * nothing, so it does not block a start or a new take, and the tools do not show it (F-T7-2). A process of its own
+   * client can still take it over (Q1).
+   */
+  private stale(id: string, take: Take, r: Reading): boolean {
+    if (this.journal.beatAge(id) <= this.limits.staleMs) return false;
+    if (!r.active) return true;
+    const a = journalReading(take);
+    return !!a && !sameRecording(a, r, take.paths);
+  }
+
+  /** The open takes of other processes. With the read r, a stale take does not count. */
+  private others(r?: Reading): { take: Take; client: string }[] {
+    return this.journal.openTakes().flatMap((id) => {
+      const l = this.open.has(id) ? undefined : this.journal.load(id);
+      return l && !(r && this.stale(id, l.take, r)) ? [{ take: l.take, client: l.meta.client }] : [];
+    });
   }
 
   /** T22 and the spawn rows: open an external take, watched at once (F13), with the expected sources of the last preflight (E27). */
@@ -261,6 +313,7 @@ export class Takes {
     const r = given?.active ? given : await this.tryRead();
     if (!r?.active || this.ended) return;
     if ([...this.open.values()].some((o) => isOpen(o.take) && o.take.state !== 'checking' && o.take.state !== 'stopping' && o.take.state !== 'stop_uncertain')) return;
+    if (this.others(r).length) return; // another process follows this recording
     // E25: the id comes from the file path, so every process finds one take, and the first owner file wins.
     const id = sha(`external:${r.path ?? Math.round((r.at - r.duration) / 10000)}`).slice(0, 16);
     if (this.open.has(id) || this.journal.load(id)) return;
@@ -273,7 +326,7 @@ export class Takes {
     this.open.set(id, o);
     this.obs.keepConnected(true);
     this.notice(TEXT.X15(r, o.sources.map((s) => s.name)));
-    this.entered(o, 'idle');
+    this.entered(o);
   }
 
   /** E27: the expected sources of the last obs_preflight of this process. obs_preflight (T8a) sets them; none until then. */
@@ -283,28 +336,43 @@ export class Takes {
 
   /**
    * Takes over the open takes of the same client whose owner stopped beating (Q1), then applies R1 to R8 to each
-   * owned take. It runs once, when the client name is known. Sends no recording request.
+   * owned take when OBS answers. Sends no recording request.
    */
   async resume() {
-    const ids = this.journal.openTakes().filter((id) => !this.open.has(id) && this.journal.takeOver(id, this.limits.staleMs) && this.journal.isOwner(id));
-    if (!ids.length || this.ended) return;
-    this.obs.keepConnected(true);
-    const r = await this.tryRead();
-    if (this.ended) return;
-    for (const id of ids) {
-      if (this.open.has(id)) continue;
-      const l = this.journal.load(id)!;
+    for (const id of this.journal.openTakes()) {
+      if (this.open.has(id) || this.ended) continue;
+      // The start of the watch gap: the old owner's beat, read before the takeover makes a new owner file (F-T7-19).
+      const lastBeat = Date.now() - this.journal.beatAge(id);
+      if (!this.journal.takeOver(id, this.limits.staleMs) || !this.journal.isOwner(id)) continue;
+      const l = this.journal.load(id);
+      if (!l) continue;
       const o: Open = { take: l.take, client: l.meta.client, sources: l.sources, timers: [], tokenHash: l.recs.findLast((x) => x.t === 'intent' && x.what === 'start')?.token as string | undefined };
       this.open.set(id, o);
-      if (!r) continue; // OBS unreachable: the restart rows run at the first read after a reconnect
+      this.waiting.set(id, lastBeat);
+      this.beating(o); // the new owner beats while it waits for OBS
+    }
+    if (!this.waiting.size || this.ended) return;
+    this.obs.keepConnected(true);
+    await this.restartWaiting();
+  }
+
+  /** The restart rows of the waiting takes, after one read. With OBS unreachable, they run when a connection opens (F-T7-3). */
+  private async restartWaiting() {
+    if (!this.waiting.size) return;
+    const r = await this.tryRead();
+    if (!r || this.ended) return;
+    for (const [id, lastBeat] of [...this.waiting]) {
+      this.waiting.delete(id);
+      const o = this.open.get(id);
+      if (!o) continue;
       const a = journalReading(o.take);
       const same = r.active && a ? sameRecording(a, r, o.take.paths) : false;
-      const lastBeat = Date.now() - this.journal.beatAge(id);
+      const before = o.take.state;
       const s = this.apply(o, { type: 'restart', reading: r, same, at: Date.now() });
       if (s.row === 'R1') this.notice(TEXT.X15(r, o.sources.map((x) => x.name)));
       if (s.row === 'R3') this.notice(`OBS still records the take that I started (${hms(r.duration)}, file ${fileName(o.take.paths.at(-1))}). The watch had a gap from ${clock(lastBeat)} to ${clock(Date.now())}.`);
-      if (s.row === 'R3' && o.take.kind === 'test') this.notice(TEXT.W8(r));
-      if (s.row === 'R3' || s.row === 'R6' || s.row === 'R7' || s.row === 'R8') this.entered(o, '');
+      if (s.row === 'R3' && o.take.kind === 'test') this.notice(TEXT.W8(r), 'warning', 'W8');
+      if (o.take.state === before) this.entered(o); // R3, R7 and R8 keep the state: the watch or the check starts again
     }
   }
 
@@ -312,17 +380,16 @@ export class Takes {
 
   /**
    * The take that a tool is about: one this process owns, or an open take of another process (read only). A take of
-   * the same client whose owner stopped beating is taken over first (Q1).
+   * the same client whose owner stopped beating is taken over first (Q1). With the read r, a stale take of another
+   * process does not count (F-T7-2).
    */
-  async current(): Promise<{ take: Take; owner: boolean; client: string } | undefined> {
+  async current(r?: Reading): Promise<{ take: Take; owner: boolean; client: string } | undefined> {
     await this.resume();
     const mine = [...this.open.values()].filter((o) => isOpen(o.take));
     const pick = mine.find((o) => o.take.state !== 'checking') ?? mine[0];
     if (pick) return { take: pick.take, owner: true, client: pick.client };
-    const id = this.journal.openTakes()[0];
-    if (!id) return undefined;
-    const l = this.journal.load(id)!;
-    return { take: l.take, owner: false, client: l.meta.client };
+    const other = this.others(r)[0];
+    return other && { take: other.take, owner: false, client: other.client };
   }
 
   byToken(token: string): Take | undefined {
@@ -331,13 +398,18 @@ export class Takes {
   }
 
   lastReading(id?: string) {
-    return id ? this.open.get(id)?.reading : undefined;
+    const r = id ? this.open.get(id)?.reading : undefined;
+    return r && this.newest(r);
   }
 
-  /** P14 and T1 before a start: refuse (X6, X7) or allow. */
-  async checkStart(r: Reading): Promise<'X6' | 'X7' | undefined> {
-    const cur = (await this.current())?.take ?? newTake('none', 'normal', 'idle');
-    return step(cur, { type: 'start', at: Date.now(), reading: r, lastEventAt: this.lastEventAt }).refuse;
+  /** P14 and T1 before a start: the refusal text, or undefined to allow (X6, X6b, X7; F-T7-15). */
+  async refusal(r: Reading): Promise<string | undefined> {
+    const cur = (await this.current(r))?.take ?? newTake('none', 'normal', 'idle');
+    const refuse = step(cur, { type: 'start', at: Date.now(), reading: r, lastEventAt: this.lastEventAt }).refuse;
+    if (!refuse) return undefined;
+    if (refuse === 'X7') return TEXT.X7;
+    if (r.active) return TEXT.X6(r, isOpen(cur) && cur.kind !== 'external');
+    return isOpen(cur) ? `${stateLine(cur, r, Date.now())} I did not send a start.` : TEXT.X6b;
   }
 
   /**
@@ -345,13 +417,18 @@ export class Takes {
    * of the read, and wait up to 5 s for STARTED (P3). Returns the take, or a refusal text when nothing was sent.
    */
   async start(token: string, kind: 'normal' | 'test', consentId: string, r: Reading): Promise<{ take?: Take; text?: string }> {
-    const refuse = await this.checkStart(r);
-    if (refuse) return { text: refuse === 'X7' ? TEXT.X7 : TEXT.X6(r) };
+    const refused = await this.refusal(r);
+    if (refused) return { text: refused };
     if (r.conn !== this.obs.connection || !this.obs.connected) return { text: 'The connection to OBS changed after your answer, so I did not send the start. Ask me again to start it.' };
     const id = randomBytes(8).toString('hex');
     const o: Open = { take: newTake(id, kind), client: this.journal.me.client, sources: this.lastSources, tokenHash: sha(token), timers: [], reading: r };
+    // The last claim is busy while its take is open and alive, or for 2 s while its take file is not there yet.
+    const busy = (prev: string | undefined, age: number) => {
+      const l = prev ? this.journal.load(prev) : undefined;
+      return l ? isOpen(l.take) && !this.stale(prev!, l.take, r) : age < this.limits.raceMs;
+    };
     try {
-      if (!this.journal.claim()) return { text: (await this.tryRead())?.active ? TEXT.X6(r) : TEXT.X7 };
+      if (!this.journal.claim(id, busy)) return { text: TEXT.X7b };
       this.journal.own(id, 1);
       this.journal.append(id, { t: 'open', v: 1, id, kind, client: o.client, pid: process.pid, obs: this.obs.version?.obsVersion, ws: this.obs.version?.obsWebSocketVersion });
       if (o.sources.length) this.journal.append(id, { t: 'expect', sources: o.sources });
@@ -360,7 +437,7 @@ export class Takes {
       this.apply(o, { type: 'start', at: Date.now(), reading: r });
       this.journal.append(id, { t: 'sent', request: 'StartRecord', seq: ++this.seq, conn: r.conn, at: Date.now() });
     } catch (e) {
-      this.open.delete(id);
+      this.release(o);
       if (e instanceof FencedError || (e as { code?: string }).code || /journal/.test(String((e as Error).message))) return { text: 'I could not save the take record, so I did not send the start.' };
       throw e;
     }
@@ -401,6 +478,8 @@ export class Takes {
         // A fenced or full journal does not change what OBS did.
       }
     };
+    // An OBS code goes to the state machine. No reply in callMs on a live connection is a timeout (T3, T16), not a
+    // drop, so that no text says "I lost the connection" then.
     this.obs.callOn(conn, request).then(
       () => record(100),
       (e) => {
@@ -408,7 +487,7 @@ export class Takes {
         if (code !== undefined && code >= 200 && code < 1000) {
           record(code);
           this.apply(o, { type: 'reply', request, code, at: Date.now() });
-        } else if (o.take.state === state) this.apply(o, { type: 'disconnect' });
+        } else if (o.take.state === state) this.apply(o, code === undefined && this.obs.connected ? { type: 'timeout', phase, at: Date.now() } : { type: 'disconnect', at: Date.now() });
       },
     );
     const seen = await this.until(() => o.take.state !== state, ms, () => o.take);
@@ -433,8 +512,8 @@ export class Takes {
   }
 
   /** Opens an external take for a recording that runs now with no take (T22 at a tool call). */
-  async adopt(r: Reading) {
-    if (!this.anyOpen()) await this.openExternal(r);
+  adopt(r: Reading) {
+    return this.openExternal(r);
   }
 
   /** O2: the client closed input. Nothing is sent; the journal keeps each take. A read still in flight changes nothing after this. */

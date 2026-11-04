@@ -122,8 +122,8 @@ export type Version = {
   platformDescription: string;
 };
 
-/** An OBS event, or the close of a connection, with the number of the connection that carried it. */
-export type ObsEvent = { type: 'RecordStateChanged' | 'RecordFileChanged' | 'ExitStarted' | 'closed'; data: Record<string, unknown>; conn: number };
+/** An OBS event, or the open or close of a connection, with the number of the connection that carried it. */
+export type ObsEvent = { type: 'RecordStateChanged' | 'RecordFileChanged' | 'ExitStarted' | 'opened' | 'closed'; data: Record<string, unknown>; conn: number };
 const EVENTS = ['RecordStateChanged', 'RecordFileChanged', 'ExitStarted'] as const;
 
 /** Reconnect waits (P8): 0.5, 1, 2, 4 and 8 s, then each 10 s. */
@@ -154,7 +154,7 @@ export class Obs {
     return !!this.ws;
   }
 
-  /** Gets each record event, ExitStarted, and the close of each connection. Returns the call that stops it. */
+  /** Gets each record event, ExitStarted, and the open and close of each connection. Returns the call that stops it. */
   onEvent(fn: (e: ObsEvent) => void) {
     this.listeners.add(fn);
     return () => this.listeners.delete(fn);
@@ -232,6 +232,7 @@ export class Obs {
     });
     this.ws = ws;
     if (this.retry) this.retry.step = 0;
+    this.emit({ type: 'opened', data: {}, conn });
     return this.version;
   }
 

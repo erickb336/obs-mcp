@@ -14,9 +14,9 @@ const folder = () => join(mkdtempSync(join(tmpdir(), 'obs-mcp-journal-')), 'take
 const RACE = fileURLToPath(new URL('./journal-race.mjs', import.meta.url));
 const run = (args) => new Promise((resolve, reject) => execFile(process.execPath, [RACE, ...args], (e, out) => (e ? reject(e) : resolve(JSON.parse(out)))));
 
-test('T7 unit 4, F8: two real processes on one journal folder: exactly one wins each start claim and each owner file', async () => {
+test('T7 unit 4, F8, F-T7-11, F-T7-13: two real processes on one journal folder: exactly one wins each start and each owner file', async () => {
   const dir = folder();
-  new Journal(dir, 'race').claim(0); // makes the folder
+  new Journal(dir, 'race').own('setup', 1); // makes the folder
   const go = String(Date.now() + 600);
   const [a, b] = await Promise.all([run([dir, go, '200']), run([dir, go, '200'])]);
   const all = (key) => [...a[key], ...b[key]].sort((x, y) => x - y);
@@ -105,8 +105,8 @@ test('G28: pruning keeps open takes, removes closed takes past 30 days or past 1
   make('open1', 'recording', now - 40 * 864e5);
   make('old', 'closed', now - 31 * 864e5);
   for (let i = 0; i < 102; i++) make(`c${i}`, 'closed', now - i * 1000);
-  j.claim(1);
-  j.claim(2);
+  j.claim('c1', () => false);
+  j.claim('c2', () => false);
   utimesSync(join(dir, 'start-1.claim'), new Date(now - 40 * 864e5), new Date(now - 40 * 864e5));
   j.prune(now);
   const ids = new Set(readdirSync(dir).map((f) => /^take-([\w-]+)\./.exec(f)?.[1]).filter(Boolean));

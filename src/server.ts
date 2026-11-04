@@ -69,12 +69,17 @@ export function createApp(o: { target?: () => ReturnType<typeof connectionTarget
   const limits = o.limits ?? LIMITS;
   const obs = new Obs(target, limits);
   const journal = new Journal(o.dir ?? stateDir(env), 'unknown client');
+  journal.prune(); // G28 at the server start (F-T7-7)
   const folder = () => recordingFolder(obs, env);
+  // The closed line (F-T7-25): the length of the file, and the expected sources with sound, or the count of checks.
   const check: Check = async (path, sources) => {
     const file = resolveInFolder(await folder(), path);
     const v = await verifyFile(file.path, file.name, sources.map(({ name, kind, track, backup }) => ({ name, kind, track, backup }) as Expected), env);
+    const length = 'duration' in v && typeof v.duration === 'string' ? `${v.duration.slice(0, 8)}, ` : '';
+    const heard = v.claims.filter((c) => /^Source /.test(c.claim) && (c.verdict === 'pass' || c.verdict === 'warn')).length;
     const passed = v.claims.filter((c) => c.verdict === 'pass').length;
-    return { result: v.state, summary: visible(`${passed} of ${v.claims.length} checks passed for ${file.name}. obs_verify_file gives each one.`) };
+    const what = sources.length ? `${heard} of ${sources.length} expected sources had sound in the file.` : `${passed} of ${v.claims.length} file checks passed. No expected sources were named.`;
+    return { result: v.state, summary: `${length}${what}` };
   };
   const takes = new Takes(obs, journal, limits, check);
   const servers = new Set<McpServer>();
@@ -195,18 +200,18 @@ export function createServer(app: App) {
       client(ctx);
       try {
         const same = takes.byToken(token);
-        if (same) return say(line(same)); // O3
+        if (same) return say(line(same, await takes.read().catch(() => undefined))); // O3, with the time now (F-T7-19)
         // G26: refuse. The read opens the connection, so that the server sees your start in OBS (E9, T22).
         if (!canAsk(server, ctx)) return (await takes.read().catch(() => undefined), say(TEXT.X2));
         const a = answerOf(ctx);
         const r = await takes.read(); // rule 4: before the prompt, and again after the answer
         if (a.action === 'none') {
-          const refuse = await takes.checkStart(r);
-          if (refuse) return say(refuse === 'X7' ? TEXT.X7 : TEXT.X6(r));
-          const sources = takes.lastSources.map((s) => `${s.name} (track ${s.track})`).join(', ') || 'none named (run obs_preflight to name them)';
+          const refused = await takes.refusal(r);
+          if (refused) return say(refused);
+          const sources = takes.lastSources.map((s) => `${s.name} (track ${s.track})`);
           const scene = await obs.call('GetCurrentProgramScene').then((x) => String(x.sceneName ?? x.currentProgramSceneName ?? 'unknown'), () => 'unknown');
           const dir = await app.folder().catch(() => 'the OBS recording folder');
-          return consents.ask(test ? TEXT.W2() : TEXT.W1(visible(scene), visible(sources), visible(dir)), { kind: 'start', token, test: !!test });
+          return consents.ask(test ? TEXT.W2() : TEXT.W1(scene, sources, dir), { kind: 'start', token, test: !!test });
         }
         const v = a.action === 'accept' ? consents.use(a.id) : (consents.drop(a.id), undefined);
         if (a.action !== 'accept') return say('You declined. I did not start a recording.');
@@ -221,21 +226,21 @@ export function createServer(app: App) {
   server.registerTool(
     'obs_record_stop',
     {
-      description: 'Stop the OBS recording after the user confirms in a dialog. Only the client that started it can stop it. Then the file check runs.',
+      description: 'Stop the OBS recording after the user confirms in a dialog. Only the client that started it, or first saw it, can stop it. Then the file check runs.',
       inputSchema: z.object({}),
       annotations: RECORDS,
     },
     async (_args, ctx) => {
       client(ctx);
       try {
-        let cur = await takes.current();
         const r = await takes.read(); // read A before the prompt; read B after the answer (rule 4)
+        let cur = await takes.current(r);
         if (!cur && r.active) {
           await takes.adopt(r);
-          cur = await takes.current();
+          cur = await takes.current(r);
         }
         if (!cur) return say(line(undefined));
-        if (!cur.owner) return say(TEXT.X16(cur.client)); // O6, G29
+        if (!cur.owner) return say(TEXT.X16(cur.client, cur.take.kind === 'external')); // O6, G29
         const t = cur.take;
         if (t.state === 'stopping' || t.state === 'stop_uncertain') return say(line(t, r)); // O7
         if (!canAsk(server, ctx)) return say(TEXT.X1); // G25
@@ -252,7 +257,9 @@ export function createServer(app: App) {
           return say(TEXT.X4(r));
         }
         const v = consents.use(a.id);
-        if (!v || v.kind !== 'stop' || v.id !== t.id) return say(TEXT.X17(r)); // F3, E15, E26
+        if (!v || v.kind !== 'stop') return say(TEXT.X17(r)); // F3, E15, E26
+        // F-T7-14: the take changed while you decided (a stop and a new start in OBS): ask about the recording now (W6).
+        if (v.id !== t.id) return r.active ? consents.ask(TEXT.W6(r), { kind: 'stop', id: t.id, reading: r }) : say(line(t, r));
         const now = (await takes.current())?.take ?? t;
         if (now.state === 'stopping' || now.state === 'stop_uncertain') return say(line(now, r)); // rule 5: another accept won
         const same = starting ? r.active : sameRecording(v.reading, r, t.paths);
@@ -276,10 +283,10 @@ export function createServer(app: App) {
     async (_args, ctx) => {
       client(ctx);
       const r = await takes.read().catch(() => undefined);
-      let cur = await takes.current();
+      let cur = await takes.current(r);
       if (!cur && r?.active) {
         await takes.adopt(r);
-        cur = await takes.current();
+        cur = await takes.current(r);
       }
       const t = cur?.take ?? takes.last ?? app.journal.latest();
       return say(line(t, r?.active || !t ? r : undefined));

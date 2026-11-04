@@ -3,13 +3,14 @@
 // machine. The writer takes typed records with an allow-list of fields, so no free object, request parameter or OBS
 // settings reply can reach the disk.
 import { randomBytes } from 'node:crypto';
-import { closeSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, writeSync, chmodSync } from 'node:fs';
+import { chmodSync, closeSync, fsyncSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import { isOpen, newTake, type Take } from './take.js';
 
 export const RETENTION = { days: 30, takes: 100 }; // G28
 const MAX_LINE = 4096;
 const MAX_LINES = 1000;
+const CLAIM = /^start-(\d+)\.claim$/;
 
 /** The fields that each record type may hold. Every value must be a string, a number, a boolean, or a list of those. */
 const FIELDS: Record<string, string[]> = {
@@ -19,7 +20,7 @@ const FIELDS: Record<string, string[]> = {
   sent: ['request', 'seq', 'conn', 'at'],
   reply: ['request', 'code', 'at'],
   event: ['state', 'at', 'path'],
-  state: ['state', 'row', 'kind', 'result', 'marks', 'intentAt', 'startedAt', 'startBytes', 'paths', 'pausedAt', 'stopAt', 'endedAt', 'heldUntil', 'stopSeen', 'summary', 'at'],
+  state: ['state', 'row', 'kind', 'result', 'marks', 'intentAt', 'startedAt', 'startBytes', 'paths', 'offlineAt', 'pausedAt', 'stopAt', 'endedAt', 'heldUntil', 'stopSeen', 'summary', 'at'],
   dropped: ['count'],
 };
 const SOURCE_FIELDS = ['uuid', 'name', 'kind', 'track', 'backup'];
@@ -66,24 +67,48 @@ export class Journal {
 
   private file = (id: string, ext: string) => join(this.dir, `take-${id}.${ext}`);
 
-  /** Creates a file only when it does not exist (flag wx): of two processes, exactly one wins. */
+  /**
+   * Creates a file only when it does not exist: of two processes, exactly one wins. The body goes to a temp file
+   * first, then a hard link gives it its name (the link fails if the name exists), so a reader never sees it empty.
+   */
   private create(path: string, body: string): boolean {
     this.ensure();
+    const tmp = `${path}.${this.me.token.slice(0, 8)}.tmp`;
+    const fd = openSync(tmp, 'w', 0o600);
     try {
-      const fd = openSync(path, 'wx', 0o600);
       writeSync(fd, body);
       fsyncSync(fd);
+    } finally {
       closeSync(fd);
+    }
+    try {
+      linkSync(tmp, path);
       return true;
     } catch (e) {
       if ((e as { code?: string }).code === 'EEXIST') return false;
       throw e;
+    } finally {
+      rmSync(tmp, { force: true });
     }
   }
 
-  /** The start claim n (section 6). A failed create means that another process won this start. */
-  claim(n = this.highest(/^start-(\d+)\.claim$/) + 1): boolean {
-    return this.create(join(this.dir, `start-${n}.claim`), JSON.stringify({ pid: this.me.pid, at: Date.now() }));
+  /**
+   * The start claim for take id (section 6, F-T7-13): claim n + 1 after the highest claim n. busy gets the take id and
+   * the age of claim n; while claim n is busy, no process can claim. Of two processes that both find claim n free,
+   * the exclusive create lets one win. So two starts at the same moment send one StartRecord.
+   */
+  claim(id: string, busy: (prev: string | undefined, ageMs: number) => boolean): boolean {
+    const n = this.highest(CLAIM);
+    if (n) {
+      let prev: { id?: string; at?: number } = {};
+      try {
+        prev = JSON.parse(readFileSync(join(this.dir, `start-${n}.claim`), 'utf8'));
+      } catch {
+        // A claim from before this format, or a damaged one: it holds no take.
+      }
+      if (busy(typeof prev.id === 'string' ? prev.id : undefined, Date.now() - (Number(prev.at) || 0))) return false;
+    }
+    return this.create(join(this.dir, `start-${n + 1}.claim`), JSON.stringify({ pid: this.me.pid, id, at: Date.now() }));
   }
 
   private highest(re: RegExp): number {
@@ -193,8 +218,8 @@ export class Journal {
   /** Writes the state of a take after a step: the fold of the file is its last state line. */
   state(id: string, t: Take, at = Date.now()) {
     if (t.state === 'closed' && this.dropped.get(id)) this.append(id, { t: 'dropped', count: this.dropped.get(id) });
-    const { state, row, kind, result, marks, intentAt, startedAt, startBytes, paths, pausedAt, stopAt, endedAt, heldUntil, stopSeen, summary } = t;
-    this.append(id, { t: 'state', state, row, kind, result, marks, intentAt, startedAt, startBytes, paths, pausedAt, stopAt, endedAt, heldUntil, stopSeen, summary, at });
+    const { id: _id, ...fields } = t;
+    this.append(id, { t: 'state', ...fields, at });
   }
 
   /** The records of a take. A damaged line (a crash during a write) is skipped. */
@@ -234,19 +259,19 @@ export class Journal {
       .filter((id): id is string => !!id && !!this.load(id) && isOpen(this.load(id)!.take));
   }
 
-  /** The take whose last state line is the newest, for a status in a new process. */
+  /** The closed take whose last state line is the newest, for a status in a new process. An open take is current(). */
   latest(): Take | undefined {
     let best: { at: number; take: Take } | undefined;
     for (const f of this.list()) {
       const id = /^take-([\w-]+)\.jsonl$/.exec(f)?.[1];
       const l = id ? this.load(id) : undefined;
       const at = Number(l?.recs.findLast((r) => r.t === 'state')?.at ?? 0);
-      if (l && (!best || at > best.at)) best = { at, take: l.take };
+      if (l && !isOpen(l.take) && (!best || at > best.at)) best = { at, take: l.take };
     }
     return best?.take;
   }
 
-  /** G28: removes closed takes older than 30 days, and the oldest closed takes past 100, with their files; and old claims. */
+  /** G28: removes closed takes older than 30 days, and the oldest closed takes past 100, with their files; old claims, and temp files a crash left. */
   prune(now = Date.now()) {
     const old = now - RETENTION.days * 864e5;
     const closed = this.list()
@@ -257,11 +282,18 @@ export class Journal {
       .map((x) => ({ id: x.id, at: Number(x.l!.recs.findLast((r) => r.t === 'state')?.at ?? 0) }))
       .sort((a, b) => b.at - a.at);
     const gone = new Set(closed.filter((x, i) => i >= RETENTION.takes || x.at < old).map((x) => x.id));
-    const top = this.highest(/^start-(\d+)\.claim$/);
+    const top = this.highest(CLAIM);
+    const mtime = (f: string) => {
+      try {
+        return statSync(join(this.dir, f)).mtimeMs;
+      } catch {
+        return now;
+      }
+    };
     for (const f of this.list()) {
       const id = /^take-([\w-]+)\./.exec(f)?.[1];
-      const claim = /^start-(\d+)\.claim$/.exec(f);
-      const stale = claim && Number(claim[1]) !== top && statSync(join(this.dir, f)).mtimeMs < old;
+      const claim = CLAIM.exec(f);
+      const stale = (claim && Number(claim[1]) !== top && mtime(f) < old) || (f.endsWith('.tmp') && mtime(f) < now - 864e5);
       if ((id && gone.has(id)) || stale) rmSync(join(this.dir, f), { force: true });
     }
   }

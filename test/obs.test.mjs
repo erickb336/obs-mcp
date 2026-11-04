@@ -42,7 +42,7 @@ test('F-T12-30: after OBS closes the connection, the next call opens a new one',
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
-test('T7 unit 2: a drop and a reconnect raise the connection number by 1, each read and event carries its number, and the reconnect sends no request', async () => {
+test('T7 unit 2: a drop and a reconnect raise the connection number by 1, each read and event carries its number, and the reconnect sends no request; each open is an event too (F-T7-3)', async () => {
   const fake = await startFakeObs({ recording: true });
   const obs = new Obs(() => connectionTarget(obsConfigDir(null), testEnv('', fake.port)), { ...LIMITS, reconnectMs: [50, 100] });
   const events = [];
@@ -66,7 +66,7 @@ test('T7 unit 2: a drop and a reconnect raise the connection number by 1, each r
   assert.deepEqual([b.conn, b.data.outputActive], [2, false]);
   fake.startInObs();
   await wait(350);
-  assert.deepEqual(events, ['closed #1', 'RecordStateChanged STARTING #2', 'RecordStateChanged STARTED #2']);
+  assert.deepEqual(events, ['opened #1', 'closed #1', 'opened #2', 'RecordStateChanged STARTING #2', 'RecordStateChanged STARTED #2']);
   assert.deepEqual(fake.log, ['GetVersion', 'GetRecordStatus']);
   await obs.close();
   await fake.close();

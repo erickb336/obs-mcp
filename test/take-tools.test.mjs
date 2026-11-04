@@ -19,14 +19,15 @@ for (const era of ['legacy', 'modern']) {
       const s = await server(w, { era, elicit: accept });
       const started = await s.call('obs_record_start', { token: 'take-token-1' });
       assert.match(started.text, /^Recording for 00:00:0\d \(OBS confirmed it\)\. File: \d{4}-\d\d-\d\d \d\d-\d\d-\d\d 1\.mov\.$/);
-      assert.match(s.prompts[0], /^Start recording in OBS\? Scene: .*\. Expected sources: none named \(run obs_preflight to name them\)\. The file goes to .*\. Everyone in the recording should know about it and agree\. Accept to start\. Decline to cancel\.$/);
+      assert.match(s.prompts[0], /^Start recording in OBS\? Scene: .*\. Expected sources: none\. To name them, run obs_preflight \(in a later version\)\. The file goes to .*\. Everyone in the recording should know about it and agree\. Accept to start\. Decline to cancel\.$/);
       assert.match(await status(s), /^Recording for /);
       const stopped = await s.call('obs_record_stop');
       assert.match(s.prompts[1], /^Stop the OBS recording\? It has run 00:00:0\d\. File: .* 1\.mov\. OBS then finishes the file\./);
       assert.match(stopped.text, /^The recording stopped at \d\d:\d\d:\d\d \(OBS confirmed it\)\. I am checking the file .* 1\.mov\.$/);
       assert.ok(await until(async () => /^Take closed: /.test(await status(s))));
-      // The fake writes no media file, so the check cannot read one: not_checked, with the reason.
-      assert.match(await status(s), /^Take closed: not_checked\. The file check did not run: /);
+      // The fake writes no media file, so the check cannot read one: not_checked, with the file name only (F-T7-25).
+      assert.match(await status(s), /^Take closed: not_checked\. I could not check the file \d{4}-\d\d-\d\d \d\d-\d\d-\d\d 1\.mov\. obs_verify_file with this file name gives the reason\.$/);
+      assert.equal((await status(s)).includes(w.rec), false, 'no folder path');
       assert.deepEqual(recordRequests(w.fake), ['StartRecord', 'StopRecord']);
       await s.kill();
       await w.fake.close();
@@ -83,17 +84,21 @@ test('O6, G29: a stop from another client gets X16 with no prompt, and nothing i
   await w.fake.close();
 });
 
-test('F2, O4: a test take sends reminder W8 on the notice channel, and each tool reply repeats it; nothing stops it', async () => {
+test('F2, O4, F-T7-21: a test take sends reminder W8 on the notice channel, and each tool reply holds it once; nothing stops it', async () => {
   const w = await world();
   const s = await server(w, { elicit: accept });
   await s.call('obs_record_start', { token: 'test-token-1', test: true });
   assert.match(s.prompts[0], /^Start a test recording in OBS\?/);
   assert.ok(await until(() => s.logs.length >= 2, 2000), 'a reminder at 300 ms, then each 500 ms');
   assert.deepEqual(s.logs.slice(0, 2).map((l) => [l.level, l.data.slice(0, 31)]), [['warning', 'A test recording still runs (00'], ['warning', 'A test recording still runs (00']]);
+  const w8 = (lines) => lines.filter((l) => /^A test recording still runs/.test(l)).length;
   const r = (await s.call('obs_take_status')).text.split('\n');
-  assert.match(r[0], /^A test recording still runs/, 'the notice comes first, once');
-  assert.match(r.at(-1), /^A test recording still runs/, 'the reply repeats the reminder');
+  assert.match(r[0], /^A test recording still runs/, 'the waiting notice comes first');
+  assert.equal(w8(r), 1, `one reminder in the reply, after ${s.logs.length} notices:\n${r.join('\n')}`);
   assert.ok(r.some((l) => /This is a test recording\. obs-mcp does not stop it by itself\./.test(l)));
+  const next = (await s.call('obs_take_status')).text.split('\n');
+  assert.equal(w8(next), 1, 'a reply with no waiting notice repeats the reminder once');
+  assert.match(next.at(-1), /^A test recording still runs/);
   await wait(400);
   assert.equal(w.fake.state.recording, true);
   assert.deepEqual(recordRequests(w.fake), ['StartRecord']);
