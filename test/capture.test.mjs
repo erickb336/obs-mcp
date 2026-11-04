@@ -16,19 +16,21 @@ const PASSWORD = 'capture-test-password-W3q8';
 const STOP_PROMPT = 'type stop and press Enter';
 /**
  * Runs the capture. answer is what the operator types at each stop prompt: a string, an async function that gives it, or
- * null for an open input with no answer. With no answer, the input is empty, as when no one is at the terminal.
+ * null for an open input with no answer. With no answer, the input is empty, as when no one is at the terminal. early is a
+ * line that the operator types at once, before any prompt.
  */
-function run(args, env = {}, answer) {
+function run(args, env = {}, answer, early) {
   return new Promise((resolve) => {
     const base = { ...process.env, ...env };
     if (!('OBS_WEBSOCKET_PASSWORD' in env)) delete base.OBS_WEBSOCKET_PASSWORD;
     const p = spawn(process.execPath, [SCRIPT, ...args], { env: base, stdio: [answer === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'] });
+    if (early !== undefined) p.stdin.write(`${early}\n`);
     let stderr = '';
     let prompts = 0;
     p.stderr.on('data', (d) => {
       stderr += d;
       const seen = stderr.split(STOP_PROMPT).length - 1;
-      for (; prompts < seen; prompts++) if (answer) Promise.resolve(typeof answer === 'function' ? answer() : answer).then((a) => p.stdin.write(`${a}\n`));
+      for (; prompts < seen; prompts++) if (answer) Promise.resolve(typeof answer === 'function' ? answer() : answer).then((a) => a !== null && p.stdin.write(`${a}\n`));
     });
     p.on('close', (code) => resolve({ code, stderr }));
   });
@@ -279,6 +281,44 @@ for (const [name, answer, act] of [
   });
 }
 
+// F-T25-2: only a line typed after the prompt shows answers it. A stop typed while no prompt shows is dropped: a late stop
+// after a prompt timed out, or a stop typed before the first prompt. Each plan has two prompts for the capture's own take.
+const LATE = 'the operator types stop after the first prompt timed out, and gives no answer at the second';
+for (const [name, answer, early] of [
+  [LATE, (() => {
+    let prompt = 0;
+    return async () => (++prompt === 1 ? (await new Promise((r) => setTimeout(r, 700)), 'stop') : null);
+  })()],
+  ['the operator types stop before the first prompt, and gives no answer at the prompts', null, 'stop'],
+]) {
+  test(`F-T25-2: when ${name}, the capture sends no StopRecord`, async (t) => {
+    const { fake } = await userAndFake(t);
+    const f = files();
+    // The GetStats between the prompts waits 1.5 s, so the late stop comes while no prompt shows.
+    writeFileSync(f.plan, JSON.stringify([{ requestType: 'StartRecord' }, { requestType: 'StopRecord' }, { requestType: 'GetStats' }, { requestType: 'StopRecord' }]));
+    const r = await run(['--url', `ws://127.0.0.1:${fake.port}`, '--out', f.out, '--plan', f.plan, '--settle-ms', '1500', '--confirm-ms', '300', '--allow-record'], {}, answer, early);
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(r.stderr.split(STOP_PROMPT).length - 1, 2, r.stderr);
+    assert.equal(fake.state.recording, true);
+    assert.deepEqual(fake.stops, []);
+    assert.equal(fake.log.includes('StopRecord'), false);
+    assert.deepEqual(JSON.parse(readFileSync(f.out, 'utf8')).refused.map((x) => `${x.requestType}: ${x.refused}`), [`StopRecord: ${NO_ANSWER}`, `StopRecord: ${NO_ANSWER}`]);
+  });
+}
+
+test('F-T25-2: a stop typed after the second prompt shows still stops the take, after a late line between the prompts', async (t) => {
+  const { fake } = await userAndFake(t);
+  const f = files();
+  writeFileSync(f.plan, JSON.stringify([{ requestType: 'StartRecord' }, { requestType: 'StopRecord' }, { requestType: 'GetStats' }, { requestType: 'StopRecord' }]));
+  let prompt = 0;
+  // A stop typed before the first prompt is dropped, the first prompt times out and gets a late "no", and the second gets stop.
+  const answer = async () => (++prompt === 1 ? (await new Promise((r) => setTimeout(r, 700)), 'no') : 'stop');
+  const r = await run(['--url', `ws://127.0.0.1:${fake.port}`, '--out', f.out, '--plan', f.plan, '--settle-ms', '1500', '--confirm-ms', '5000', '--allow-record'], {}, answer, 'stop');
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(fake.state.recording, false);
+  assert.deepEqual(fake.stops, [{ requestType: 'StopRecord', cause: 'request' }]);
+});
+
 // F-T6-4 and F-T6-9: a crash of OBS or a request with no reply ends the capture with the reason, and the partial trace is written.
 for (const [name, options, reason] of [
   ['OBS closes the connection', { crashOn: 'GetSceneList' }, 'OBS closed the connection (1006) while GetSceneList was in flight.'],
@@ -322,14 +362,23 @@ test('a password argument, a stray argument or a non-loopback URL is refused bef
     await run(['--url', url, '--out', f.out, PASSWORD]),
     await run(['--url', 'ws://192.0.2.10:4455', '--out', f.out]),
     await run(['--url', url, '--out', f.out, '--confirm-ms', '0']),
+    // F-T25-4: setTimeout fires at once for a wait above 2147483647 ms.
+    await run(['--url', url, '--out', f.out, '--confirm-ms', '2147483648']),
+    await run(['--url', url, '--out', f.out, '--confirm-ms', 'Infinity']),
+    await run(['--url', url, '--out', f.out, '--timeout-ms', '1e10']),
   ];
   await fake.close();
-  assert.deepEqual(runs.map((r) => r.code), [2, 2, 2, 2]);
+  assert.deepEqual(runs.map((r) => r.code), [2, 2, 2, 2, 2, 2, 2]);
   assert.match(runs[0].stderr, /never from an argument/);
   assert.match(runs[1].stderr, /unknown argument/);
   assert.match(runs[2].stderr, /loopback address/);
-  assert.equal(runs[3].stderr, 'capture-traces: --confirm-ms must be a number above 0.\n');
+  const tooLong = (name) => `capture-traces: ${name} must be a number of milliseconds above 0 and at most 2147483647.\n`;
+  assert.deepEqual(runs.slice(3).map((r) => r.stderr), [tooLong('--confirm-ms'), tooLong('--confirm-ms'), tooLong('--confirm-ms'), tooLong('--timeout-ms')]);
   assert.equal(runs.some((r) => r.stderr.includes(PASSWORD)), false);
+  // The longest wait passes the check: the script goes on to read the plan.
+  const ok = await run(['--url', url, '--out', f.out, '--confirm-ms', '2147483647', '--timeout-ms', '2147483647', '--plan', '/nonexistent/plan.json']);
+  assert.equal(ok.code, 1);
+  assert.doesNotMatch(ok.stderr, /-ms/);
   assert.equal(fake.connections(), 0);
 });
 

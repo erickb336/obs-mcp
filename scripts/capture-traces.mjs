@@ -14,7 +14,8 @@
 // - never stops a take on its own. OBS may answer a user's start, sent a few ms after the capture's StartRecord, with an
 //   ok reply and no events of its own (F-T25-1): then the one STARTED event is the user's take too, and the capture cannot
 //   see it. So before a StopRecord it asks the operator on the terminal, and sends it only when the operator types stop
-//   within --confirm-ms. No answer, another answer or the end of the input leaves the take running.
+//   within --confirm-ms. Only a line typed after the prompt shows counts: a line typed before it, also a late answer to an
+//   earlier prompt, is dropped. No answer, another answer or the end of the input leaves the take running.
 //   Before it asks, and again after the answer, it also checks its own take: GetRecordStatus, read just then, says that a
 //   recording is active, and no record event came after the STARTED event of its own StartRecord. When either check
 //   fails, it does not stop. It never sends ToggleRecord;
@@ -23,7 +24,6 @@
 // plan.json is a list of { requestType, requestData }. With no plan, it sends each catalogue read that needs no field.
 import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
-import { createInterface } from 'node:readline';
 import { parseArgs } from 'node:util';
 import WebSocket from 'ws';
 import { CATALOGUE, entry, READ_GUARDED } from '../dist/catalogue.js';
@@ -55,8 +55,8 @@ const timeoutMs = Number(args['timeout-ms']);
 const confirmMs = Number(args['confirm-ms']);
 // A wait of more than a minute after each request is a typing error, not a plan.
 if (!/^\d+$/.test(args['settle-ms']) || settleMs > 60000) fail('--settle-ms must be a whole number of milliseconds from 0 to 60000.', 2);
-if (!(timeoutMs > 0)) fail('--timeout-ms must be a number above 0.', 2);
-if (!(confirmMs > 0)) fail('--confirm-ms must be a number above 0.', 2);
+// setTimeout fires at once for a wait above 2^31 - 1 ms (about 24.8 days), so a larger wait is refused (F-T25-4).
+for (const [name, ms] of [['--timeout-ms', timeoutMs], ['--confirm-ms', confirmMs]]) if (!(ms > 0 && ms <= 2147483647)) fail(`${name} must be a number of milliseconds above 0 and at most 2147483647.`, 2);
 const plan = args.plan
   ? JSON.parse(readFileSync(args.plan, 'utf8'))
   : CATALOGUE.filter((e) => e.class === 'read' && e.fields.every((f) => f.optional)).map((e) => ({ requestType: e.request }));
@@ -85,23 +85,40 @@ function prompt() {
   });
 }
 
-/** Asks the operator to confirm a stop. True only when the next line of the input is "stop" and comes in --confirm-ms. */
+/**
+ * The operator's input. With --allow-record, it is read from the connection to the end, so that a line typed while no prompt shows
+ * (a late answer to an earlier prompt, or a line typed before the first prompt) is dropped and never answers a prompt
+ * (F-T25-2). The input does not keep the process alive.
+ */
+const input = { answer: undefined, partial: '', ended: false };
+function readInput() {
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', (chunk) => {
+    const lines = (input.partial + chunk).split(/\r?\n/);
+    input.partial = lines.pop();
+    for (const line of lines) input.answer?.(line);
+  });
+  process.stdin.on('end', () => {
+    input.ended = true;
+    input.answer?.();
+  });
+  process.stdin.unref?.();
+}
+
+/** Asks the operator to confirm a stop. True only when the first line typed after the prompt is "stop" and comes in --confirm-ms. */
 function confirmStop() {
+  // Drop the part of a line typed before the prompt.
+  input.partial = '';
   process.stderr.write(`capture-traces: the capture started a test take. If you did not start a take yourself, type stop and press Enter to send StopRecord. Waiting ${confirmMs / 1000} s.\n`);
   return new Promise((resolve) => {
-    // An input that is a pipe keeps the process alive while it is referenced, also when paused: hold it only while waiting.
-    process.stdin.ref?.();
-    const lines = createInterface({ input: process.stdin });
-    const done = (answer) => {
+    const done = (line) => {
       clearTimeout(timer);
-      lines.removeAllListeners();
-      lines.close();
-      process.stdin.unref?.();
-      resolve(answer?.trim() === 'stop');
+      input.answer = undefined;
+      resolve(line?.trim() === 'stop');
     };
     const timer = setTimeout(done, confirmMs);
-    lines.once('line', done);
-    lines.once('close', done);
+    input.answer = done;
+    if (input.ended) done();
   });
 }
 
@@ -156,6 +173,7 @@ try {
 } catch (e) {
   fail(e.message);
 }
+if (args['allow-record']) readInput();
 const state = { recording: false, streaming: false };
 const entries = [];
 /** Sends one request and keeps it with the events that came before the next request. */
