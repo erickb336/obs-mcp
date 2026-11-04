@@ -67,7 +67,7 @@ test('the writer takes only typed records with allowed fields: no free object, n
   assert.throws(() => j.append('a', { t: 'intent', what: 'stop', path: { outputSettings: { key: 'x' } } }), /field path of intent is not a plain value/);
   assert.throws(() => j.append('a', { t: 'expect', sources: [{ name: 'Mic', settings: 'x' }] }), /field sources of expect is not a plain value/);
   assert.throws(() => j.append('a', { t: 'settings', x: 1 }), /unknown record settings/);
-  assert.throws(() => j.append('a', { t: 'event', state: 'STARTED', path: 'x'.repeat(5000) }), /longer than 4096 bytes/);
+  assert.throws(() => j.append('a', { t: 'event', state: 'STARTED', path: 'x'.repeat(70000) }), /longer than 65536 bytes/);
   assert.deepEqual(j.read('a'), []);
 });
 

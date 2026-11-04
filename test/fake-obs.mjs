@@ -51,12 +51,16 @@ const sample = (type) => (type.startsWith('Array') ? [] : SAMPLE[type]);
  * recordDirectory (the GetRecordDirectory folder), plant (bool: see plantReply below; each planted secret is listed in `planted` as { secret, field }),
  * elapsedMs (how long a recording at start has run), lagMs (how far outputDuration runs behind the clock; T4 measured 1,000 to 1,200 ms),
  * closeAfter (request names: OBS runs the request, then the connection closes before the reply),
- * dropEvents (output states, such as 'OBS_WEBSOCKET_OUTPUT_STARTED', whose events never go out).
+ * dropEvents (output states, such as 'OBS_WEBSOCKET_OUTPUT_STARTED', whose events never go out),
+ * fileOutput (the kind of the record output: 'mov_output' by default, as R210 found on OBS 33.0.1 in Simple output mode
+ * with the hybrid MOV format; 'ffmpeg_muxer' gives the Advanced mode output adv_file_output of T4; any other kind too).
+ * The settings of the record output hold only path and muxer_settings, as on real OBS. path keeps the file of the last
+ * take after the stop, and an old file before the first take (R210): only an active output has the current file.
  * The record status runs on the clock: outputDuration stops during a pause, and outputBytes (1,000 bytes for each ms recorded) is
  * cumulative across takes, as T4 measured. Each take gets a new file path in the record folder; it replaces the "[path]" of a trace.
  * Each input has the UUID "uuid-<name>". Like OBS, the fake resolves inputName first and inputUuid only when no name is given.
  * Returns { port, log, sent, planted, state, stops, crashes, connections, path(), startInObs(), stopInObs(), pauseInObs(), resumeInObs(),
- * restartObs(), drop(), close() }. The *InObs() calls are what a person does with the OBS buttons: they play the events of the trace, with no request. log holds every request type that reached the fake, in order;
+ * restartObs(), drop(), down(ms), close() }. The *InObs() calls are what a person does with the OBS buttons: they play the events of the trace, with no request. log holds every request type that reached the fake, in order;
  * sent holds { requestType, requestData } for each; connections() is the count of WebSocket connections that the fake accepted.
  * state is the output state now. stops holds { requestType, cause } for each recording that a request or a crash stopped;
  * crashes() is the count of simulated crashes (each closes the socket with 1006 and ends every output, as a real crash does).
@@ -143,8 +147,9 @@ export async function startFakeObs(options = {}) {
     if (typeof v === 'string') return plant(field);
     if (Array.isArray(v)) return v.map((x) => plantIn(x, field, at === 'field' ? 'item' : 'deep'));
     if (!v || typeof v !== 'object') return v;
-    const keep = at === 'reply' || at === 'item';
-    return Object.fromEntries(Object.entries(v).map(([k, x]) => (keep ? [k, plantIn(x, k, at === 'reply' ? 'field' : 'deep')] : [plant(field), plantIn(x, field, 'deep')])));
+    // The flags of an output are fixed by OBS too: OBS_OUTPUT_AUDIO and the rest.
+    const keep = at === 'reply' || at === 'item' || field === 'outputFlags';
+    return Object.fromEntries(Object.entries(v).map(([k, x]) => (keep ? [k, plantIn(x, at === 'reply' || at === 'item' ? k : field, at === 'reply' ? 'field' : 'deep')] : [plant(field), plantIn(x, field, 'deep')])));
   };
   const plantReply = (v) => plantIn(v, '', 'reply');
   const profile = () => ({ 'Twitch/RefreshToken': token(), 'AdvOut/FFURL': `rtmp://live.example.com/app/${key()}`, 'Video/BaseCX': '1920' });
@@ -154,12 +159,16 @@ export async function startFakeObs(options = {}) {
   let connections = 0;
   await new Promise((r, reject) => http.once('error', reject).listen(o.port ?? 0, '127.0.0.1', r));
 
+  // The flags of GetOutputList, as R210 read them: the record output is encoded and sends to no service.
+  const flags = (f) => Object.fromEntries(['AUDIO', 'VIDEO', 'ENCODED', 'MULTI_TRACK', 'SERVICE'].map((k) => [`OBS_OUTPUT_${k}`, f.includes(k)]));
+  const fileKind = o.fileOutput ?? 'mov_output';
+  const fileName = fileKind === 'ffmpeg_muxer' ? 'adv_file_output' : 'simple_file_output';
   const outputs = () =>
     o.outputs ?? [
-      { outputName: 'adv_file_output', outputKind: 'ffmpeg_muxer', outputActive: state.recording },
-      { outputName: 'adv_stream', outputKind: 'rtmp_output', outputActive: state.streaming },
-      { outputName: 'virtualcam_output', outputKind: 'virtualcam_output', outputActive: state.virtualCam },
-      { outputName: 'Replay Buffer', outputKind: 'replay_buffer', outputActive: state.replayBuffer },
+      { outputName: fileName, outputKind: fileKind, outputActive: state.recording, outputFlags: flags(['AUDIO', 'VIDEO', 'ENCODED', 'MULTI_TRACK']) },
+      { outputName: 'adv_stream', outputKind: 'rtmp_output', outputActive: state.streaming, outputFlags: flags(['AUDIO', 'VIDEO', 'ENCODED', 'MULTI_TRACK', 'SERVICE']) },
+      { outputName: 'virtualcam_output', outputKind: 'virtualcam_output', outputActive: state.virtualCam, outputFlags: flags(['VIDEO']) },
+      { outputName: 'Replay Buffer', outputKind: 'replay_buffer', outputActive: state.replayBuffer, outputFlags: flags(['AUDIO', 'VIDEO', 'ENCODED', 'MULTI_TRACK']) },
     ].map((x) => ({ outputWidth: 1920, outputHeight: 1080, outputFlags: {}, ...x }));
   const answer = (type, data) => {
     switch (type) {
@@ -171,8 +180,10 @@ export async function startFakeObs(options = {}) {
         return { obsVersion: o.obsVersion, obsWebSocketVersion: '5.7.6', rpcVersion: 1, availableRequests: [...DOCUMENTED.keys(), ...PRIVATE_REQUESTS], supportedImageFormats: ['png', 'jpg'], platform: o.platform, platformDescription: `${o.platform} (simulated)` };
       case 'GetRecordDirectory':
         return { recordDirectory: recordDir() };
-      case 'GetRecordStatus':
-        return { outputActive: state.recording, outputPaused: state.paused, outputTimecode: tc(durationMs()), outputDuration: durationMs(), outputBytes: bytes() };
+      case 'GetRecordStatus': {
+        const d = durationMs();
+        return { outputActive: state.recording, outputPaused: state.paused, outputTimecode: tc(d), outputDuration: d, outputBytes: rec.base + d * 1000 };
+      }
       case 'GetStreamStatus':
         return { outputActive: state.streaming, outputReconnecting: false, outputTimecode: '00:00:00.000', outputDuration: 0, outputCongestion: 0, outputBytes: 0, outputSkippedFrames: 0, outputTotalFrames: 0 };
       case 'GetInputSettings': {
@@ -183,8 +194,8 @@ export async function startFakeObs(options = {}) {
       case 'GetStreamServiceSettings': // F-T12-9: a server with no scheme and the key in its path
         return { streamServiceType: 'rtmp_custom', streamServiceSettings: { server: `live.example.com:1935/app/${key()}`, protocol: 'RTMP', key: key(), use_auth: true, username: 'someone', password: o.password ?? 'none' } };
       case 'GetOutputSettings':
-        // The file output has a path only while it records (T4). Its settings hold a stream key too, as a custom FFmpeg output can.
-        if (outputs().some((x) => x.outputName === data?.outputName && x.outputKind === 'ffmpeg_muxer')) return { outputSettings: state.recording ? { path: rec.path, muxer_settings: '', ...settings() } : {} };
+        // The record output keeps the path of its last file, also after the stop (R210).
+        if (data?.outputName === fileName && !o.outputs) return { outputSettings: { path: rec.path ?? join(recordDir(), '2026-01-01 00-00-00 0.mov'), muxer_settings: '' } };
         return { outputSettings: { ...settings(), url: `ingest.example.com:1935/app/${key()}` } }; // a custom FFmpeg output URL with no scheme
       case 'GetSourceFilter':
         return { filterEnabled: true, filterIndex: 0, filterKind: 'sample_kind', filterSettings: settings() };
@@ -209,7 +220,9 @@ export async function startFakeObs(options = {}) {
     }
   };
 
+  let downUntil = 0;
   wss.on('connection', (ws) => {
+    if (Date.now() < downUntil) return ws.terminate();
     connections++;
     const challenge = randomBytes(16).toString('base64');
     const salt = randomBytes(16).toString('base64');
@@ -310,6 +323,11 @@ export async function startFakeObs(options = {}) {
     },
     // The socket drops (code 1006) while OBS runs on: every output stays as it is.
     drop: () => {
+      for (const c of wss.clients) c.terminate();
+    },
+    // The socket drops and stays down for ms: each new connection drops at once, while OBS runs on.
+    down: (ms) => {
+      downUntil = Date.now() + ms;
       for (const c of wss.clients) c.terminate();
     },
     options: o,

@@ -209,7 +209,9 @@ test('E15: no answer in time on a 2025-era client: nothing is sent, and X5 goes 
   const { w, s } = await recording();
   const slow = await pair(() => createServer(s.app), { elicit: after(2600, accept), name: 'Claude Code' });
   const r = await slow.call('obs_record_stop');
-  assert.equal(r.isError, true, 'the SDK shim ends the round at 120 s (scaled: 2 s)');
+  // The prompt ends at the life of the consent id (120 s, scaled: 2 s), and X5 is the reply too (F-T7-49).
+  assert.equal(r.isError, false);
+  assert.match(r.text, /^No answer in 2 minutes\. I did not stop the recording\. It still records \(/);
   assert.ok(await until(() => s.logs.some((l) => /^No answer in 2 minutes\. I did not stop the recording\. It still records \(/.test(l.data))));
   await wait(700);
   assert.deepEqual(recordRequests(w.fake), ['StartRecord']);

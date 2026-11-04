@@ -403,19 +403,49 @@ test('the fake OBS sends events only to a client that subscribed to their catego
   await fake.close();
 });
 
-test('the fake OBS gives an output path in GetOutputSettings only while it records (T4)', async () => {
-  const paths = [];
-  for (const recording of [false, true]) {
-    const fake = await startFakeObs({ recording, recordDirectory: 'rec' });
-    const c = await client(fake);
-    const settings = (await c.call('GetOutputSettings', { outputName: 'adv_file_output' })).d.outputSettings;
-    paths.push(settings.path ?? null);
-    if (recording) assert.match(settings.server, /sample-stream-key/, 'the file output holds a stream key too, as a custom FFmpeg output can');
-    await c.obs.disconnect();
-    await fake.close();
-  }
-  assert.equal(paths[0], null);
-  assert.match(paths[1], /^rec[\\/]\d{4}-\d\d-\d\d \d\d-\d\d-\d\d 1\.mov$/);
+test('R210: the fake record output is simple_file_output of kind mov_output; its settings are path and muxer_settings, and path stays after the stop', async () => {
+  const fake = await startFakeObs({ recordDirectory: 'rec' });
+  const c = await client(fake);
+  const file = (await c.call('GetOutputList')).d.outputs.find((o) => o.outputName === 'simple_file_output');
+  assert.deepEqual([file.outputKind, file.outputActive, file.outputFlags.OBS_OUTPUT_ENCODED, file.outputFlags.OBS_OUTPUT_SERVICE], ['mov_output', false, true, false]);
+  const path = async () => (await c.call('GetOutputSettings', { outputName: 'simple_file_output' })).d.outputSettings;
+  const idle = await path();
+  assert.deepEqual(Object.keys(idle).sort(), ['muxer_settings', 'path']);
+  assert.match(idle.path, /^rec[\\/]2026-01-01 00-00-00 0\.mov$/, 'an old file before the first take');
+  await c.call('StartRecord');
+  await new Promise((r) => setTimeout(r, 400));
+  const now = fake.path();
+  assert.equal((await path()).path, now);
+  await c.call('StopRecord');
+  await new Promise((r) => setTimeout(r, 400));
+  assert.equal((await c.call('GetRecordStatus')).d.outputActive, false);
+  assert.equal((await path()).path, now, 'the last file stays after the stop');
+  await c.obs.disconnect();
+  await fake.close();
+});
+
+test('R210: the ffmpeg_muxer variant of the fake is adv_file_output', async () => {
+  const fake = await startFakeObs({ fileOutput: 'ffmpeg_muxer', recording: true, recordDirectory: 'rec' });
+  const c = await client(fake);
+  const file = (await c.call('GetOutputList')).d.outputs.find((o) => o.outputKind === 'ffmpeg_muxer');
+  assert.deepEqual([file.outputName, file.outputActive], ['adv_file_output', true]);
+  assert.equal((await c.call('GetOutputSettings', { outputName: 'adv_file_output' })).d.outputSettings.path, fake.path());
+  await c.obs.disconnect();
+  await fake.close();
+});
+
+test('R210: the PAUSED event has outputActive false, and the record status stays active and paused', async () => {
+  const fake = await startFakeObs({ recording: true });
+  const c = await client(fake);
+  const seen = [];
+  c.obs.on('RecordStateChanged', (d) => seen.push(d));
+  await c.call('PauseRecord');
+  await new Promise((r) => setTimeout(r, 100));
+  assert.deepEqual(seen.map((d) => [d.outputState, d.outputActive]), [['OBS_WEBSOCKET_OUTPUT_PAUSED', false]]);
+  const st = (await c.call('GetRecordStatus')).d;
+  assert.deepEqual([st.outputActive, st.outputPaused], [true, true]);
+  await c.obs.disconnect();
+  await fake.close();
 });
 
 // Unit 1 of T7: the record model of the fake OBS. SIMULATED.
@@ -477,7 +507,7 @@ test('T7 unit 1: the record status runs on the clock, stops during a pause, and 
   assert.equal(a.outputTimecode, new Date(a.outputDuration).toISOString().slice(11, 23));
   assert.equal(a.outputBytes, a.outputDuration * 1000);
   assert.equal(fake.pauseInObs(), true);
-  await wait(20);
+  await wait(40); // PAUSED and its effect land at 21 ms (R210)
   const p1 = await status();
   await wait(150);
   const p2 = await status();

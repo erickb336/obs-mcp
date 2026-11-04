@@ -1,10 +1,10 @@
-// T7 unit 5: consent through inputRequired, on an SDK test client in both protocol eras. A tool of this test stands in
+// T7 unit 5: consent through one form elicitation (inputRequired on the 2026 era, a server request on the 2025 era, F-T7-49), on an SDK test client in both protocol eras. A tool of this test stands in
 // for obs_record_stop: it counts a "send" only after a valid, unused consent id. No OBS.
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
-import { answerOf, canAsk, Consents } from '../dist/consent.js';
+import { asking, canAsk, Consents } from '../dist/consent.js';
 import { TEXT } from '../dist/take.js';
 import { accept, after, decline, pair } from './mcp-pair.mjs';
 
@@ -15,10 +15,10 @@ function app(lifeMs) {
   const expired = [];
   const consents = new Consents(lifeMs, (v) => expired.push(v));
   const factory = () => {
-    const server = new McpServer({ name: 't', version: '0' }, { capabilities: { tools: {} }, inputRequired: { roundTimeoutMs: lifeMs } });
-    server.registerTool('stop', { inputSchema: z.object({}) }, async (_a, ctx) => {
+    const server = new McpServer({ name: 't', version: '0' }, { capabilities: { tools: {} } });
+    const expiredReply = (why) => ({ content: [{ type: 'text', text: why === 'expired' ? TEXT.X5(R) : 'rounds' }] });
+    server.registerTool('stop', { inputSchema: z.object({}) }, async (_a, ctx) => asking(ctx, async (a) => {
       if (!canAsk(server, ctx)) return { content: [{ type: 'text', text: TEXT.X1 }] };
-      const a = answerOf(ctx);
       if (a.action === 'none') return consents.ask(TEXT.W3(R), R);
       if (a.action !== 'accept') {
         consents.drop(a.id);
@@ -28,7 +28,7 @@ function app(lifeMs) {
       if (!reading) return { content: [{ type: 'text', text: TEXT.X17(R) }] };
       sends.push('StopRecord');
       return { content: [{ type: 'text', text: 'stopped' }] };
-    });
+    }, expiredReply));
     server.registerTool('start', { inputSchema: z.object({}) }, async (_a, ctx) => ({ content: [{ type: 'text', text: canAsk(server, ctx) ? 'can ask' : TEXT.X2 }] }));
     return server;
   };
@@ -65,8 +65,8 @@ for (const era of ['legacy', 'modern']) {
       const p = await pair(a.factory, { era, elicit: after(400, accept) });
       const r = await p.call('stop');
       if (era === 'modern') assert.match(r.text, /^That confirm expired after 2 minutes, so I did not stop the recording\./);
-      // On the 2025 era the SDK shim ends the round at roundTimeoutMs, before the tool sees the answer.
-      else assert.equal(r.isError, true, r.text);
+      // On the 2025 era the server ends its own prompt at the end of the id's life, and the reply is X5 (F-T7-49).
+      else assert.deepEqual([r.text, r.isError], [TEXT.X5(R), false]);
       assert.deepEqual(a.sends, []);
       assert.equal(a.expired.length, 1, 'the expiry is reported once, for the notice channel');
       await p.close();

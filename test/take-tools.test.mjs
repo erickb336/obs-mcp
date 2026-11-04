@@ -62,7 +62,8 @@ test('O3: the same start token returns the take and sends nothing', async () => 
 test('G25, G26: a client with no elicitation gets X2 for a start and X1 for a stop, and nothing is sent', async () => {
   const w = await world({ recording: true });
   const s = await server(w);
-  assert.equal((await s.call('obs_record_start', { token: 'take-token-1' })).text.split('\n').at(-1), TEXT.X2);
+  // OBS records already, so the refusal says so, not X2 (F-T7-48); take-repair3.test.mjs has X2 when idle.
+  assert.match((await s.call('obs_record_start', { token: 'take-token-1' })).text.split('\n').at(-1), /^OBS already records \(started .*\)\. I did not send a start\./);
   assert.equal((await s.call('obs_record_stop')).text.split('\n').at(-1), TEXT.X1);
   assert.deepEqual(recordRequests(w.fake), []);
   await s.kill();
@@ -99,7 +100,7 @@ test('F2, O4, F-T7-21: a test take sends reminder W8 on the notice channel, and 
   assert.equal(r.filter((l) => /does not stop it by itself/.test(l)).length, 1, r.join('\n'));
   const next = (await s.call('obs_take_status')).text.split('\n');
   assert.equal(w8(next), 1, 'a reply with no waiting notice repeats the reminder once');
-  assert.match(next.at(-1), /^A test recording still runs/);
+  assert.match(next[0], /^A test recording still runs/, 'W8 comes first in each reply (F-T7-53)');
   await wait(400);
   assert.equal(w.fake.state.recording, true);
   assert.deepEqual(recordRequests(w.fake), ['StartRecord']);
@@ -118,7 +119,8 @@ test('F9: a full take with planted secrets leaves no planted secret in the journ
   // With plant on, the path field of the file output has a planted key, so the same-recording test cannot pass
   // (check 3 fails to the safe side) and a stop request would only ask again. The take stops in OBS (T20).
   const asked = await s.call('obs_record_stop');
-  assert.match(asked.text, /The recording changed while you decided, so I did not stop it\.|reached the maximum|rounds/i, asked.text);
+  // On the 2025 era the server asks again up to 8 times, then gives X19.
+  assert.match(asked.text, /The recording changed each time you decided, so I did not stop it\./, asked.text);
   assert.deepEqual(recordRequests(w.fake), ['StartRecord']);
   w.fake.stopInObs();
   await wait(400);

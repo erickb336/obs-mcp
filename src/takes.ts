@@ -10,7 +10,16 @@ import { clock, fileName, hms, isOpen, journalReading, newTake, sameRecording, s
 
 /** The file check of a take: its result and one line for the reply. */
 export type Check = (path: string, sources: Source[]) => Promise<{ result: 'verified' | 'verified_with_warnings' | 'failed' | 'not_checked'; summary: string }>;
-type Open = { take: Take; client: string; sources: Source[]; tokenHash?: string; timers: NodeJS.Timeout[]; reading?: Reading };
+type Open = { take: Take; client: string; sources: Source[]; tokenHash?: string; timers: NodeJS.Timeout[]; reading?: Reading; gone?: NodeJS.Timeout; unsaved?: boolean };
+
+/** The longest path that a file call takes (PATH_MAX of Linux). A longer path from OBS names no file, so it counts as no path, and the journal holds every path it keeps (F-T7-40). */
+const MAX_PATH = 4096;
+const pathOf = (v: unknown) => (typeof v === 'string' && v && Buffer.byteLength(v) <= MAX_PATH ? v : undefined);
+/** The code of a file system error, such as EACCES. The message names the folder, so a reply gives only the code (F-T7-41). */
+export const fsCode = (e: unknown) => {
+  const code = (e as { code?: unknown } | undefined)?.code;
+  return typeof code === 'string' && /^E[A-Z0-9]+$/.test(code) ? code : undefined;
+};
 
 /** The states in which a test take gets reminder W8 (O4). */
 const reminds = (t: Take) => t.state === 'recording' || t.state === 'paused';
@@ -37,6 +46,9 @@ export class Takes {
   private seq = 0;
   /** The last take that closed in this process, for obs_take_status. */
   last?: Take;
+  /** The takes that closed in this process. A failed write can leave such a take open on disk: it is not open (F-T7-38). */
+  private done = new Set<string>();
+  private journalOpen = () => this.journal.openTakes().filter((id) => !this.done.has(id));
   private waiters = new Set<() => void>();
   /** Notice sink: a log notification to the client. Set by the server. */
   notify: (level: 'warning' | 'error', text: string) => void = () => {};
@@ -59,17 +71,20 @@ export class Takes {
   }
 
   /**
-   * The reply of a tool: the waiting notices first, then the lines. A test take that records adds reminder W8 once
-   * (O4, F-T7-21); W8 says what the test mark says, so the state line leaves the mark out (F-T7-33).
+   * The reply of a tool: the waiting notices first, then the lines. A test take that has recorded for the first
+   * reminder time adds reminder W8 once, at the top, where the W8 notice goes too (O4, F-T7-21, F-T7-53). Before that
+   * time the state line keeps the test mark. W8 says what the mark says, so the state line then leaves it out (F-T7-33).
    */
   reply(...lines: string[]): string {
-    const waiting = this.notices.splice(0);
-    const out = [...waiting.map((n) => n.text), ...lines];
-    let w8 = waiting.some((n) => n.key === 'W8');
+    const top = this.notices.splice(0);
+    let w8 = top.some((n) => n.key === 'W8');
     for (const o of this.open.values()) {
-      if (!w8 && o.take.kind === 'test' && reminds(o.take) && o.reading) (out.push(TEXT.W8(this.newest(o.reading))), (w8 = true));
+      if (!w8 && o.take.kind === 'test' && reminds(o.take) && o.reading && Date.now() - (o.take.startedAt ?? Date.now()) >= this.limits.reminderFirstMs) {
+        top.push({ text: TEXT.W8(this.newest(o.reading)) });
+        w8 = true;
+      }
     }
-    return (w8 ? out.map((l) => l.replace(TEST_MARK, '')) : out).join('\n');
+    return [...top.map((n) => n.text), ...(w8 ? lines.map((l) => l.replace(TEST_MARK, '')) : lines)].join('\n');
   }
 
   /** The newer of a take's reading and the last read of this process, while OBS records (F-T7-19). */
@@ -96,17 +111,25 @@ export class Takes {
     return r;
   }
 
-  /** F10: find the active output that writes a file, then keep only the path field of its settings. The rest of the reply is dropped here. */
+  /**
+   * F10: the path of the active output that writes a file: an encoded output that sends to no service, with a string
+   * path in its settings. The kind does not count: OBS 33 records hybrid MOV through mov_output, Advanced mode through
+   * ffmpeg_muxer, and other formats through other kinds (F-T7-36, R210). Only an active output counts, because the path
+   * keeps the last file after the stop (R210). Only the path field is kept; the rest of each reply is dropped here.
+   */
   private async filePath(conn: number): Promise<string | undefined> {
     try {
       const list = (await this.obs.callOn(conn, 'GetOutputList')).outputs;
-      const out = Array.isArray(list) ? list.find((o) => o?.outputActive === true && o?.outputKind === 'ffmpeg_muxer') : undefined;
-      if (typeof out?.outputName !== 'string') return undefined;
-      const path = ((await this.obs.callOn(conn, 'GetOutputSettings', { outputName: out.outputName })).outputSettings as { path?: unknown } | undefined)?.path;
-      return typeof path === 'string' && path ? path : undefined;
+      for (const o of Array.isArray(list) ? list : []) {
+        const flags = (o?.outputFlags ?? {}) as Record<string, unknown>;
+        if (o?.outputActive !== true || typeof o.outputName !== 'string' || flags.OBS_OUTPUT_ENCODED !== true || flags.OBS_OUTPUT_SERVICE === true) continue;
+        const path = pathOf(((await this.obs.callOn(conn, 'GetOutputSettings', { outputName: o.outputName })).outputSettings as { path?: unknown } | undefined)?.path);
+        if (path) return path;
+      }
     } catch {
-      return undefined;
+      // No path: check 3 fails, to the safe side.
     }
+    return undefined;
   }
 
   private async tryRead(): Promise<Reading | undefined> {
@@ -130,6 +153,8 @@ export class Takes {
     o.take = s.take;
     if (changed) this.write(o);
     if (s.notice?.id === 'X11') this.notice(TEXT.X11(o.take), s.notice.level);
+    // T19, T24, R1 and R4 close the take for a new recording: its closed line names the old file (F-T7-51), before X15.
+    if (changed && s.spawn && o.take.state === 'closed') this.notice(stateLine(o.take, undefined, Date.now()));
     if (s.notice?.id === 'X18') void this.x18(input);
     if (s.row === 'E10') this.notice('OBS already recorded when my start arrived. Your stop applied to that recording.');
     if (s.spawn) void this.openExternal(input.type === 'event' ? undefined : (input as { reading?: Reading }).reading);
@@ -144,18 +169,26 @@ export class Takes {
     this.notice(TEXT.X18(r ?? { at: Date.now(), conn: 0, ev: 0, active: true, paused: false, duration: 0, bytes: 0 }));
   }
 
+  /**
+   * The state line of a step. A file error (a full disk, a file that cannot be written) does not stop the take: the
+   * step is what OBS did, so its effects run, and you get one notice (F-T7-38). The intents are written before their
+   * sends, and a failed intent sends nothing.
+   */
   private write(o: Open) {
     try {
       this.journal.state(o.take.id, o.take);
     } catch (e) {
-      if (e instanceof FencedError) this.release(o);
-      else throw e;
+      if (e instanceof FencedError) return this.release(o);
+      if (!fsCode(e)) throw e;
+      if (!o.unsaved) this.notice(TEXT.J1(fsCode(e)!), 'error');
+      o.unsaved = true;
     }
   }
 
   /** Another process took over: stop all work on the take here (the fence). */
   private release(o: Open) {
     for (const t of o.timers) clearTimeout(t);
+    clearTimeout(o.gone);
     this.open.delete(o.take.id);
   }
 
@@ -201,7 +234,9 @@ export class Takes {
     }
     if (s === 'checking') void this.runCheck(o);
     if (s === 'closed') {
+      clearTimeout(o.gone);
       this.open.delete(o.take.id);
+      this.done.add(o.take.id);
       this.last = o.take;
       this.journal.prune();
       if (!this.open.size) this.obs.keepConnected(false);
@@ -256,18 +291,21 @@ export class Takes {
   private onEvent(e: ObsEvent) {
     if (e.type === 'opened') {
       // A connection is up: the waiting restart rows run (F-T7-3), and each take reads at once, so that the offline
-      // mark ends with the reconnect (F-T7-16).
+      // mark ends with the reconnect (F-T7-16). The gone limit of the drop ends too: a later drop starts its own (F-T7-37).
       void this.restartWaiting();
-      for (const o of this.open.values()) if (!this.waiting.has(o.take.id)) void this.tick(o);
+      for (const o of this.open.values()) {
+        clearTimeout(o.gone);
+        if (!this.waiting.has(o.take.id)) void this.tick(o);
+      }
       return;
     }
     if (e.type === 'closed') {
       for (const o of this.open.values()) {
         const s = this.apply(o, { type: 'disconnect', at: Date.now() });
         if (s.row === 'O1' && (o.take.state === 'recording' || o.take.state === 'paused')) {
-          const t = setTimeout(() => !this.obs.connected && this.apply(o, { type: 'timeout', phase: 'gone', at: Date.now() }), this.limits.goneMs);
-          t.unref?.();
-          o.timers.push(t);
+          clearTimeout(o.gone);
+          o.gone = setTimeout(() => !this.obs.connected && this.apply(o, { type: 'timeout', phase: 'gone', at: Date.now() }), this.limits.goneMs);
+          o.gone.unref?.();
         }
       }
       return;
@@ -277,8 +315,8 @@ export class Takes {
       return;
     }
     if (e.type === 'RecordFileChanged') {
-      const path = e.data.newOutputPath;
-      if (typeof path === 'string') for (const o of this.open.values()) this.apply(o, { type: 'file', path });
+      const path = pathOf(e.data.newOutputPath);
+      if (path) for (const o of this.open.values()) this.apply(o, { type: 'file', path });
       return;
     }
     const state = STATES[String(e.data.outputState)];
@@ -288,7 +326,8 @@ export class Takes {
       this.ev.set(e.conn, (this.ev.get(e.conn) ?? 0) + 1);
       this.lastEventAt = at;
     }
-    const path = typeof e.data.outputPath === 'string' ? e.data.outputPath : undefined;
+    // The state name gives the state. PAUSED comes with outputActive false, but the output stays active (R210).
+    const path = pathOf(e.data.outputPath);
     if (state === 'STARTED' && !this.open.size) {
       void this.openExternal(undefined);
       return;
@@ -310,7 +349,7 @@ export class Takes {
 
   /** The open takes of other processes. With the read r, a stale take does not count. */
   private others(r?: Reading): { take: Take; client: string }[] {
-    return this.journal.openTakes().flatMap((id) => {
+    return this.journalOpen().flatMap((id) => {
       const l = this.open.has(id) ? undefined : this.journal.load(id);
       return l && !(r && this.stale(id, l.take, r)) ? [{ take: l.take, client: l.meta.client }] : [];
     });
@@ -325,12 +364,18 @@ export class Takes {
     // E25: the id comes from the file path, so every process finds one take, and the first owner file wins.
     const id = sha(`external:${r.path ?? Math.round((r.at - r.duration) / 10000)}`).slice(0, 16);
     if (this.open.has(id) || this.journal.load(id)) return;
-    if (!this.journal.own(id, 1)) return;
     const take: Take = { ...newTake(id, 'external', 'external'), row: 'T22', startedAt: r.at - r.duration, startBytes: r.bytes, paths: r.path ? [r.path] : [] };
     const o: Open = { take, client: this.journal.me.client, sources: this.lastSources, timers: [], reading: r };
-    this.journal.append(id, { t: 'open', v: 1, id, kind: 'external', client: o.client, pid: process.pid, obs: this.obs.version?.obsVersion, ws: this.obs.version?.obsWebSocketVersion });
-    if (o.sources.length) this.journal.append(id, { t: 'expect', sources: o.sources });
-    this.journal.state(id, take);
+    try {
+      if (!this.journal.own(id, 1)) return;
+      this.journal.append(id, { t: 'open', v: 1, id, kind: 'external', client: o.client, pid: process.pid, obs: this.obs.version?.obsVersion, ws: this.obs.version?.obsWebSocketVersion });
+      if (o.sources.length) this.journal.append(id, { t: 'expect', sources: o.sources });
+      this.journal.state(id, take);
+    } catch (e) {
+      if (!fsCode(e)) throw e;
+      // The recording goes on, unfollowed. It sends nothing either way.
+      return this.notice(TEXT.J1(fsCode(e)!), 'error');
+    }
     this.open.set(id, o);
     this.obs.keepConnected(true);
     this.notice(TEXT.X15(r, o.sources.map((s) => s.name)));
@@ -347,22 +392,42 @@ export class Takes {
    * owned take when OBS answers. Sends no recording request.
    */
   async resume() {
-    for (const id of this.journal.openTakes()) {
+    let soon = Infinity;
+    for (const id of this.journalOpen()) {
       if (this.open.has(id) || this.ended) continue;
-      // The start of the watch gap: the old owner's beat, read before the takeover makes a new owner file (F-T7-19).
-      const lastBeat = Date.now() - this.journal.beatAge(id);
-      if (!this.journal.takeOver(id, this.limits.staleMs) || !this.journal.isOwner(id)) continue;
-      const l = this.journal.load(id);
-      if (!l) continue;
-      const o: Open = { take: l.take, client: l.meta.client, sources: l.sources, timers: [], tokenHash: l.recs.findLast((x) => x.t === 'intent' && x.what === 'start')?.token as string | undefined };
-      this.open.set(id, o);
-      this.waiting.set(id, lastBeat);
-      this.beating(o); // the new owner beats while it waits for OBS
+      try {
+        // The start of the watch gap: the old owner's beat, read before the takeover makes a new owner file (F-T7-19).
+        const age = this.journal.beatAge(id);
+        const lastBeat = Date.now() - age;
+        if (!this.journal.takeOver(id, this.limits.staleMs) || !this.journal.isOwner(id)) {
+          // A take of this client whose owner beat less than staleMs ago: try again when that beat is stale (F-T7-43).
+          if (this.journal.owner(id)?.client === this.journal.me.client) soon = Math.min(soon, this.limits.staleMs - age + this.limits.beatMs);
+          continue;
+        }
+        const l = this.journal.load(id);
+        if (!l) continue;
+        const o: Open = { take: l.take, client: l.meta.client, sources: l.sources, timers: [], tokenHash: l.recs.findLast((x) => x.t === 'intent' && x.what === 'start')?.token as string | undefined };
+        this.open.set(id, o);
+        this.waiting.set(id, lastBeat);
+        this.beating(o); // the new owner beats while it waits for OBS
+      } catch (e) {
+        if (!fsCode(e)) throw e;
+        this.notice(TEXT.J1(fsCode(e)!), 'error'); // the take stays in the journal for the next try
+      }
+    }
+    if (soon < Infinity && !this.retry && !this.ended) {
+      this.retry = setTimeout(() => {
+        this.retry = undefined;
+        void this.resume().catch(() => {});
+      }, Math.max(0, soon));
+      this.retry.unref?.();
     }
     if (!this.waiting.size || this.ended) return;
     this.obs.keepConnected(true);
     await this.restartWaiting();
   }
+
+  private retry?: NodeJS.Timeout;
 
   /** The restart rows of the waiting takes, after one read. With OBS unreachable, they run when a connection opens (F-T7-3). */
   private async restartWaiting() {
@@ -377,7 +442,9 @@ export class Takes {
       const same = r.active && a ? sameRecording(a, r, o.take.paths) : false;
       const before = o.take.state;
       const s = this.apply(o, { type: 'restart', reading: r, same, at: Date.now() });
-      if (s.row === 'R3') this.notice(`OBS still records the take that I started (${hms(r.duration)}, file ${fileName(o.take.paths.at(-1))}). The watch had a gap from ${clock(lastBeat)} to ${clock(Date.now())}.`);
+      const gap = `The watch had a gap from ${clock(lastBeat)} to ${clock(Date.now())}.`;
+      const file = `${hms(r.duration)}, file ${fileName(o.take.paths.at(-1))}`;
+      if (s.row === 'R3') this.notice(r.paused ? `The take that I started is still paused in OBS (${file}). ${gap}` : `OBS still records the take that I started (${file}). ${gap}`); // F-T7-45
       if (s.row === 'R3' && o.take.kind === 'test') this.notice(TEXT.W8(r), 'warning', 'W8');
       if (o.take.state === before) this.entered(o); // R3, R7 and R8 keep the state: the watch or the check starts again
     }
@@ -414,7 +481,8 @@ export class Takes {
     const cur = (await this.current(r))?.take ?? newTake('none', 'normal', 'idle');
     const refuse = step(cur, { type: 'start', at: Date.now(), reading: r, lastEventAt: this.lastEventAt }).refuse;
     if (!refuse) return undefined;
-    if (refuse === 'X7') return TEXT.X7;
+    // A stop that OBS did not confirm: the state line says what to do in OBS (F-T7-50).
+    if (refuse === 'X7') return cur.state === 'stop_uncertain' ? `${stateLine(cur, r, Date.now())} I did not send a start.` : TEXT.X7;
     if (r.active) return TEXT.X6(r, isOpen(cur) && cur.kind !== 'external');
     return isOpen(cur) ? `${stateLine(cur, r, Date.now())} I did not send a start.` : TEXT.X6b;
   }
@@ -431,7 +499,7 @@ export class Takes {
     const o: Open = { take: newTake(id, kind), client: this.journal.me.client, sources: this.lastSources, tokenHash: sha(token), timers: [], reading: r };
     // The last claim is busy while its take is open and alive, or for 2 s while its take file is not there yet.
     const busy = (prev: string | undefined, age: number) => {
-      const l = prev ? this.journal.load(prev) : undefined;
+      const l = prev && !this.done.has(prev) ? this.journal.load(prev) : undefined;
       return l ? isOpen(l.take) && !this.stale(prev!, l.take, r) : age < this.limits.raceMs;
     };
     try {
@@ -445,7 +513,7 @@ export class Takes {
       this.journal.append(id, { t: 'sent', request: 'StartRecord', seq: ++this.seq, conn: r.conn, at: Date.now() });
     } catch (e) {
       this.release(o);
-      if (e instanceof FencedError || (e as { code?: string }).code || /journal/.test(String((e as Error).message))) return { text: 'I could not save the take record, so I did not send the start.' };
+      if (e instanceof FencedError || fsCode(e)) return { text: 'I could not save the take record, so I did not send the start.' };
       throw e;
     }
     this.obs.keepConnected(true);
@@ -457,19 +525,30 @@ export class Takes {
    * StopRecord once on the connection of read B, and wait up to 15 s for STOPPED (P5). A second stop finds the open
    * stop and sends nothing (O7).
    */
-  async stop(id: string, b: Reading, consentId: string | undefined, shown: Reading | undefined): Promise<Take> {
+  async stop(id: string, b: Reading, consentId: string | undefined, shown: Reading | undefined): Promise<{ take: Take; text?: string }> {
     const o = this.open.get(id);
     if (!o) throw new Error('not the owner');
     const s = step(o.take, { type: 'stop', reading: b });
     if (!s.send) {
       this.apply(o, { type: 'stop', reading: b });
-      return o.take;
+      return { take: o.take };
     }
     // Journal the intent before the step, in the same tick, so that a parallel accept finds the open stop (rule 5).
-    this.journal.append(id, { t: 'intent', what: 'stop', at: Date.now(), consent: consentId, duration: shown?.duration, path: shown?.path, bytes: shown?.bytes });
+    // With no intent on disk, nothing is sent (rule 1), and the reply gives the error code only (F-T7-41).
+    try {
+      this.journal.append(id, { t: 'intent', what: 'stop', at: Date.now(), consent: consentId, duration: shown?.duration, path: shown?.path, bytes: shown?.bytes });
+    } catch (e) {
+      if (e instanceof FencedError) return { take: o.take, text: 'Another obs-mcp process follows this take now, so I did not send the stop.' };
+      if (fsCode(e)) return { take: o.take, text: `${TEXT.J1(fsCode(e)!)} So I did not send the stop.` };
+      throw e;
+    }
     this.apply(o, { type: 'stop', reading: b });
-    this.journal.append(id, { t: 'sent', request: 'StopRecord', seq: ++this.seq, conn: b.conn, at: Date.now() });
-    return this.send(o, 'StopRecord', b.conn, 'stopping', this.limits.stopMs, 'stop');
+    try {
+      this.journal.append(id, { t: 'sent', request: 'StopRecord', seq: ++this.seq, conn: b.conn, at: Date.now() });
+    } catch {
+      // The intent is on disk; this line only records the send.
+    }
+    return { take: await this.send(o, 'StopRecord', b.conn, 'stopping', this.limits.stopMs, 'stop') };
   }
 
   /**
@@ -526,7 +605,8 @@ export class Takes {
   /** O2: the client closed input. Nothing is sent; the journal keeps each take. A read still in flight changes nothing after this. */
   close() {
     this.ended = true;
-    for (const o of this.open.values()) for (const t of o.timers) clearTimeout(t);
+    clearTimeout(this.retry);
+    for (const o of this.open.values()) for (const t of [...o.timers, o.gone]) clearTimeout(t);
     this.open.clear();
   }
   private ended = false;

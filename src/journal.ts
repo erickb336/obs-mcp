@@ -5,12 +5,15 @@
 import { randomBytes } from 'node:crypto';
 import { chmodSync, closeSync, fsyncSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
-import { isOpen, newTake, type Take } from './take.js';
+import { isOpen, newTake, STATES, type Take } from './take.js';
 
 export const RETENTION = { days: 30, takes: 100 }; // G28
-const MAX_LINE = 4096;
+// A line holds at most 2 paths of up to 4,096 bytes (the limit of the driver), each up to 6 times longer in JSON (F-T7-40).
+const MAX_LINE = 64 * 1024;
 const MAX_LINES = 1000;
 const CLAIM = /^start-(\d+)\.claim$/;
+/** The temp files of this journal: of create() (a name, a token and .tmp) and of beat(). No other .tmp file is ours (F-T7-39). */
+const TEMP = /^(take-[\w-]+\.(owner-\d+\.[0-9a-f]{8}|beat\.\d+)|start-\d+\.claim\.[0-9a-f]{8})\.tmp$/;
 
 /** The fields that each record type may hold. Every value must be a string, a number, a boolean, or a list of those. */
 const FIELDS: Record<string, string[]> = {
@@ -60,9 +63,10 @@ export class Journal {
     this.me = { pid: process.pid, client, token: randomBytes(16).toString('hex') };
   }
 
+  /** Makes the folder, only for this process's user. A folder that is there already keeps its mode: it can hold other files (F-T7-39). */
   private ensure() {
-    mkdirSync(this.dir, { recursive: true, mode: 0o700 });
-    if (process.platform !== 'win32') chmodSync(this.dir, 0o700);
+    const made = mkdirSync(this.dir, { recursive: true, mode: 0o700 });
+    if (made && process.platform !== 'win32') chmodSync(this.dir, 0o700);
   }
 
   private file = (id: string, ext: string) => join(this.dir, `take-${id}.${ext}`);
@@ -195,7 +199,7 @@ export class Journal {
       return;
     }
     const line = (torn ? '\n' : '') + JSON.stringify({ ...checked(rec), k: this.owned.get(id) }) + '\n';
-    if (Buffer.byteLength(line) > MAX_LINE) throw new Error(`journal: a ${rec.t} line is longer than ${MAX_LINE} bytes`);
+    if (Buffer.byteLength(line) > MAX_LINE) throw Object.assign(new Error(`journal: a ${rec.t} line is longer than ${MAX_LINE} bytes`), { code: 'E2BIG' });
     const fd = openSync(this.file(id, 'jsonl'), 'a', 0o600);
     try {
       writeSync(fd, line);
@@ -246,7 +250,7 @@ export class Journal {
     const open = recs.find((r) => r.t === 'open');
     if (!open) return undefined;
     const meta = { id, kind: String(open.kind), client: String(open.client), pid: Number(open.pid) };
-    const last = recs.findLast((r) => r.t === 'state');
+    const last = recs.findLast(validState);
     const take: Take = { ...newTake(id, meta.kind as Take['kind']), ...(last ? strip(last) : {}) };
     const sources = (recs.findLast((r) => r.t === 'expect')?.sources as Source[] | undefined) ?? [];
     return { take, meta, sources, recs };
@@ -265,7 +269,7 @@ export class Journal {
     for (const f of this.list()) {
       const id = /^take-([\w-]+)\.jsonl$/.exec(f)?.[1];
       const l = id ? this.load(id) : undefined;
-      const at = Number(l?.recs.findLast((r) => r.t === 'state')?.at ?? 0);
+      const at = Number(l?.recs.findLast(validState)?.at ?? 0);
       if (l && !isOpen(l.take) && (!best || at > best.at)) best = { at, take: l.take };
     }
     return best?.take;
@@ -291,7 +295,7 @@ export class Journal {
       .filter((id): id is string => !!id)
       .map((id) => ({ id, l: this.load(id) }))
       .filter((x) => x.l && !isOpen(x.l.take))
-      .map((x) => ({ id: x.id, at: Number(x.l!.recs.findLast((r) => r.t === 'state')?.at ?? 0) }))
+      .map((x) => ({ id: x.id, at: Number(x.l!.recs.findLast(validState)?.at ?? 0) }))
       .sort((a, b) => b.at - a.at);
     const gone = new Set(closed.filter((x, i) => i >= RETENTION.takes || x.at < old).map((x) => x.id));
     const top = this.highest(CLAIM);
@@ -305,7 +309,7 @@ export class Journal {
     for (const f of this.list()) {
       const id = /^take-([\w-]+)\./.exec(f)?.[1];
       const claim = CLAIM.exec(f);
-      const stale = (claim && Number(claim[1]) !== top && mtime(f) < old) || (f.endsWith('.tmp') && mtime(f) < now - 864e5);
+      const stale = (claim && Number(claim[1]) !== top && mtime(f) < old) || (TEMP.test(f) && mtime(f) < now - 864e5);
       if (!((id && gone.has(id)) || stale)) continue;
       try {
         rmSync(join(this.dir, f), { force: true });
@@ -315,6 +319,24 @@ export class Journal {
     }
   }
 }
+
+const KINDS = ['normal', 'test', 'external'];
+const NUMBERS = ['intentAt', 'startedAt', 'startBytes', 'offlineAt', 'pausedAt', 'stopAt', 'endedAt', 'heldUntil', 'at'];
+const strings = (v: unknown) => v === undefined || (Array.isArray(v) && v.every((x) => typeof x === 'string'));
+const opt = (v: unknown, type: string) => v === undefined || typeof v === type;
+/**
+ * A state line that a take can come from: a damaged line, or a line of another version, does not (F-T7-42). The
+ * last good line gives the take.
+ */
+const validState = (r: Rec) =>
+  r.t === 'state' &&
+  STATES.includes(r.state as Take['state']) &&
+  (r.kind === undefined || KINDS.includes(r.kind as string)) &&
+  strings(r.marks) &&
+  strings(r.paths) &&
+  NUMBERS.every((k) => r[k] === undefined || Number.isFinite(r[k])) &&
+  ['row', 'result', 'summary'].every((k) => opt(r[k], 'string')) &&
+  opt(r.stopSeen, 'boolean');
 
 const strip = (r: Rec): Partial<Take> => {
   const { t: _t, k: _k, at: _at, ...rest } = r;

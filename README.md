@@ -199,7 +199,7 @@ All are optional.
 | `OBS_WEBSOCKET_PORT` | The port, in place of the one in the settings file (default 4455). It must be a whole number from 1 to 65535; any other value, an empty one too, is an error that `obs_status` and the doctor report |
 | `OBS_STUDIO_CONFIG_DIR` | The OBS settings folder, for a portable or custom install |
 | `OBS_MCP_RECORDING_DIR` | The recording folder for `obs_verify_file`, in place of the folder that OBS gives. It lets the check work with OBS closed |
-| `OBS_MCP_STATE_DIR` | The take folder, in place of the default: `~/Library/Application Support/obs-mcp/takes` on macOS, `$XDG_STATE_HOME/obs-mcp/takes` (or `~/.local/state/obs-mcp/takes`) on Linux, `%LOCALAPPDATA%\obs-mcp\takes` on Windows |
+| `OBS_MCP_STATE_DIR` | The take folder, in place of the default: `~/Library/Application Support/obs-mcp/takes` on macOS, `$XDG_STATE_HOME/obs-mcp/takes` (or `~/.local/state/obs-mcp/takes`) on Linux, `%LOCALAPPDATA%\obs-mcp\takes` on Windows. A folder that obs-mcp makes is for your user only; a folder that is there already keeps its mode, and obs-mcp changes only its own files in it |
 | `OBS_MCP_FFMPEG` | The full path of ffmpeg, with ffprobe in the same folder. Without it, both come from `PATH` |
 | `OBS_MCP_VOICE_GAP_S` | The gap limit of a `voice` source, in seconds (default 30) |
 | `OBS_MCP_CONTINUOUS_GAP_S` | The gap limit of a `continuous` source, in seconds (default 2) |

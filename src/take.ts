@@ -85,6 +85,8 @@ export const LIMITS = {
 export type Limits = typeof LIMITS;
 
 const OPEN: State[] = ['starting', 'start_uncertain', 'stop_held', 'external', 'recording', 'paused', 'stopping', 'stop_uncertain', 'checking'];
+/** Every state, for the check of a journal line (F-T7-42). */
+export const STATES: State[] = ['idle', ...OPEN, 'closed'];
 export const isOpen = (t: Take) => OPEN.includes(t.state);
 const STOPS: State[] = ['stopping', 'stop_uncertain'];
 
@@ -296,7 +298,7 @@ export const TEXT = {
   X2: 'I did not start a recording. This client cannot show a confirm dialog, and obs-mcp starts a recording only after you confirm in one. To start: in OBS, click Start Recording in the Controls dock. I will see the start, watch the sources and check the file.',
   X3: 'I did not send this change. It needs your confirmation, and this client cannot show a confirm dialog. You can make the change in OBS.',
   X4: (r: Reading) => `You declined. I did not stop the recording. ${still(r)}`,
-  X5: (r: Reading) => `No answer in 2 minutes. I did not stop the recording. ${still(r)}`,
+  X5: (r?: Reading) => `No answer in 2 minutes. I did not stop the recording.${r ? ` ${still(r)}` : ''}`,
   /** ours: an obs-mcp take, of this process or another one (F-T7-15). */
   X6: (r: Reading, ours = false) =>
     `OBS already records (started ${clock(r.at - r.duration)}, file ${fileName(r.path)}). I did not send a start. ${ours ? 'obs-mcp started this recording.' : 'obs-mcp did not start this recording.'}`,
@@ -320,6 +322,10 @@ export const TEXT = {
   X16: (client: string, external = false) =>
     `I did not stop the recording. ${external ? `It started outside obs-mcp. ${shown(client)} follows it, and` : `${shown(client)} started it, and`} in this version only that client can stop it. Ask there, or click Stop Recording in the Controls dock of OBS.`,
   X17: (r: Reading) => `That confirm expired after 2 minutes, so I did not stop the recording. ${still(r)} Ask me again to stop it.`,
+  /** Eight W6 prompts in one call: the recording changed each time (the 2025 era). */
+  X19: 'The recording changed each time you decided, so I did not stop it. To stop it, click Stop Recording in the Controls dock of OBS.',
+  /** A file error of the journal: only its code, because the message names the folder (F-T7-38, F-T7-41). */
+  J1: (code: string) => `I could not write the take record on this computer (${code}).`,
   X18: (r: Reading) => `A recording started in OBS after you asked me to stop (running ${hms(r.duration)}, file ${fileName(r.path)}). I did not stop it. To stop it, ask me again, or click Stop Recording in OBS.`,
 };
 
@@ -371,7 +377,7 @@ export function stateLine(take: Take | undefined, r: Reading | undefined, now: n
         : `OBS shows no recording now. I am checking the file ${file}.`;
       break;
     case 'closed':
-      line = `Take closed: ${take.result}.${take.summary ? ` ${take.summary}` : CLOSED[take.row ?? ''] ?? ''}`;
+      line = `Take closed: ${take.result}.${take.summary ? ` ${take.summary}` : (CLOSED[take.row ?? '']?.(take) ?? '')}`;
       break;
   }
   if (take.marks.includes('offline') && isOpen(take)) line = `${TEXT.X10(take.offlineAt ?? now)} ${line}`;
@@ -383,13 +389,16 @@ export function stateLine(take: Take | undefined, r: Reading | undefined, now: n
 /** The test mark of the state line, until the take stops. A reply with W8 leaves it out, because W8 says the same (F-T7-33). */
 export const TEST_MARK = ' This is a test recording. obs-mcp does not stop it by itself.';
 
-const CLOSED: Record<string, string> = {
-  T6: ' OBS did not start the recording in 30 s. Look in OBS for an error dialog.',
-  T7: ' OBS did not start the recording. OBS gives no reason, so look in the OBS log.',
-  T12: ' OBS did not start a recording while I held your stop. A later recording is reported and never stopped by me.',
-  T19: ' OBS records again, but this is not the recording that I stopped. Its old file stays as it is.',
-  T24: ' OBS records, but this is not the take I followed. Its old file stays as it is.',
-  R1: ' OBS records, but I cannot tell if it is the start that I sent, so this take ends here.',
-  R2: ' OBS shows no recording, so the start did not happen.',
-  R4: ' OBS records, but this is not the take I followed. Its old file stays as it is.',
+/** What happened to the old file of a take that a new recording replaced (F-T7-51). */
+const oldFile = (t: Take) =>
+  t.paths.length ? `I did not check its file ${fileName(t.paths.at(-1))}. To check it, run obs_verify_file with this file name.` : 'I do not know the name of its file, so I did not check it.';
+const CLOSED: Record<string, (t: Take) => string> = {
+  T6: () => ' OBS did not start the recording in 30 s. Look in OBS for an error dialog.',
+  T7: () => ' OBS did not start the recording. OBS gives no reason, so look in the OBS log.',
+  T12: () => ' OBS did not start a recording while I held your stop. A later recording is reported and never stopped by me.',
+  T19: (t) => ` The recording that I stopped at ${clock(t.stopAt ?? 0)} has ended, and OBS records a new one now. I sent the stop once. ${oldFile(t)}`,
+  T24: (t) => ` The take that I followed ended while I could not reach OBS, and OBS records a new one now. ${oldFile(t)}`,
+  R1: () => ' OBS records, but I cannot tell if it is the start that I sent, so this take ends here.',
+  R2: () => ' OBS shows no recording, so the start did not happen.',
+  R4: (t) => ` The take that I followed ended while obs-mcp was not running, and OBS records a new one now. ${oldFile(t)}`,
 };
