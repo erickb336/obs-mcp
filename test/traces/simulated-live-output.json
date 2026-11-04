@@ -1,0 +1,18 @@
+{
+  "format": "obs-mcp-trace/1",
+  "source": "simulated",
+  "basis": "SIMULATED. Written by hand from the output checks of obs-websocket 5.7.6 (commit e28f849), as the T20 research lists them: 500 OutputRunning and 501 OutputNotRunning. videoActive means that any video output is live: stream, recording, replay buffer or virtual camera. The comments are the obs-websocket source texts. Not captured from OBS: a real capture replaces this file.",
+  "obs": { "obsVersion": "33.0.1", "obsWebSocketVersion": "5.7.6", "rpcVersion": 1 },
+  "entries": [
+    { "requestType": "SetVideoSettings", "when": { "videoActive": true }, "status": { "result": false, "code": 500, "comment": "Video settings cannot be changed while an output is active." } },
+    { "requestType": "SetStreamServiceSettings", "when": { "streaming": true }, "status": { "result": false, "code": 500, "comment": "You cannot change stream service settings while streaming." } },
+    { "requestType": "SetRecordDirectory", "when": { "recording": true }, "status": { "result": false, "code": 500 } },
+    { "requestType": "StartStream", "when": { "streaming": true }, "status": { "result": false, "code": 500 } },
+    { "requestType": "StopStream", "when": { "streaming": false }, "status": { "result": false, "code": 501 } },
+    { "requestType": "StartVirtualCam", "when": { "virtualCam": true }, "status": { "result": false, "code": 500 } },
+    { "requestType": "StopVirtualCam", "when": { "virtualCam": false }, "status": { "result": false, "code": 501 } },
+    { "requestType": "StartReplayBuffer", "when": { "replayBuffer": true }, "status": { "result": false, "code": 500 } },
+    { "requestType": "StopReplayBuffer", "when": { "replayBuffer": false }, "status": { "result": false, "code": 501 } },
+    { "requestType": "SaveReplayBuffer", "when": { "replayBuffer": false }, "status": { "result": false, "code": 501 } }
+  ]
+}

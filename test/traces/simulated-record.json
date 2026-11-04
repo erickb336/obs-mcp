@@ -1,0 +1,60 @@
+{
+  "format": "obs-mcp-trace/1",
+  "source": "simulated",
+  "basis": "SIMULATED. Written by hand from the obs-websocket 5.7.6 protocol and the facts of the T4 spike on OBS 33.0.1: STARTING at 13 to 39 ms and STARTED at 21 to 51 ms after a record start; the stop returns at once and STOPPED comes at 1,013 to 1,111 ms; GetOutputSettings gives a path only while recording. The effects of StopOutput, ToggleOutput and the stop hotkey on the record output are inferred from the source, not measured. Not captured from OBS. StartRecord and StopRecord are real now, in the real record trace.",
+  "obs": { "obsVersion": "33.0.1", "obsWebSocketVersion": "5.7.6", "rpcVersion": 1 },
+  "entries": [
+    {
+      "requestType": "ToggleRecord",
+      "when": { "recording": false },
+      "status": { "result": true, "code": 100 },
+      "responseData": { "outputActive": true },
+      "events": [
+        { "delayMs": 25, "eventType": "RecordStateChanged", "eventData": { "outputActive": false, "outputState": "OBS_WEBSOCKET_OUTPUT_STARTING", "outputPath": null } },
+        { "delayMs": 40, "eventType": "RecordStateChanged", "eventData": { "outputActive": true, "outputState": "OBS_WEBSOCKET_OUTPUT_STARTED", "outputPath": "[path]" } }
+      ],
+      "effect": { "recording": true }
+    },
+    {
+      "requestType": "ToggleRecord",
+      "when": { "recording": true },
+      "status": { "result": true, "code": 100 },
+      "responseData": { "outputActive": false },
+      "events": [
+        { "delayMs": 1, "eventType": "RecordStateChanged", "eventData": { "outputActive": false, "outputState": "OBS_WEBSOCKET_OUTPUT_STOPPING", "outputPath": null } },
+        { "delayMs": 1050, "eventType": "RecordStateChanged", "eventData": { "outputActive": false, "outputState": "OBS_WEBSOCKET_OUTPUT_STOPPED", "outputPath": "[path]" } }
+      ],
+      "effect": { "recording": false }
+    },
+    {
+      "requestType": "PauseRecord",
+      "when": { "recording": true },
+      "status": { "result": true, "code": 100 },
+      "events": [{ "delayMs": 5, "eventType": "RecordStateChanged", "eventData": { "outputActive": true, "outputState": "OBS_WEBSOCKET_OUTPUT_PAUSED", "outputPath": null } }]
+    },
+    { "requestType": "PauseRecord", "when": { "recording": false }, "status": { "result": false, "code": 501 } },
+    {
+      "requestType": "ResumeRecord",
+      "when": { "recording": true },
+      "status": { "result": true, "code": 100 },
+      "events": [{ "delayMs": 5, "eventType": "RecordStateChanged", "eventData": { "outputActive": true, "outputState": "OBS_WEBSOCKET_OUTPUT_RESUMED", "outputPath": null } }]
+    },
+    { "requestType": "ResumeRecord", "when": { "recording": false }, "status": { "result": false, "code": 501 } },
+    { "requestType": "StopOutput", "requestData": { "outputName": "adv_file_output" }, "when": { "recording": true }, "status": { "result": true, "code": 100 }, "effect": { "recording": false } },
+    { "requestType": "StartOutput", "requestData": { "outputName": "adv_file_output" }, "when": { "recording": true }, "status": { "result": false, "code": 500 } },
+    { "requestType": "ToggleOutput", "requestData": { "outputName": "adv_file_output" }, "when": { "recording": true }, "status": { "result": true, "code": 100 }, "responseData": { "outputActive": false }, "effect": { "recording": false } },
+    {
+      "requestType": "TriggerHotkeyByName",
+      "requestData": { "hotkeyName": "OBSBasic.StopRecording" },
+      "when": { "recording": true },
+      "status": { "result": true, "code": 100 },
+      "events": [
+        { "delayMs": 1, "eventType": "RecordStateChanged", "eventData": { "outputActive": false, "outputState": "OBS_WEBSOCKET_OUTPUT_STOPPING", "outputPath": null } },
+        { "delayMs": 1050, "eventType": "RecordStateChanged", "eventData": { "outputActive": false, "outputState": "OBS_WEBSOCKET_OUTPUT_STOPPED", "outputPath": "[path]" } }
+      ],
+      "effect": { "recording": false }
+    },
+    { "requestType": "GetOutputSettings", "requestData": { "outputName": "adv_file_output" }, "when": { "recording": false }, "status": { "result": true, "code": 100 }, "responseData": { "outputSettings": {} } },
+    { "requestType": "GetOutputSettings", "requestData": { "outputName": "adv_file_output" }, "when": { "recording": true }, "status": { "result": true, "code": 100 }, "responseData": { "outputSettings": { "hidden_key_1": "[path]", "hidden_key_2": "" } } }
+  ]
+}

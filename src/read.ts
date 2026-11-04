@@ -72,9 +72,9 @@ export async function read(obs: Obs, request: string, params: Record<string, unk
  * Returns why a list request must not run, or the params to send. It reads the state of every output just before,
  * whoever started them: recording, stream, replay buffer, virtual camera and plugin outputs. A state that is not
  * known, or a read that fails, refuses the request. The request goes out by the input UUID that the check resolved,
- * so another client cannot swap the input between the check and the request.
+ * so another client cannot swap the input between the check and the request. The trace capture uses it too.
  */
-async function listGuard(obs: Obs, params: Record<string, unknown>): Promise<string | Record<string, unknown>> {
+export async function listGuard(obs: Pick<Obs, 'call' | 'version'>, params: Record<string, unknown>): Promise<string | Record<string, unknown>> {
   // With both fields, the guard could clear one input while OBS resolves the other.
   if (params.inputName !== undefined && params.inputUuid !== undefined) return 'give inputName or inputUuid, not both.';
   const unknown = 'the state of the OBS outputs is not known, and a list request can crash OBS during an output.';

@@ -1,0 +1,106 @@
+{
+  "format": "obs-mcp-trace/1",
+  "source": "real",
+  "basis": "REAL. Captured on 2026-11-03 with the trace capture script and --allow-record from a running OBS 33.0.1, obs-websocket 5.7.6, on macOS, then scrubbed: one test recording of 17 s, deleted after. StartRecord when idle, StartRecord while recording (code 500), StopRecord while recording, StopRecord when idle (code 501). STOPPED came 235 ms after StopRecord in this run; the T4 spike measured 1013 to 1111 ms.",
+  "obs": {
+    "obsVersion": "33.0.1",
+    "obsWebSocketVersion": "5.7.6",
+    "rpcVersion": 1,
+    "platform": "macos"
+  },
+  "entries": [
+    {
+      "requestType": "StartRecord",
+      "when": {
+        "recording": false,
+        "streaming": false
+      },
+      "status": {
+        "code": 100,
+        "result": true
+      },
+      "events": [
+        {
+          "delayMs": 51,
+          "eventType": "RecordStateChanged",
+          "eventData": {
+            "outputActive": false,
+            "outputPath": null,
+            "outputState": "OBS_WEBSOCKET_OUTPUT_STARTING"
+          }
+        },
+        {
+          "delayMs": 272,
+          "eventType": "RecordStateChanged",
+          "eventData": {
+            "outputActive": true,
+            "outputPath": "[path]",
+            "outputState": "OBS_WEBSOCKET_OUTPUT_STARTED"
+          }
+        }
+      ],
+      "effect": {
+        "recording": true
+      }
+    },
+    {
+      "requestType": "StartRecord",
+      "when": {
+        "recording": true,
+        "streaming": false
+      },
+      "status": {
+        "code": 500,
+        "result": false
+      }
+    },
+    {
+      "requestType": "StopRecord",
+      "when": {
+        "recording": true,
+        "streaming": false
+      },
+      "status": {
+        "code": 100,
+        "result": true
+      },
+      "responseData": {
+        "outputPath": "[path]"
+      },
+      "events": [
+        {
+          "delayMs": 2,
+          "eventType": "RecordStateChanged",
+          "eventData": {
+            "outputActive": false,
+            "outputPath": null,
+            "outputState": "OBS_WEBSOCKET_OUTPUT_STOPPING"
+          }
+        },
+        {
+          "delayMs": 235,
+          "eventType": "RecordStateChanged",
+          "eventData": {
+            "outputActive": false,
+            "outputPath": "[path]",
+            "outputState": "OBS_WEBSOCKET_OUTPUT_STOPPED"
+          }
+        }
+      ],
+      "effect": {
+        "recording": false
+      }
+    },
+    {
+      "requestType": "StopRecord",
+      "when": {
+        "recording": false,
+        "streaming": false
+      },
+      "status": {
+        "code": 501,
+        "result": false
+      }
+    }
+  ]
+}

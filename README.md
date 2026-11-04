@@ -6,7 +6,12 @@ An agent can find any of the 147 documented obs-websocket requests and run the r
 
 [![CI](https://github.com/erickb336/obs-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/erickb336/obs-mcp/actions/workflows/ci.yml) [![Licence: MIT](https://img.shields.io/github/license/erickb336/obs-mcp)](LICENSE)
 
-> **Status: pre-release 0.0. Not yet published to npm. Not tested on real OBS**, except the one cleared list row in [Safety rules](#safety-rules). All tests run against a simulated OBS.
+> **Status: pre-release 0.0. Not yet published to npm.** All tests run against a fake OBS that replays stored traces ([The fake OBS and its traces](#the-fake-obs-and-its-traces)):
+>
+> - **Real traces:** the default reads, and `StartRecord` and `StopRecord`. They were captured from a real OBS 33.0.1 on macOS, then scrubbed.
+> - **Simulated behaviour:** `ToggleRecord`, pause and resume, `StopOutput`, `ToggleOutput`, the stop hotkey, the live-output blocks and the crash of a list request. These traces are written by hand, so the stop-rule sweep runs against a simulated take.
+>
+> The one cleared list row in [Safety rules](#safety-rules) was also tested on real OBS.
 
 Contents: [Quick start](#quick-start) · [Usage](#usage) · [Tools](#tools) · [Safety rules](#safety-rules) · [How it works](#how-it-works) · [Settings](#settings) · [Under the hood](#under-the-hood) · [Licence](#licence)
 
@@ -187,8 +192,28 @@ All are optional.
 | `src/` | The server, the doctor, the OBS layer and the platform layer |
 | `catalogue/classes.json` | One class row for each documented request |
 | `protocol/` | The pinned protocol description and its source |
-| `scripts/` | The catalogue generator and the packed-package smoke test |
-| `test/` | Tests, a simulated OBS that closes the socket (code 1006) on an untested list request, and a script that makes SIMULATED media with ffmpeg for the file check. `test/real-files.test.mjs` checks real recordings of your own: it runs only when `OBS_MCP_REAL_DIR` names their folder |
+| `scripts/` | The catalogue generator, the packed-package smoke test, the trace capture, the trace scrub and the timing loop |
+| `test/` | Tests, the fake OBS, and a script that makes SIMULATED media with ffmpeg for the file check. `test/real-files.test.mjs` checks real recordings of your own: it runs only when `OBS_MCP_REAL_DIR` names their folder |
+| `test/traces/` | The stored traces that the fake OBS replays. Each file says its `source` (`real` or `simulated`), and its name starts with it |
+
+### The fake OBS and its traces
+
+All tests run against a fake OBS (`test/fake-obs.mjs`). It replays the stored traces: a request, its data and the output state give the status code, the reply, the events and the change of state of the trace. A request with no trace gets sample values in the shape of the protocol. The fake closes the socket with code 1006 on a list request that is not tested on real OBS, as real OBS does when it crashes. It counts each recording that stops.
+
+The traces are of two kinds:
+
+- **Real** (`real-*.json`): captured from a running OBS 33.0.1 with obs-websocket 5.7.6 on macOS, then scrubbed. `real-reads.json` holds the reads of the default capture plan that the fake does not answer from its own model. `real-record.json` holds `StartRecord` and `StopRecord`, each when idle and while recording, from one test recording. Names and settings are `[scrubbed]`, and each file's `basis` says what was left out.
+- **Simulated** (`simulated-*.json`): written by hand from the protocol and from facts measured on real OBS 33.0.1 (for example, `SetVideoSettings` gives code 500 during any output). These are the requests that the capture does not send to a real OBS: `ToggleRecord`, pause and resume, `StopOutput`, `ToggleOutput`, the stop hotkey, `GetOutputSettings` and the live-output blocks.
+
+| Tool | What it does |
+| --- | --- |
+| `node scripts/capture-traces.mjs --url ws://127.0.0.1:4455 --out trace.json` | Records requests, replies and events. It reads the password from `OBS_WEBSOCKET_PASSWORD` or a hidden prompt. It stops when a stream or recording is active. It sends only the requests that `obs_read` runs, behind the same guards as the server, and starts or stops a recording only with `--allow-record`. With it, the script starts a take only when no recording is active, and stops only the take that it started. It never stops a take that you start, and it never sends `ToggleRecord`. When OBS closes the connection or gives no reply in `--timeout-ms` (default 10000), it stops with the reason and writes the partial trace. It writes a trace only after the scrub. |
+| `node scripts/trace-scrub.mjs --check test/traces/*.json` | Fails when a trace holds a string that the allow-list does not keep, or a key that is not a plain identifier. A string stays only in a form that holds no text (an OBS enum value, a number, a time code, a version) or in a short list of fields that OBS fixes, such as `requestType` and `outputState`. So scene, input and profile names, every settings value, profile parameter value and the data of custom and vendor events and requests are removed. In those values, each string and number goes, and each key becomes `hidden_key_<n>`, as in the server. A real UUID fails the check, and the scrub replaces it with a fake one (`00000000-0000-4000-8000-<n>`). `node scripts/trace-scrub.mjs --in-place <file>...` gives the same fake to the same UUID in all the files. A string that stays must also pass a deny list of secrets, host names, addresses and the names of this machine. `npm test` runs the same scan on every stored trace. |
+| `node scripts/timing-loop.mjs` | Measures the time that the server adds to each request over loopback, against the fake OBS. Add `--url ws://127.0.0.1:4455` to measure a running OBS. |
+
+The stop rule has its own test (`test/sweep.test.mjs`): during a simulated take, it sends each of the 147 requests through the server, and the two list requests that crash OBS. Result: 0 stops and 0 crashes. The same requests sent straight to the fake OBS stop the take 6 times, so the test can see a stop.
+
+### Run the checks
 
 Run the checks from a clone:
 
