@@ -55,7 +55,7 @@ const sample = (type) => (type.startsWith('Array') ? [] : SAMPLE[type]);
  * cumulative across takes, as T4 measured. Each take gets a new file path in the record folder; it replaces the "[path]" of a trace.
  * Each input has the UUID "uuid-<name>". Like OBS, the fake resolves inputName first and inputUuid only when no name is given.
  * Returns { port, log, sent, planted, state, stops, crashes, connections, path(), startInObs(), stopInObs(), pauseInObs(), resumeInObs(),
- * restartObs(), close() }. The *InObs() calls are what a person does with the OBS buttons: they play the events of the trace, with no request. log holds every request type that reached the fake, in order;
+ * restartObs(), drop(), close() }. The *InObs() calls are what a person does with the OBS buttons: they play the events of the trace, with no request. log holds every request type that reached the fake, in order;
  * sent holds { requestType, requestData } for each; connections() is the count of WebSocket connections that the fake accepted.
  * state is the output state now. stops holds { requestType, cause } for each recording that a request or a crash stopped;
  * crashes() is the count of simulated crashes (each closes the socket with 1006 and ends every output, as a real crash does).
@@ -303,6 +303,10 @@ export async function startFakeObs(options = {}) {
       apply({ recording: false });
       for (const k of Object.keys(state)) state[k] = false;
       rec.base = 0;
+      for (const c of wss.clients) c.terminate();
+    },
+    // The socket drops (code 1006) while OBS runs on: every output stays as it is.
+    drop: () => {
       for (const c of wss.clients) c.terminate();
     },
     options: o,

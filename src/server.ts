@@ -196,7 +196,8 @@ export function createServer(app: App) {
       try {
         const same = takes.byToken(token);
         if (same) return say(line(same)); // O3
-        if (!canAsk(server, ctx)) return say(TEXT.X2);
+        // G26: refuse. The read opens the connection, so that the server sees your start in OBS (E9, T22).
+        if (!canAsk(server, ctx)) return (await takes.read().catch(() => undefined), say(TEXT.X2));
         const a = answerOf(ctx);
         const r = await takes.read(); // rule 4: before the prompt, and again after the answer
         if (a.action === 'none') {
