@@ -1,7 +1,7 @@
 {
   "format": "obs-mcp-trace/1",
   "source": "simulated",
-  "basis": "SIMULATED. Written by hand from the obs-websocket 5.7.6 protocol and the facts of the T4 spike on OBS 33.0.1: STARTING at 13 to 39 ms and STARTED at 21 to 51 ms after a record start; the stop returns at once and STOPPED comes at 1,013 to 1,111 ms; GetOutputSettings gives a path only while recording. The effects of StopOutput, ToggleOutput and the stop hotkey on the record output are inferred from the source, not measured. Not captured from OBS. StartRecord and StopRecord are real now, in the real record trace.",
+  "basis": "SIMULATED. Written by hand from the obs-websocket 5.7.6 protocol and the facts of the T4 spike on OBS 33.0.1: STARTING at 13 to 39 ms and STARTED at 21 to 51 ms after a record start; the stop returns at once and STOPPED comes at 1,013 to 1,111 ms; PauseRecord on a paused output gives 502 and ResumeRecord on an output that is not paused gives 503, by reading the obs-websocket 5.7.6 source (RequestHandler_Record.cpp); both give 501 when nothing records. The fake models GetOutputSettings of the file output (a path only while recording) and the record status. The effects of StopOutput, ToggleOutput and the stop hotkey on the record output are inferred from the source, not measured. Not captured from OBS. StartRecord and StopRecord are real now, in the real record trace.",
   "obs": { "obsVersion": "33.0.1", "obsWebSocketVersion": "5.7.6", "rpcVersion": 1 },
   "entries": [
     {
@@ -28,17 +28,21 @@
     },
     {
       "requestType": "PauseRecord",
-      "when": { "recording": true },
+      "when": { "recording": true, "paused": false },
       "status": { "result": true, "code": 100 },
-      "events": [{ "delayMs": 5, "eventType": "RecordStateChanged", "eventData": { "outputActive": true, "outputState": "OBS_WEBSOCKET_OUTPUT_PAUSED", "outputPath": null } }]
+      "events": [{ "delayMs": 5, "eventType": "RecordStateChanged", "eventData": { "outputActive": true, "outputState": "OBS_WEBSOCKET_OUTPUT_PAUSED", "outputPath": null } }],
+      "effect": { "paused": true }
     },
+    { "requestType": "PauseRecord", "when": { "recording": true, "paused": true }, "status": { "result": false, "code": 502 } },
     { "requestType": "PauseRecord", "when": { "recording": false }, "status": { "result": false, "code": 501 } },
     {
       "requestType": "ResumeRecord",
-      "when": { "recording": true },
+      "when": { "recording": true, "paused": true },
       "status": { "result": true, "code": 100 },
-      "events": [{ "delayMs": 5, "eventType": "RecordStateChanged", "eventData": { "outputActive": true, "outputState": "OBS_WEBSOCKET_OUTPUT_RESUMED", "outputPath": null } }]
+      "events": [{ "delayMs": 5, "eventType": "RecordStateChanged", "eventData": { "outputActive": true, "outputState": "OBS_WEBSOCKET_OUTPUT_RESUMED", "outputPath": null } }],
+      "effect": { "paused": false }
     },
+    { "requestType": "ResumeRecord", "when": { "recording": true, "paused": false }, "status": { "result": false, "code": 503 } },
     { "requestType": "ResumeRecord", "when": { "recording": false }, "status": { "result": false, "code": 501 } },
     { "requestType": "StopOutput", "requestData": { "outputName": "adv_file_output" }, "when": { "recording": true }, "status": { "result": true, "code": 100 }, "effect": { "recording": false } },
     { "requestType": "StartOutput", "requestData": { "outputName": "adv_file_output" }, "when": { "recording": true }, "status": { "result": false, "code": 500 } },
@@ -53,8 +57,6 @@
         { "delayMs": 1050, "eventType": "RecordStateChanged", "eventData": { "outputActive": false, "outputState": "OBS_WEBSOCKET_OUTPUT_STOPPED", "outputPath": "[path]" } }
       ],
       "effect": { "recording": false }
-    },
-    { "requestType": "GetOutputSettings", "requestData": { "outputName": "adv_file_output" }, "when": { "recording": false }, "status": { "result": true, "code": 100 }, "responseData": { "outputSettings": {} } },
-    { "requestType": "GetOutputSettings", "requestData": { "outputName": "adv_file_output" }, "when": { "recording": true }, "status": { "result": true, "code": 100 }, "responseData": { "outputSettings": { "hidden_key_1": "[path]", "hidden_key_2": "" } } }
+    }
   ]
 }

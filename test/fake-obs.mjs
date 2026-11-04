@@ -6,6 +6,7 @@
 // closes the socket with no close frame (the client sees 1006) on a list request that real OBS can crash on.
 import { createHash, randomBytes } from 'node:crypto';
 import { readdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { WebSocketServer } from 'ws';
 
 const protocol = JSON.parse(readFileSync(new URL('../protocol/protocol.json', import.meta.url), 'utf8'));
@@ -46,9 +47,15 @@ const sample = (type) => (type.startsWith('Array') ? [] : SAMPLE[type]);
  * port (default: any free port), platform, obsVersion, inputs ({name: kind}), streamKey, token, crashOn (request name),
  * outputs (the GetOutputList items; by default four outputs, each active when its output state is on),
  * silentOn (request names that never get an answer), failOn (request names that get a failed status),
- * recordDirectory (the GetRecordDirectory folder), plant (bool: see plantReply below; each planted secret is listed in `planted` as { secret, field }).
+ * recordDirectory (the GetRecordDirectory folder), plant (bool: see plantReply below; each planted secret is listed in `planted` as { secret, field }),
+ * elapsedMs (how long a recording at start has run), lagMs (how far outputDuration runs behind the clock; T4 measured 1,000 to 1,200 ms),
+ * closeAfter (request names: OBS runs the request, then the connection closes before the reply),
+ * dropEvents (output states, such as 'OBS_WEBSOCKET_OUTPUT_STARTED', whose events never go out).
+ * The record status runs on the clock: outputDuration stops during a pause, and outputBytes (1,000 bytes for each ms recorded) is
+ * cumulative across takes, as T4 measured. Each take gets a new file path in the record folder; it replaces the "[path]" of a trace.
  * Each input has the UUID "uuid-<name>". Like OBS, the fake resolves inputName first and inputUuid only when no name is given.
- * Returns { port, log, sent, planted, state, stops, crashes, connections, close() }. log holds every request type that reached the fake, in order;
+ * Returns { port, log, sent, planted, state, stops, crashes, connections, path(), startInObs(), stopInObs(), pauseInObs(), resumeInObs(),
+ * restartObs(), close() }. The *InObs() calls are what a person does with the OBS buttons: they play the events of the trace, with no request. log holds every request type that reached the fake, in order;
  * sent holds { requestType, requestData } for each; connections() is the count of WebSocket connections that the fake accepted.
  * state is the output state now. stops holds { requestType, cause } for each recording that a request or a crash stopped;
  * crashes() is the count of simulated crashes (each closes the socket with 1006 and ends every output, as a real crash does).
@@ -59,7 +66,36 @@ export async function startFakeObs(options = {}) {
   const log = [];
   const sent = [];
   const planted = [];
-  const state = { recording: !!o.recording, streaming: !!o.streaming, replayBuffer: !!o.replayBuffer, virtualCam: !!o.virtualCam };
+  const state = { recording: !!o.recording, paused: false, streaming: !!o.streaming, replayBuffer: !!o.replayBuffer, virtualCam: !!o.virtualCam };
+  // The clock of the record output: when the take started, its paused time, and the bytes of the takes before it.
+  const rec = { startAt: Date.now() - (o.elapsedMs ?? 0), pausedMs: 0, pauseAt: 0, base: 0, path: undefined, takes: 0 };
+  const recordDir = () => o.recordDirectory ?? 'sample';
+  const newPath = () => {
+    const d = new Date();
+    const p = (n) => String(n).padStart(2, '0');
+    rec.takes++;
+    // OBS names a file by its start time; the take number keeps two takes in one second apart.
+    rec.path = join(recordDir(), `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())} ${rec.takes}.mov`);
+    return rec.path;
+  };
+  if (state.recording) newPath();
+  const durationMs = () => (state.recording ? Math.max(0, (state.paused ? rec.pauseAt : Date.now()) - rec.startAt - rec.pausedMs - (o.lagMs ?? 0)) : 0);
+  const bytes = () => rec.base + durationMs() * 1000;
+  // An effect lands on the output state, and moves the clock of the record output with it.
+  const apply = (effect = {}) => {
+    const now = Date.now();
+    if (effect.recording === true && !state.recording) Object.assign(rec, { startAt: now, pausedMs: 0 });
+    if (effect.recording === false && state.recording) {
+      rec.base = bytes();
+      state.paused = false;
+    }
+    if (effect.paused === true && state.recording && !state.paused) rec.pauseAt = now;
+    if (effect.paused === false && state.paused) rec.pausedMs += now - rec.pauseAt;
+    Object.assign(state, effect);
+  };
+  // A trace holds the placeholder "[path]" where OBS gave the file path; the fake gives the path of the take.
+  const withPath = (v) => (v === undefined ? v : JSON.parse(JSON.stringify(v).replaceAll('"[path]"', JSON.stringify(rec.path ?? null))));
+  const tc = (ms) => new Date(ms).toISOString().slice(11, 23);
   const stops = [];
   let crashes = 0;
   const timers = new Set();
@@ -72,6 +108,7 @@ export async function startFakeObs(options = {}) {
   const crash = (ws, requestType) => {
     crashes++;
     if (state.recording) stops.push({ requestType, cause: 'crash' });
+    apply({ recording: false });
     for (const k of Object.keys(state)) state[k] = false;
     ws.terminate();
   };
@@ -130,9 +167,9 @@ export async function startFakeObs(options = {}) {
       case 'GetVersion':
         return { obsVersion: o.obsVersion, obsWebSocketVersion: '5.7.6', rpcVersion: 1, availableRequests: [...DOCUMENTED.keys(), ...PRIVATE_REQUESTS], supportedImageFormats: ['png', 'jpg'], platform: o.platform, platformDescription: `${o.platform} (simulated)` };
       case 'GetRecordDirectory':
-        return { recordDirectory: o.recordDirectory ?? 'sample' };
+        return { recordDirectory: recordDir() };
       case 'GetRecordStatus':
-        return { outputActive: state.recording, outputPaused: false, outputTimecode: '00:00:00.000', outputDuration: 0, outputBytes: 0 };
+        return { outputActive: state.recording, outputPaused: state.paused, outputTimecode: tc(durationMs()), outputDuration: durationMs(), outputBytes: bytes() };
       case 'GetStreamStatus':
         return { outputActive: state.streaming, outputReconnecting: false, outputTimecode: '00:00:00.000', outputDuration: 0, outputCongestion: 0, outputBytes: 0, outputSkippedFrames: 0, outputTotalFrames: 0 };
       case 'GetInputSettings': {
@@ -143,6 +180,8 @@ export async function startFakeObs(options = {}) {
       case 'GetStreamServiceSettings': // F-T12-9: a server with no scheme and the key in its path
         return { streamServiceType: 'rtmp_custom', streamServiceSettings: { server: `live.example.com:1935/app/${key()}`, protocol: 'RTMP', key: key(), use_auth: true, username: 'someone', password: o.password ?? 'none' } };
       case 'GetOutputSettings':
+        // The file output has a path only while it records (T4). Its settings hold a stream key too, as a custom FFmpeg output can.
+        if (outputs().some((x) => x.outputName === data?.outputName && x.outputKind === 'ffmpeg_muxer')) return { outputSettings: state.recording ? { path: rec.path, muxer_settings: '', ...settings() } : {} };
         return { outputSettings: { ...settings(), url: `ingest.example.com:1935/app/${key()}` } }; // a custom FFmpeg output URL with no scheme
       case 'GetSourceFilter':
         return { filterEnabled: true, filterIndex: 0, filterKind: 'sample_kind', filterSettings: settings() };
@@ -195,10 +234,16 @@ export async function startFakeObs(options = {}) {
     });
   });
   /** Logs and answers one request, and plays its trace. Returns the reply, or nothing on a crash or a silent request. */
-  const handle = (ws, { requestType, requestId, requestData }) => {
-    log.push(requestType);
-    sent.push({ requestType, requestData });
+  const handle = (ws, { requestType, requestId, requestData }, closing = false) => {
+    if (!closing) {
+      log.push(requestType);
+      sent.push({ requestType, requestData });
+    }
     if (requestType === o.crashOn) return crash(ws, requestType);
+    if (!closing && o.closeAfter?.includes(requestType)) {
+      handle(ws, { requestType, requestId, requestData }, true);
+      return void ws.terminate();
+    }
     if (o.silentOn?.includes(requestType)) return undefined;
     if (requestType === 'GetInputPropertiesListPropertyItems') {
       const cleared = o.inputs[inputOf(requestData)] === 'screen_capture' && requestData?.propertyName === 'type';
@@ -208,17 +253,31 @@ export async function startFakeObs(options = {}) {
     const failed = !known ? 204 : o.failOn?.includes(requestType) ? 600 : undefined;
     const t = failed ? undefined : traceFor(requestType, requestData);
     const status = failed ? { result: false, code: failed, comment: 'simulated failure' } : (t?.status ?? { result: true, code: 100 });
-    const answered = t ? (t.responseData ?? {}) : answer(requestType, requestData);
+    if (t?.effect?.recording === true && !state.recording) newPath();
+    const answered = t ? (withPath(t.responseData) ?? {}) : answer(requestType, requestData);
     // GetVersion is the handshake that the server needs to run, so it is never planted.
     const data = o.plant && requestType !== 'GetVersion' ? plantReply(answered) : answered;
     if (t) {
-      // The trace's events go out at their delays; its effect on the output state lands with the last one, as in OBS.
       // A stop counts at once: OBS accepted the request, so the take ends.
       if (t.effect?.recording === false && state.recording) stops.push({ requestType, cause: 'request' });
-      for (const ev of t.events ?? []) later(ev.delayMs ?? 0, () => broadcast(ev));
-      later(Math.max(0, ...(t.events ?? []).map((ev) => ev.delayMs ?? 0)), () => Object.assign(state, t.effect));
+      play(t);
     }
     return { requestType, requestId, requestStatus: status, ...(status.result ? { responseData: data } : {}) };
+  };
+  // The trace's events go out at their delays; its effect on the output state lands with the last one, as in OBS.
+  const play = (t) => {
+    const events = (t.events ?? []).map((ev) => ({ ...ev, eventData: withPath(ev.eventData) }));
+    for (const ev of events) if (!o.dropEvents?.includes(ev.eventData?.outputState)) later(ev.delayMs ?? 0, () => broadcast(ev));
+    later(Math.max(0, ...events.map((ev) => ev.delayMs ?? 0)), () => apply(t.effect));
+  };
+  // A click on an OBS button: the trace of its request plays, with no request on the wire. It returns false when OBS would refuse.
+  const button = (requestType) => () => {
+    const t = traceFor(requestType, {});
+    if (!t?.status.result) return false;
+    if (t.effect?.recording === true) newPath();
+    if (t.effect?.recording === false) stops.push({ requestType, cause: 'button' });
+    play(t);
+    return true;
   };
   const broadcast = ({ eventType, eventData }) => {
     const message = JSON.stringify({ op: 5, d: { eventType, eventIntent: EVENT_BIT.get(eventType), eventData } });
@@ -234,6 +293,18 @@ export async function startFakeObs(options = {}) {
     stops,
     crashes: () => crashes,
     connections: () => connections,
+    path: () => rec.path,
+    startInObs: button('StartRecord'),
+    stopInObs: button('StopRecord'),
+    pauseInObs: button('PauseRecord'),
+    resumeInObs: button('ResumeRecord'),
+    // OBS quits and opens again: every output ends, and the byte count starts again from 0.
+    restartObs: () => {
+      apply({ recording: false });
+      for (const k of Object.keys(state)) state[k] = false;
+      rec.base = 0;
+      for (const c of wss.clients) c.terminate();
+    },
     options: o,
     close: () => new Promise((r) => {
       for (const t of timers) clearTimeout(t);
