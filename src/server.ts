@@ -1,5 +1,5 @@
-// The MCP server over stdio: four read tools, and the take tools of release 0.1. The process opens no network socket;
-// it listens only on the local controller lock (G32, control.ts).
+// The MCP server over stdio: four read tools, and the take tools of release 0.1. The process listens only on the
+// controller lock, a TCP port of 127.0.0.1 that answers with a banner and reads nothing (G32, control.ts).
 import { McpServer, type ServerContext } from '@modelcontextprotocol/server';
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
 import { fileURLToPath } from 'node:url';
@@ -9,7 +9,7 @@ import { asking, canAsk, Consents, type Answer } from './consent.js';
 import { Control } from './control.js';
 import { Journal } from './journal.js';
 import { connectionTarget, listenerCheck, Obs, ObsError, SETTINGS_FILE_FIX } from './obs.js';
-import { controlLock, listeners, obsConfigDir, stateDir } from './platform.js';
+import { listeners, obsConfigDir, stateDir } from './platform.js';
 import { deleteScreenshots, read } from './read.js';
 import { capped } from './redact.js';
 import { fileName, LIMITS, newTake, sameRecording, shown, stateLine, TEXT, type Limits, type Reading } from './take.js';
@@ -81,7 +81,7 @@ export function createApp(o: { target?: () => ReturnType<typeof connectionTarget
   const limits = o.limits ?? LIMITS;
   const obs = new Obs(target, limits);
   const journal = new Journal(o.dir ?? stateDir(env));
-  const lock = new Control(() => controlLock(target().url, env));
+  const lock = new Control(() => target().url);
   const folder = () => recordingFolder(obs, env);
   // The closed line (F-T7-25): the length of the file, with a label so that it does not read as a clock time (F-T7-34),
   // and the expected sources with sound, or the count of checks. A failed check or a warning names its check and the
@@ -100,7 +100,7 @@ export function createApp(o: { target?: () => ReturnType<typeof connectionTarget
       : '';
     return { result: v.state, summary: `${length}${what}${why}` };
   };
-  const takes = new Takes(obs, journal, limits, check, () => lock.held);
+  const takes = new Takes(obs, journal, limits, check, lock);
   const servers = new Set<McpServer>();
   takes.notify = (level, data) => {
     for (const s of servers) s.server.sendLoggingMessage({ level, logger: 'obs-mcp', data }).catch(() => {});
@@ -112,12 +112,13 @@ export function createApp(o: { target?: () => ReturnType<typeof connectionTarget
   });
   let becoming: Promise<boolean> | undefined;
   /**
-   * G32: become the controller of this OBS, at the server start and at each tool call of a reader. A new controller
-   * prunes the journal (G28) and follows its open takes with the restart rows R1 to R8 (D4, F-T7-58).
+   * G32: become the controller of this OBS, at the server start and at each tool call of a reader, and again when
+   * the OBS endpoint changed (F-T7-73). A new controller prunes the journal (G28) and follows its open takes with the
+   * restart rows R1 to R8 (D4, F-T7-58).
    */
   const control = () =>
     (becoming ??= (async () => {
-      if (lock.held) return true;
+      if (lock.holds()) return true;
       if (!(await lock.acquire())) return false;
       journal.prune();
       await takes.resume().catch((e) => console.error(`obs-mcp: ${(e as Error).message}`));
@@ -247,7 +248,7 @@ export function createServer(app: App) {
   const start = async (token: string, test: boolean | undefined, ctx: ServerContext, a: Answer) => {
     // An answer spends its consent at once, so that no early reply leaves a live consent behind (F-T7-60).
     const v = a.action === 'none' ? undefined : a.action === 'accept' ? consents.use(a.id) : (consents.drop(a.id), undefined);
-    if (!app.lock.held) return say(TEXT.X16); // G32: a reader sends no start
+    if (!app.lock.held) return say(TEXT.X16('start', app.lock.error)); // G32: a reader sends no start
     const same = takes.byToken(token);
     if (same) return say(line(same, await takes.read().catch(() => undefined))); // O3, with the time now (F-T7-19)
     // G26: refuse. The read opens the connection, so that the server sees your start in OBS (E9, T22). While OBS
@@ -289,7 +290,7 @@ export function createServer(app: App) {
   const stop = async (ctx: ServerContext, a: Answer) => {
     // An answer spends its consent at once, so that no early reply leaves it to expire into a false X5 (F-T7-60).
     const v = a.action === 'none' ? undefined : a.action === 'accept' ? consents.use(a.id) : (consents.drop(a.id), undefined);
-    if (!app.lock.held) return say(TEXT.X16); // G32: a reader sends no stop
+    if (!app.lock.held) return say(TEXT.X16('stop', app.lock.error)); // G32: a reader sends no stop
     const r = await takes.read(); // read A before the prompt; read B after the answer (rule 4)
     let t = takes.current();
     if (!t && r.active) {
@@ -303,6 +304,7 @@ export function createServer(app: App) {
     if (a.action === 'none') {
       if (starting && !r.active) return say(line((await takes.stop(t.id, r, undefined, undefined)).take, r)); // T10: nothing to send
       if (!r.active) return say(line(t, r));
+      if (!r.path) return say(TEXT.X20); // no path: no stop can pass check 3, so no dialog (F-T7-55, F-T7-77)
       const ask = t.state === 'paused' || r.paused ? TEXT.W5(r) : t.kind === 'external' ? TEXT.W4(r) : TEXT.W3(r);
       return consents.ask(ask, { kind: 'stop', id: t.id, reading: r });
     }

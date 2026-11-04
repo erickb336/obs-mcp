@@ -319,26 +319,37 @@ export const TEXT = {
   X7: 'OBS is still finishing the last recording. I did not send a start. Ask again in a few seconds.',
   X8: (t: Take) => `I sent the stop at ${clock(t.stopAt ?? 0)}, but OBS did not confirm it in ${LIMITS.stopMs / 1000} s. I will not send it again, because a second stop can cut the file short. ${STOP_OBS}`,
   X9: (t: Take) => `I sent the start at ${clock(t.intentAt ?? 0)}, but OBS did not confirm it in ${LIMITS.startMs / 1000} s. I will not send it again. OBS may still start. In OBS, look at the Controls dock: if the button reads Stop Recording, OBS records.`,
-  /** recording: OBS recorded at the drop. Otherwise the text does not say that OBS records (F-T7-67). */
-  X10: (at: number, recording = true) => `I lost the connection to OBS at ${clock(at)}.${recording ? ' OBS keeps recording on its own.' : ''} I reconnect, and I send no recording request.`,
+  /** state: the state of the take at the drop. Only a take that records says that OBS records; a paused one says paused (F-T7-67, F-T7-75). */
+  X10: (at: number, state?: State) =>
+    `I lost the connection to OBS at ${clock(at)}.${state === 'paused' ? ' The recording was paused then.' : state === 'recording' || state === 'external' ? ' OBS keeps recording on its own.' : ''} I reconnect, and I send no recording request.`,
   /** The connection dropped right after the stop went out (7.1, F-T7-17). */
   X10b: 'I lost the connection to OBS right after I sent the stop. I will not send it again. I reconnect and read what OBS shows.',
   /** The connection dropped right after the start went out (F-T7-67). */
   X10c: 'I lost the connection to OBS right after I sent the start. I will not send it again. OBS may still start. I reconnect and read what OBS shows.',
-  /** The time is the last time that OBS surely recorded (F-T7-67); after a restart (R5) nobody knows it. */
-  X11: (t: Take) => `The recording stopped ${t.endedAt === undefined ? 'while I did not watch it' : `at about ${clock(t.endedAt).slice(0, 5)}`}, and nobody asked for it. OBS may show an error dialog. I am checking the file that OBS wrote: ${fileName(t.paths.at(-1))}.`,
+  /**
+   * A take that ended with no request. The time is the last time that OBS surely recorded (F-T7-67); after a restart
+   * (R5) nobody knows it. At the gone limit OBS gave no answer, so its state is unknown (F-T7-78). With no file path,
+   * no file is checked (F-T7-78).
+   */
+  X11: (t: Take) =>
+    `${t.marks.includes('lost') ? `I lost the connection to OBS at ${clock(t.endedAt ?? 0)}, and OBS has not answered since. I do not know the state of the recording now.` : `The recording stopped ${t.endedAt === undefined ? 'while I did not watch it' : `at about ${clock(t.endedAt).slice(0, 5)}`}, and nobody asked for it. OBS may show an error dialog.`} ${t.paths.length ? `I am checking the file that OBS wrote: ${fileName(t.paths.at(-1))}.` : 'OBS gave me no file path, so I cannot check the file.'}`,
   X12: (t: Take) => `The recording was stopped in OBS at ${clock(t.endedAt ?? 0)}. I am checking the file.`,
-  /** recording: a take that records. Otherwise the text does not say that OBS records (F-T7-67). */
-  X14: (recording = true) => (recording ? 'obs-mcp is closing. OBS keeps recording. I did not stop it.' : 'obs-mcp is closing. I did not send a stop.'),
+  /** state: a take that records or is paused. Otherwise the text does not say that OBS records (F-T7-67, F-T7-75). */
+  X14: (state?: 'recording' | 'paused') =>
+    state === 'recording' ? 'obs-mcp is closing. OBS keeps recording. I did not stop it.' : state === 'paused' ? 'obs-mcp is closing. The recording stays paused in OBS. I did not stop it.' : 'obs-mcp is closing. I did not send a stop.',
   X15: (r: Reading, sources: string[]) =>
     `OBS started a recording at ${clock(r.at - r.duration)} (file ${fileName(r.path)}). obs-mcp did not start it, and it does not stop it. ${sources.length ? `I watch ${list(sources)}, and I check the file when it ends.` : `I check the file when it ends. No expected sources. ${PREFLIGHT}`}`,
-  /** G32: a process that does not control recording. One text for every recording request. */
-  X16: 'I did not send it. Another obs-mcp copy controls recording in this OBS, and this copy only reads. To start or stop, click Start Recording or Stop Recording in the Controls dock of OBS.',
+  /**
+   * G32: a copy that does not control recording, for a start or a stop (F-T7-76). error: the lock gave an error, so
+   * this copy cannot confirm that it alone controls (F-T7-70).
+   */
+  X16: (what: 'start' | 'stop', error?: string) =>
+    `I did not send the ${what}. ${error ? `I cannot confirm that this obs-mcp copy alone controls recording in this OBS (the controller lock gave ${error}), so this copy only reads.` : 'Another obs-mcp copy controls recording in this OBS, and this copy only reads.'} To ${what} the recording, click ${what === 'start' ? 'Start Recording' : 'Stop Recording'} in the Controls dock of OBS.`,
   X17: (r: Reading) => `That confirm expired after 2 minutes, so I did not stop the recording. ${still(r)}${r.active ? ' Ask me again to stop it.' : ''}`,
   /** A second change after W6: the recording changed each time. */
   X19: 'The recording changed each time you decided, so I did not stop it. To stop it, click Stop Recording in the Controls dock of OBS.',
-  /** OBS gave no file path, so no stop can pass check 3 (F-T7-55). */
-  X20: 'I did not stop the recording. OBS gives me no file path for it, so I cannot tell that it is the recording you saw. To stop it, click Stop Recording in the Controls dock of OBS.',
+  /** OBS gave no file path, so no stop can pass check 3: no dialog, or no stop after it (F-T7-55, F-T7-77). */
+  X20: 'I did not stop the recording. OBS gives me no file path for it, so I cannot check that a stop goes to the right recording. To stop it, click Stop Recording in the Controls dock of OBS.',
   /** A file error of the journal: only its code, because the message names the folder (F-T7-38, F-T7-41). */
   J1: (code: string) => `I could not write the take record on this computer (${code}).`,
   X18: (r: Reading) => `A recording started in OBS after you asked me to stop (running ${hms(r.duration)}, file ${fileName(r.path)}). I did not stop it. To stop it, ask me again, or click Stop Recording in OBS.`,
@@ -397,7 +408,7 @@ export function stateLine(take: Take | undefined, r: Reading | undefined, now: n
       line = `Take closed: ${take.result}.${take.summary ? ` ${take.summary}` : (CLOSED[take.row ?? '']?.(take) ?? '')}`;
       break;
   }
-  if (take.marks.includes('offline') && isOpen(take)) line = `${TEXT.X10(take.offlineAt ?? now, RECORDS.includes(take.state))} ${line}`;
+  if (take.marks.includes('offline') && isOpen(take)) line = `${TEXT.X10(take.offlineAt ?? now, take.state)} ${line}`;
   if (take.kind === 'test' && isOpen(take) && !STOPS.includes(take.state) && take.state !== 'checking') line += TEST_MARK;
   return line;
 }

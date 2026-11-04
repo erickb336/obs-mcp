@@ -197,8 +197,9 @@ test('F-T7-19: O3, W8, X18 and the R3 gap give the values of now', async () => {
   await done(w, s);
 });
 
-test('G32, F-T7-66: the stop tool names no client, and X16 is the one text of a copy that only reads', async () => {
-  assert.equal(TEXT.X16, 'I did not send it. Another obs-mcp copy controls recording in this OBS, and this copy only reads. To start or stop, click Start Recording or Stop Recording in the Controls dock of OBS.');
+test('G32, F-T7-66, F-T7-76: the stop tool names no client; X16 names what it did not send, and one OBS button', async () => {
+  assert.equal(TEXT.X16('start'), 'I did not send the start. Another obs-mcp copy controls recording in this OBS, and this copy only reads. To start the recording, click Start Recording in the Controls dock of OBS.');
+  assert.equal(TEXT.X16('stop'), 'I did not send the stop. Another obs-mcp copy controls recording in this OBS, and this copy only reads. To stop the recording, click Stop Recording in the Controls dock of OBS.');
   const w = await world();
   const s = await server(w);
   const { tools } = await s.client.listTools();

@@ -58,8 +58,8 @@ export class Takes {
     readonly journal: Journal,
     readonly limits: Limits,
     private check: Check,
-    /** Whether this process controls recording now (G32). */
-    readonly controls: () => boolean = () => true,
+    /** The controller lock: only its holder follows takes and sends (G32). error says why a reader cannot confirm control. */
+    readonly lock: { readonly held: boolean; readonly error?: string } = { held: true },
   ) {
     obs.onEvent((e) => this.onEvent(e));
   }
@@ -283,7 +283,7 @@ export class Takes {
     if (e.type === 'opened') {
       // A connection is up: the waiting restart rows run (F-T7-3), and each take reads at once, so that the offline
       // mark ends with the reconnect (F-T7-16). The gone limit of the drop ends too: a later drop starts its own (F-T7-37).
-      if (!this.controls()) return;
+      if (!this.lock.held) return;
       void this.restartWaiting();
       for (const o of this.open.values()) {
         clearTimeout(o.gone);
@@ -318,7 +318,7 @@ export class Takes {
       this.ev.set(e.conn, (this.ev.get(e.conn) ?? 0) + 1);
       this.lastEventAt = at;
     }
-    if (!this.controls()) return;
+    if (!this.lock.held) return;
     // The state name gives the state. PAUSED comes with outputActive false, but the output stays active (R210).
     const path = pathOf(e.data.outputPath);
     if (state === 'STARTED' && !this.open.size) {
@@ -340,7 +340,7 @@ export class Takes {
 
   /** T22 and the spawn rows: open an external take, watched at once (F13), with the expected sources of the last preflight (E27). */
   private async openExternal(given?: Reading) {
-    if (!this.controls()) return;
+    if (!this.lock.held) return;
     // A read from before the last record event can show a recording that has ended since: read again.
     const r = given?.active && given.at >= (this.lastEventAt ?? 0) ? given : await this.tryRead();
     if (!r?.active || this.ended || this.waiting.size) return; // a waiting take may be this recording: its restart row decides
@@ -416,7 +416,7 @@ export class Takes {
 
   /** The take that a tool is about: one that this process follows, or, in a reader, the open take of the journal (G32). */
   current(): Take | undefined {
-    if (!this.controls()) {
+    if (!this.lock.held) {
       const id = this.journal.openTakes()[0];
       return id ? this.journal.load(id)?.take : undefined;
     }
@@ -451,7 +451,7 @@ export class Takes {
    * process gets here (G32), and the refusal and the step run in one tick, so two accepts send one start.
    */
   async start(token: string, kind: 'normal' | 'test', consentId: string, r: Reading): Promise<{ take?: Take; text?: string }> {
-    if (!this.controls()) return { text: TEXT.X16 };
+    if (!this.lock.held) return { text: TEXT.X16('start', this.lock.error) };
     const refused = this.refusal(r);
     if (refused) return { text: refused };
     if (r.conn !== this.obs.connection || !this.obs.connected) return { text: 'The connection to OBS changed after your answer, so I did not send the start. Ask me again to start it.' };
@@ -481,7 +481,7 @@ export class Takes {
   async stop(id: string, b: Reading, consentId: string | undefined, shown: Reading | undefined): Promise<{ take: Take; text?: string }> {
     const o = this.open.get(id);
     if (!o) throw new Error('no such take');
-    if (!this.controls()) return { take: o.take, text: TEXT.X16 };
+    if (!this.lock.held) return { take: o.take, text: TEXT.X16('stop', this.lock.error) };
     const s = step(o.take, { type: 'stop', reading: b });
     if (!s.send) {
       this.apply(o, { type: 'stop', reading: b });
@@ -568,8 +568,9 @@ export class Takes {
     return this.open.size > 0;
   }
 
-  /** Whether a take that this process follows records now (X14). */
-  get recording() {
-    return [...this.open.values()].some((o) => RECORDS.includes(o.take.state));
+  /** Whether a take that this process follows records or is paused now (X14). */
+  get recording(): 'recording' | 'paused' | undefined {
+    const states = [...this.open.values()].map((o) => o.take.state);
+    return states.some((s) => s === 'recording' || s === 'external') ? 'recording' : states.includes('paused') ? 'paused' : undefined;
   }
 }

@@ -75,9 +75,9 @@ test('G32: a second copy on the same OBS only reads: X16 for a start and a stop,
   const a = await server(w, { elicit: accept, client: 'Claude Code' });
   const b = await server(w, { elicit: accept, client: 'Cursor' });
   assert.deepEqual([a.app.lock.held, b.app.lock.held], [true, false]);
-  assert.equal((await b.call('obs_record_start', { token: 'reader-token-1' })).text, TEXT.X16);
+  assert.equal((await b.call('obs_record_start', { token: 'reader-token-1' })).text, TEXT.X16('start'));
   await a.call('obs_record_start', { token: 'take-token-1' });
-  assert.equal((await b.call('obs_record_stop')).text, TEXT.X16);
+  assert.equal((await b.call('obs_record_stop')).text, TEXT.X16('stop'));
   assert.equal(b.prompts.length, 0);
   assert.match(await status(b), /^Recording for /);
   assert.deepEqual(recordRequests(w.fake), ['StartRecord']);
@@ -118,10 +118,10 @@ test('F9: a full take with planted secrets leaves no planted secret in the journ
   w.fake.resumeInObs();
   await wait(100);
   // With plant on, the path field of the file output has a planted key, so the same-recording test cannot pass
-  // (check 3 fails to the safe side). After one dialog the stop refuses with X20 (F-T7-55). The take stops in OBS (T20).
+  // (check 3 fails to the safe side). The stop refuses with X20 before any dialog (F-T7-55, F-T7-77). The take stops in OBS (T20).
   const asked = await s.call('obs_record_stop');
   assert.equal(asked.text, TEXT.X20);
-  assert.equal(s.prompts.length, 2, 'the start dialog and one stop dialog');
+  assert.equal(s.prompts.length, 1, 'only the start dialog');
   assert.deepEqual(recordRequests(w.fake), ['StartRecord']);
   w.fake.stopInObs();
   await wait(400);

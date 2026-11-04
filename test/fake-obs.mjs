@@ -9,6 +9,7 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createServer } from 'node:http';
 import { WebSocketServer } from 'ws';
+import { tracked } from './cleanup.mjs';
 
 const protocol = JSON.parse(readFileSync(new URL('../protocol/protocol.json', import.meta.url), 'utf8'));
 const DOCUMENTED = new Map(protocol.requests.map((r) => [r.requestType, r]));
@@ -332,12 +333,12 @@ export async function startFakeObs(options = {}) {
       for (const c of wss.clients) c.terminate();
     },
     options: o,
-    close: () => new Promise((r) => {
+    close: tracked(() => new Promise((r) => {
       for (const t of timers) clearTimeout(t);
       for (const c of wss.clients) c.terminate();
       wss.close();
       http.close(() => r());
       http.closeAllConnections();
-    }),
+    })),
   };
 }

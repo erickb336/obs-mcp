@@ -10,6 +10,7 @@ import { LIMITS } from '../dist/take.js';
 import { startFakeObs } from './fake-obs.mjs';
 import { obsConfigDir, testEnv } from './helpers.mjs';
 import { pair } from './mcp-pair.mjs';
+import { tracked } from './cleanup.mjs';
 
 export const FAST = {
   ...LIMITS,
@@ -48,10 +49,10 @@ export async function server(w, { era = 'legacy', elicit = null, client = 'Claud
     app,
     ...p,
     /** Ends the process as a crash would: no notice, no journal line, timers stopped, and the controller lock goes. */
-    kill: async () => {
+    kill: tracked(async () => {
       await app.close();
       await p.close().catch(() => {});
-    },
+    }),
   };
 }
 

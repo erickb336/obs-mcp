@@ -51,7 +51,7 @@ for (const how of ['tool', 'button']) {
     await status(a2);
     await wait(300);
     const stop = await a2.call('obs_record_stop');
-    assert.equal(stop.text, TEXT.X16, 'the copy that came back only reads: Claude Code controls');
+    assert.equal(stop.text, TEXT.X16('stop'), 'the copy that came back only reads: Claude Code controls');
     assert.equal(a2.prompts.length, 0, 'no stop prompt');
     assert.deepEqual(recordRequests(w.fake), how === 'tool' ? ['StartRecord'] : [], 'nothing stopped the recording of Claude Code');
     assert.equal(w.fake.state.recording, true);

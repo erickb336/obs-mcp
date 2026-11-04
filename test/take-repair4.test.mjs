@@ -29,7 +29,7 @@ test('F-T7-59: a drop longer than the gone limit loses the take, and the reconne
   const s = await server(w, { elicit: accept });
   await s.call('obs_record_start', { token: 'gone-token-1' });
   w.fake.down(FAST.goneMs + 800);
-  assert.ok(await until(() => /nobody asked for it/.test(logs(s)), FAST.goneMs + 600), 'X11 at the gone limit');
+  assert.ok(await until(() => /I do not know the state of the recording now/.test(logs(s)), FAST.goneMs + 600), 'X11 at the gone limit (F-T7-78)');
   assert.ok(takes(w)[0].marks.includes('lost'));
   assert.ok(await until(() => /OBS still records the take that I started/.test(logs(s)), 3000), 'R3 at the reconnect');
   assert.deepEqual([takes(w)[0].state, takes(w)[0].row, takes(w)[0].marks], ['recording', 'R3', []]);
@@ -138,8 +138,8 @@ test('F-T7-67: X10 and X14 do not say that OBS records when no take records; a d
   assert.match(stateLine(rec, undefined, at), /^I lost the connection to OBS at \d\d:\d\d:\d\d\. OBS keeps recording on its own\./);
   const started = step({ ...newTake('t', 'normal', 'starting'), intentAt: at }, { type: 'disconnect', at: at + 20 }).take;
   assert.equal(stateLine(started, undefined, at + 9000), TEXT.X10c);
-  assert.equal(TEXT.X14(true), 'obs-mcp is closing. OBS keeps recording. I did not stop it.');
-  assert.equal(TEXT.X14(false), 'obs-mcp is closing. I did not send a stop.');
+  assert.equal(TEXT.X14('recording'), 'obs-mcp is closing. OBS keeps recording. I did not stop it.');
+  assert.equal(TEXT.X14(undefined), 'obs-mcp is closing. I did not send a stop.');
 });
 
 test('F-T7-67: X11 gives the last time that OBS surely recorded, not the time of the read', () => {

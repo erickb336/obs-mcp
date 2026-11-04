@@ -110,8 +110,8 @@ test('E6, E11: you pause in OBS; a stop while paused shows W5 and passes the sam
 test('E7, G32: two clients, each with its own copy: the second copy only reads, so its start and its stop get X16', async () => {
   const { w, s } = await recording();
   const b = await server(w, { elicit: accept, client: 'Cursor' });
-  assert.equal((await b.call('obs_record_start', { token: 'other-token-1' })).text, TEXT.X16);
-  assert.equal((await b.call('obs_record_stop')).text, TEXT.X16);
+  assert.equal((await b.call('obs_record_start', { token: 'other-token-1' })).text, TEXT.X16('start'));
+  assert.equal((await b.call('obs_record_stop')).text, TEXT.X16('stop'));
   assert.deepEqual(b.prompts, []);
   assert.deepEqual(recordRequests(w.fake), ['StartRecord']);
   await done(w, s, b);

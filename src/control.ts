@@ -1,67 +1,127 @@
-// The controller lock (G32): exactly one obs-mcp process for each OBS endpoint controls recording. It listens on a
-// local socket (a Unix domain socket, or a Windows named pipe; the platform layer gives the name). The operating
-// system frees the socket when the process exits, also at a crash. A process that cannot listen is a reader: it
-// reads OBS and the journal, and sends no recording request.
-import { randomBytes } from 'node:crypto';
-import { renameSync, rmSync } from 'node:fs';
-import { createConnection, createServer, type Server } from 'node:net';
+// The controller lock (G32): exactly one obs-mcp process for each OBS endpoint controls recording. The controller
+// listens on a TCP port of 127.0.0.1 that a hash of the endpoint gives. Nothing is on disk and nothing comes from the
+// environment, and the operating system frees the port when the process exits, also at a crash. A process that does
+// not hold the lock is a reader: it reads OBS and the journal, and sends no recording request.
+import { createHash } from 'node:crypto';
+import { connect, createServer, type Server } from 'node:net';
 
-/** Whether a process listens on the socket path now. */
-const answers = (path: string) =>
-  new Promise<boolean>((resolve) => {
-    const s = createConnection(path);
-    s.once('connect', () => (s.destroy(), resolve(true)));
-    s.once('error', () => resolve(false));
+const HOST = '127.0.0.1';
+const WORD = 'obs-mcp-control';
+/** How long a listener has to send its banner. A program that sends none in this time is not obs-mcp. */
+const BANNER_MS = 500;
+
+const sha = (s: string) => createHash('sha256').update(s).digest();
+
+/** The banner hash of an endpoint, and its 8 lock ports in the range 49152 to 65535, in the order that a copy tries them. */
+export function lockPorts(endpoint: string): { id: string; ports: number[] } {
+  const ports: number[] = [];
+  for (let i = 0; ports.length < 8; i++) {
+    const port = 49152 + (sha(`${endpoint}\n${i}`).readUInt32BE(0) % 16384);
+    if (!ports.includes(port)) ports.push(port);
+  }
+  return { id: sha(endpoint).toString('hex').slice(0, 16), ports };
+}
+
+/** What listens on a port: an obs-mcp controller of this endpoint ('ours'), nothing ('free'), or another program. */
+function who(port: number, id: string): Promise<'ours' | 'free' | 'other'> {
+  return new Promise((resolve) => {
+    const s = connect({ host: HOST, port });
+    let got = '';
+    const end = (v: 'ours' | 'free' | 'other') => {
+      clearTimeout(timer);
+      s.destroy();
+      resolve(v);
+    };
+    const timer = setTimeout(() => end('other'), BANNER_MS);
+    s.setEncoding('latin1');
+    s.on('data', (d: string) => {
+      got += d;
+      const line = got.split('\n');
+      if (line.length > 1 || got.length > 64) end(line[0].split(' ').slice(0, 2).join(' ') === `${WORD} ${id}` ? 'ours' : 'other');
+    });
+    s.on('end', () => end('other'));
+    s.on('error', (e: NodeJS.ErrnoException) => end(e.code === 'ECONNREFUSED' ? 'free' : 'other'));
   });
+}
 
-const listen = (path: string) =>
+const loopback = (a?: string) => a === HOST || a === `::ffff:${HOST}`;
+
+/**
+ * Listens on a lock port. Each connection gets the banner and is closed: when the other side closes, or after 1 s. The
+ * listener uses no data that it gets. The other side closes first, so that no closed connection waits on the lock port.
+ */
+const listen = (port: number, banner: string) =>
   new Promise<Server | NodeJS.ErrnoException>((resolve) => {
-    const server = createServer((s) => s.destroy());
-    server.once('error', resolve);
-    server.listen(path, () => (server.unref(), resolve(server)));
+    const server = createServer((s) => {
+      s.on('error', () => {});
+      if (!loopback(s.remoteAddress)) return s.destroy();
+      s.setTimeout(2 * BANNER_MS, () => s.destroy());
+      s.write(banner);
+      s.resume(); // drops any data, so that the end of the other side comes through
+    });
+    server.on('error', resolve);
+    server.listen(port, HOST, () => (server.unref(), resolve(server)));
   });
 
 export class Control {
   private server?: Server;
+  /** The endpoint of the held lock. */
+  private at?: string;
   private trying?: Promise<boolean>;
+  /** The code of a listen error other than EADDRINUSE: this copy cannot confirm that it alone controls (X16). */
+  error?: string;
 
-  constructor(private path: () => string) {}
+  constructor(private endpoint: () => string) {}
 
   get held() {
     return !!this.server;
   }
 
-  /** Tries to become the controller. True when this process controls. Parallel calls share one try. */
+  /** Whether this process holds the lock of the endpoint now. */
+  holds() {
+    return !!this.server && this.at === this.endpoint();
+  }
+
+  /**
+   * Tries to become the controller of the endpoint now. A lock of an older endpoint goes first (F-T7-73). True when
+   * this process controls. Parallel calls share one try.
+   */
   acquire(): Promise<boolean> {
-    if (this.server) return Promise.resolve(true);
-    this.trying ??= this.tryListen().finally(() => (this.trying = undefined));
+    if (this.holds()) return Promise.resolve(true);
+    this.close();
+    this.trying ??= this.tryListen(this.endpoint()).finally(() => (this.trying = undefined));
     return this.trying;
   }
 
   /**
-   * A socket file that nobody answers is stale: a crashed process left it (Unix only; a named pipe goes with its
-   * process). It moves to a new name, and only a file that is dead there too is removed. A live socket that a second
-   * process moved in the same moment goes back to its name, so of two processes only one listens.
+   * The first free port of the sequence is the lock. A port that answers with the banner of this endpoint is another
+   * controller: this copy reads. A port that another program holds is passed (F-T7-74). After the listen, a banner
+   * on any other port of the sequence means that a controller took a later port while an earlier one was held: this
+   * copy lets its port go and reads, so that two copies never both control.
    */
-  private async tryListen(): Promise<boolean> {
-    const path = this.path();
-    for (let round = 0; round < 3; round++) {
-      const got = await listen(path);
-      if (!(got instanceof Error)) return !!(this.server = got);
-      if (got.code !== 'EADDRINUSE' || process.platform === 'win32' || (await answers(path))) return false;
-      const moved = `${path}.${randomBytes(4).toString('hex')}`;
-      try {
-        renameSync(path, moved);
-      } catch (e) {
-        if ((e as NodeJS.ErrnoException).code === 'ENOENT') continue; // another process removed it first
+  private async tryListen(endpoint: string): Promise<boolean> {
+    const { id, ports } = lockPorts(endpoint);
+    this.error = undefined;
+    for (const [i, port] of ports.entries()) {
+      const got = await listen(port, `${WORD} ${id} ${process.pid}\n`);
+      if (got instanceof Error) {
+        if (got.code !== 'EADDRINUSE') {
+          this.error = got.code ?? 'unknown';
+          return false;
+        }
+        if ((await who(port, id)) === 'ours') return false;
+        continue;
+      }
+      const others = await Promise.all(ports.map((p, j) => (j === i ? 'free' : who(p, id))));
+      if (others.includes('ours')) {
+        got.close();
         return false;
       }
-      if (await answers(moved)) {
-        renameSync(moved, path);
-        return false;
-      }
-      rmSync(moved, { force: true });
+      this.server = got;
+      this.at = endpoint;
+      return true;
     }
+    this.error = 'EADDRINUSE';
     return false;
   }
 
@@ -69,5 +129,6 @@ export class Control {
   close() {
     this.server?.close();
     this.server = undefined;
+    this.at = undefined;
   }
 }

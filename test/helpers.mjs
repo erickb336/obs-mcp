@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
+import { tracked } from './cleanup.mjs';
 
 export const CLI = fileURLToPath(new URL('../dist/cli.js', import.meta.url));
 
@@ -61,7 +62,7 @@ export async function connect(env, { era = 'legacy', command = process.execPath,
     replies.push(text);
     return { text, isError: !!r.isError, json: (() => { try { return JSON.parse(text); } catch { return undefined; } })() };
   };
-  return { client, call, replies, stderr: () => stderr, pid: () => transport.pid, close: () => client.close() };
+  return { client, call, replies, stderr: () => stderr, pid: () => transport.pid, close: tracked(() => client.close()) };
 }
 
 export function runDoctor(env) {

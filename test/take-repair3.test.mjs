@@ -102,7 +102,7 @@ test('F-T7-37: a second drop does not end the take at the gone limit of the firs
   await wait(t0 + 1500 - Date.now());
   assert.equal(w.fake.state.recording, true);
   assert.equal(takeOf(w).marks.includes('lost'), false);
-  assert.doesNotMatch(logs(s), /nobody asked for it/, 'no X11');
+  assert.doesNotMatch(logs(s), /nobody asked for it|I do not know the state of the recording now/, 'no X11');
   assert.match(last(await status(s)), /^Recording for /);
   assert.deepEqual(recordRequests(w.fake), ['StartRecord']);
   await done(w, s);
@@ -197,7 +197,8 @@ test('F-T7-40, F-T7-47: a path over 4,096 bytes counts as no path, and no reply 
   assert.equal(takeOf(w).state, 'recording');
   const stop = await s.call('obs_record_stop');
   assert.doesNotMatch(stop.text, /journal/);
-  assert.match(s.prompts[1], /File: `unknown`/);
+  assert.equal(stop.text, TEXT.X20, 'no stop dialog with no path (F-T7-77)');
+  assert.equal(s.prompts.length, 1);
   assert.deepEqual(recordRequests(w.fake), ['StartRecord'], 'with no path, the same-recording test fails to the safe side');
   await done(w, s);
 });
@@ -230,7 +231,7 @@ test('F-T7-43, F-T7-58: a client that restarts follows the take at once, with no
   const b = await server(w, { elicit: accept });
   assert.ok(await until(() => takeOf(w).row === 'R3', 2000), 'R3 ran with no tool call');
   w.fake.stopInObs();
-  assert.ok(await until(() => /was stopped in OBS|nobody asked/.test(logs(b)) || takeOf(w).state !== 'recording', 3000));
+  assert.ok(await until(() => /was stopped in OBS|nobody asked|I do not know the state of the recording now/.test(logs(b)) || takeOf(w).state !== 'recording', 3000));
   assert.notEqual(takeOf(w).state, 'recording', 'the new process watches the take');
   await done(w, b);
 });
