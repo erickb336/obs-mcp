@@ -28,7 +28,7 @@
   ],
   "scripts": {
     "build": "node scripts/catalogue.mjs && tsc -p tsconfig.json",
-    "test": "npm run build && node --test --test-reporter=spec \"test/*.test.mjs\"",
+    "test": "npm run build && node --test --test-timeout=120000 --test-reporter=spec \"test/*.test.mjs\"",
     "parity": "node scripts/catalogue.mjs --check protocol/protocol.json",
     "smoke": "node scripts/packed-smoke.mjs",
     "prepack": "npm run build"

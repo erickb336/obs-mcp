@@ -7,6 +7,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { createServer } from 'node:http';
 import { WebSocketServer } from 'ws';
 
 const protocol = JSON.parse(readFileSync(new URL('../protocol/protocol.json', import.meta.url), 'utf8'));
@@ -147,9 +148,11 @@ export async function startFakeObs(options = {}) {
   };
   const plantReply = (v) => plantIn(v, '', 'reply');
   const profile = () => ({ 'Twitch/RefreshToken': token(), 'AdvOut/FFURL': `rtmp://live.example.com/app/${key()}`, 'Video/BaseCX': '1920' });
-  const wss = new WebSocketServer({ host: '127.0.0.1', port: o.port ?? 0 });
+  // The fake owns its HTTP server, so that close() can also end a connection that is still in its handshake.
+  const http = createServer();
+  const wss = new WebSocketServer({ server: http });
   let connections = 0;
-  await new Promise((r) => wss.once('listening', r));
+  await new Promise((r, reject) => http.once('error', reject).listen(o.port ?? 0, '127.0.0.1', r));
 
   const outputs = () =>
     o.outputs ?? [
@@ -285,7 +288,7 @@ export async function startFakeObs(options = {}) {
   };
 
   return {
-    port: wss.address().port,
+    port: http.address().port,
     log,
     sent,
     planted,
@@ -313,7 +316,9 @@ export async function startFakeObs(options = {}) {
     close: () => new Promise((r) => {
       for (const t of timers) clearTimeout(t);
       for (const c of wss.clients) c.terminate();
-      wss.close(r);
+      wss.close();
+      http.close(() => r());
+      http.closeAllConnections();
     }),
   };
 }

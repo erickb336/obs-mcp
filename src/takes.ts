@@ -191,7 +191,7 @@ export class Takes {
   /** One watch read. After a reconnect, the same-recording test runs against the journal (T24). */
   private async tick(o: Open) {
     const r = await this.tryRead();
-    if (!r || !this.open.has(o.take.id)) return;
+    if (!r || this.ended || !this.open.has(o.take.id)) return;
     const s = o.take.state;
     let same: boolean | undefined;
     if (s === 'stop_uncertain' && r.active && o.reading) same = sameRecording(o.reading, r, o.take.paths);
@@ -259,7 +259,7 @@ export class Takes {
   /** T22 and the spawn rows: open an external take, watched at once (F13), with the expected sources of the last preflight (E27). */
   private async openExternal(given?: Reading) {
     const r = given?.active ? given : await this.tryRead();
-    if (!r?.active) return;
+    if (!r?.active || this.ended) return;
     if ([...this.open.values()].some((o) => isOpen(o.take) && o.take.state !== 'checking' && o.take.state !== 'stopping' && o.take.state !== 'stop_uncertain')) return;
     // E25: the id comes from the file path, so every process finds one take, and the first owner file wins.
     const id = sha(`external:${r.path ?? Math.round((r.at - r.duration) / 10000)}`).slice(0, 16);
@@ -287,9 +287,10 @@ export class Takes {
    */
   async resume() {
     const ids = this.journal.openTakes().filter((id) => !this.open.has(id) && this.journal.takeOver(id, this.limits.staleMs) && this.journal.isOwner(id));
-    if (!ids.length) return;
+    if (!ids.length || this.ended) return;
     this.obs.keepConnected(true);
     const r = await this.tryRead();
+    if (this.ended) return;
     for (const id of ids) {
       if (this.open.has(id)) continue;
       const l = this.journal.load(id)!;
@@ -436,11 +437,13 @@ export class Takes {
     if (!this.anyOpen()) await this.openExternal(r);
   }
 
-  /** O2: the client closed input. Nothing is sent; the journal keeps each take. */
+  /** O2: the client closed input. Nothing is sent; the journal keeps each take. A read still in flight changes nothing after this. */
   close() {
+    this.ended = true;
     for (const o of this.open.values()) for (const t of o.timers) clearTimeout(t);
     this.open.clear();
   }
+  private ended = false;
 
   get hasOpen() {
     return this.open.size > 0;
