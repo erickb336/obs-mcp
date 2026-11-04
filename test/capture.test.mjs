@@ -261,3 +261,17 @@ test('a password argument, a stray argument or a non-loopback URL is refused bef
   assert.equal(runs.some((r) => r.stderr.includes(PASSWORD)), false);
   assert.equal(fake.connections(), 0);
 });
+
+test('F-T27-3: a --settle-ms that is not a whole number from 0 to 60000 is refused before any connection', async () => {
+  const fake = await startFakeObs();
+  const f = files();
+  const runs = [];
+  for (const ms of ['abc', '-5', '1e9', '60001', '2.5', '']) runs.push(await run(['--url', `ws://127.0.0.1:${fake.port}`, '--out', f.out, `--settle-ms=${ms}`]));
+  const ok = await run(['--url', `ws://127.0.0.1:${fake.port}`, '--out', f.out, '--settle-ms', '60000', '--plan', '/nonexistent/plan.json']);
+  await fake.close();
+  assert.deepEqual(runs.map((r) => [r.code, r.stderr]), Array(6).fill([2, 'capture-traces: --settle-ms must be a whole number of milliseconds from 0 to 60000.\n']));
+  // 60000 passes the check: the script goes on to read the plan.
+  assert.equal(ok.code, 1);
+  assert.doesNotMatch(ok.stderr, /settle-ms/);
+  assert.equal(fake.connections(), 0);
+});
