@@ -86,9 +86,9 @@ function prompt() {
 }
 
 /**
- * The operator's input. With --allow-record, it is read from the connection to the end, so that a line typed while no prompt shows
- * (a late answer to an earlier prompt, or a line typed before the first prompt) is dropped and never answers a prompt
- * (F-T25-2). The input does not keep the process alive. The password prompt pauses the input when it ends, and a data
+ * The operator's input. With --allow-record, it is read from the connection to the end, so that a complete line (ended
+ * with Enter) typed while no prompt shows (a late answer to an earlier prompt, or a line typed before the first prompt)
+ * is dropped and never answers a prompt (F-T25-2). The input does not keep the process alive. The password prompt pauses the input when it ends, and a data
  * listener does not resume a paused stream, so the input is resumed here (F-T25-5).
  */
 const input = { answer: undefined, partial: '', ended: false };
@@ -109,7 +109,9 @@ function readInput() {
 
 /** Asks the operator to confirm a stop. True only when the first line typed after the prompt is "stop" and comes in --confirm-ms. */
 function confirmStop() {
-  // Drop the part of a line typed before the prompt.
+  // A complete line typed before the prompt was dropped when it came. On piped input, also drop the part of a line that
+  // came before the prompt. On a terminal, the terminal keeps an unfinished line until Enter, so the script cannot see it:
+  // a part typed before the prompt joins the text typed after it, and that line is the operator's answer to this prompt.
   input.partial = '';
   process.stderr.write(`capture-traces: the capture started a test take. If you did not start a take yourself, type stop and press Enter to send StopRecord. Waiting ${confirmMs / 1000} s.\n`);
   return new Promise((resolve) => {

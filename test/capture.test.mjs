@@ -319,9 +319,9 @@ test('F-T25-2: a stop typed after the second prompt shows still stops the take, 
   assert.deepEqual(fake.stops, [{ requestType: 'StopRecord', cause: 'request' }]);
 });
 
-// F-T25-6: the part of a line typed before the prompt is dropped. "st" with no newline, then "op" after the prompt, is
-// the line "op", not "stop".
-test('F-T25-6: a part of a line typed before the prompt does not join the answer typed after it', async (t) => {
+// F-T25-6, piped input only (not a terminal): the part of a line that came before the prompt is dropped. "st" with no
+// newline, then "op" after the prompt, is the line "op", not "stop". On a terminal the rule differs: see the pty tests.
+test('F-T25-6: on piped input, a part of a line that came before the prompt does not join the answer after it', async (t) => {
   const { fake } = await userAndFake(t);
   const f = files();
   writeFileSync(f.plan, JSON.stringify([{ requestType: 'StartRecord' }, { requestType: 'StopRecord' }]));
@@ -344,15 +344,20 @@ test('F-T25-5: when the input is paused before the capture reads it, a stop type
   assert.deepEqual(fake.stops, [{ requestType: 'StopRecord', cause: 'request' }]);
 });
 
-// F-T25-5 on a terminal: a pseudo-terminal from the Python standard library (pty) runs the capture. The operator types
-// the password at the hidden prompt, then stop at the stop prompt. Python's pty module works only on Unix.
+// On a terminal: a pseudo-terminal from the Python standard library (pty) runs the capture, as an operator at a terminal.
+// PTY_STEPS is a list of [cue, text]: the operator types text when cue shows in the output, or at once when cue is empty.
+// A carriage return is Enter. The terminal is in its normal line mode: it gives a line to the script only at Enter.
 const PTY_OPERATOR = `
-import os, pty, select, sys, time
+import json, os, pty, select, sys, time
+steps = json.loads(os.environ['PTY_STEPS'])
 pid, fd = pty.fork()
 if pid == 0:
     os.execv(sys.argv[1], sys.argv[1:])
-out, typed, deadline = b'', set(), time.time() + 30
+out, done, deadline = b'', 0, time.time() + 30
 while time.time() < deadline:
+    while done < len(steps) and steps[done][0].encode() in out:
+        os.write(fd, steps[done][1].encode())
+        done += 1
     if select.select([fd], [], [], 0.1)[0]:
         try:
             data = os.read(fd, 4096)
@@ -361,24 +366,25 @@ while time.time() < deadline:
         if not data:
             break
         out += data
-    for cue, line in ((b'password:', os.environ['CAPTURE_PASSWORD'].encode()), (b'type stop and press Enter', b'stop')):
-        if cue in out and cue not in typed:
-            os.write(fd, line + b'\\r')
-            typed.add(cue)
 else:
     os.kill(pid, 9)
 sys.stdout.write(out.decode(errors='replace'))
 sys.exit(os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]))
 `;
-const noPty = process.platform === 'win32' ? 'Python\'s pty module works only on Unix' : spawnSync('python3', ['-c', 'import pty']).status !== 0 ? 'python3 with its pty module is not on this machine' : false;
-test('F-T25-5: on a terminal, after the hidden password prompt, a stop typed at the stop prompt stops the take once', { skip: noPty }, async (t) => {
-  const fake = await startFakeObs({ password: PASSWORD });
+// The pty tests need Unix and Python 3.9 or later (os.waitstatus_to_exitcode). Exit code 3 means an older Python.
+const python = process.platform === 'win32' ? undefined : spawnSync('python3', ['-c', 'import os, pty, sys; sys.exit(0 if hasattr(os, "waitstatus_to_exitcode") else 3)']);
+const noPty = process.platform === 'win32' ? 'no pty on Windows: Python\'s pty module works only on Unix'
+  : python.status === 3 ? 'python3 is older than 3.9: it has no os.waitstatus_to_exitcode'
+  : python.status !== 0 ? 'python3 with its pty module is not on this machine' : false;
+/** Runs the capture on a pseudo-terminal with the operator's steps. A fake OBS without a password needs no password step. */
+async function runOnTerminal(t, steps, { password, confirmMs = '5000' } = {}) {
+  const fake = await startFakeObs(password ? { password } : {});
   t.after(() => fake.close());
   const f = files();
   writeFileSync(f.plan, JSON.stringify([{ requestType: 'StartRecord' }, { requestType: 'StopRecord' }]));
-  const env = { ...process.env, CAPTURE_PASSWORD: PASSWORD };
+  const env = { ...process.env, PTY_STEPS: JSON.stringify(steps) };
   delete env.OBS_WEBSOCKET_PASSWORD;
-  const args = [SCRIPT, '--url', `ws://127.0.0.1:${fake.port}`, '--out', f.out, '--plan', f.plan, '--settle-ms', '0', '--confirm-ms', '5000', '--allow-record'];
+  const args = [SCRIPT, '--url', `ws://127.0.0.1:${fake.port}`, '--out', f.out, '--plan', f.plan, '--settle-ms', '0', '--confirm-ms', confirmMs, '--allow-record'];
   const r = await new Promise((resolve) => {
     const p = spawn('python3', ['-c', PTY_OPERATOR, process.execPath, ...args], { env, stdio: ['ignore', 'pipe', 'inherit'] });
     let output = '';
@@ -386,10 +392,34 @@ test('F-T25-5: on a terminal, after the hidden password prompt, a stop typed at 
     p.on('close', (code) => resolve({ code, output }));
   });
   assert.equal(r.code, 0, r.output);
-  assert.ok(r.output.includes('obs-websocket password: '), r.output);
-  assert.equal(r.output.includes(PASSWORD), false);
+  assert.equal(r.output.split(STOP_PROMPT).length - 1, 1, r.output);
+  return { fake, output: r.output, refused: JSON.parse(readFileSync(f.out, 'utf8')).refused.map((x) => `${x.requestType}: ${x.refused}`) };
+}
+
+// F-T25-5 on a terminal: the operator types the password at the hidden prompt, then stop at the stop prompt.
+test('F-T25-5: on a terminal, after the hidden password prompt, a stop typed at the stop prompt stops the take once', { skip: noPty }, async (t) => {
+  const { fake, output } = await runOnTerminal(t, [['password:', `${PASSWORD}\r`], [STOP_PROMPT, 'stop\r']], { password: PASSWORD });
+  assert.ok(output.includes('obs-websocket password: '), output);
+  assert.equal(output.includes(PASSWORD), false);
   assert.equal(fake.state.recording, false);
   assert.deepEqual(fake.stops, [{ requestType: 'StopRecord', cause: 'request' }]);
+});
+
+// F-T25-7: on a terminal, a complete line typed before the prompt is dropped, so a stop from before the prompt never stops a take.
+test('F-T25-7: on a terminal, a complete stop line typed before the prompt sends no StopRecord', { skip: noPty }, async (t) => {
+  const { fake, refused } = await runOnTerminal(t, [['', 'stop\r']], { confirmMs: '1000' });
+  assert.equal(fake.state.recording, true);
+  assert.deepEqual(fake.stops, []);
+  assert.deepEqual(refused, [`StopRecord: ${NO_ANSWER}`]);
+});
+
+// F-T25-7: on a terminal, an unfinished line is completed by what the operator types after the prompt, and that line is
+// the answer to the prompt that shows: "st" before the prompt, then "op" and Enter after it, is "stop".
+test('F-T25-7: on a terminal, "st" typed before the prompt and "op" with Enter after it stops the take once', { skip: noPty }, async (t) => {
+  const { fake, refused } = await runOnTerminal(t, [['', 'st'], [STOP_PROMPT, 'op\r']]);
+  assert.equal(fake.state.recording, false);
+  assert.deepEqual(fake.stops, [{ requestType: 'StopRecord', cause: 'request' }]);
+  assert.deepEqual(refused, []);
 });
 
 // F-T6-4 and F-T6-9: a crash of OBS or a request with no reply ends the capture with the reason, and the partial trace is written.
