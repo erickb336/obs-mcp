@@ -71,7 +71,7 @@ test('the leak scan names each place and rule of a raw trace, never the value, a
 });
 
 // F-T6-2, F-T6-6, F-T6-7, F-T6-8: the values that the scrub of R131 left in a trace. Each one goes in a free field
-// (settings, a name, a slot), and in a text field that the allow-list keeps ("comment"), where the deny list must find it.
+// (settings, a name, a slot), and in a text field that the allow-list keeps ("basis"), where the deny list must find it.
 const BS = '\\';
 const MISSED = {
   apiKey: { inputSettings: { apiKey: 'AKIAIOSFODNN7EXAMPLE' } },
@@ -79,22 +79,22 @@ const MISSED = {
   'short key in a profile value': { parameterValue: 'abcd-efgh-ijkl-mnop-qrst' },
   'one-word secret in a slot': { slotValue: 'hunter2secret' },
   'real name in an input name': { inputName: 'Sam Example iPhone Camera' },
-  'path under /Volumes': { comment: `Failed to open ${['', 'Vol' + 'umes', 'Sam SSD', 'take.mkv'].join('/')}` },
-  'path under /private/var/folders': { comment: `Wrote ${['', 'private', 'var', 'folders', 'ab', 'T', 'obs.log'].join('/')}` },
-  'host name with no port': { comment: 'connected to sam-studio.lan' },
-  'escaped Windows home in text': { comment: `saved to C:${BS}${BS}Us${'ers'}${BS}${BS}zelda${BS}${BS}Videos ok` },
+  'path under /Volumes': { basis: `Failed to open ${['', 'Vol' + 'umes', 'Sam SSD', 'take.mkv'].join('/')}` },
+  'path under /private/var/folders': { basis: `Wrote ${['', 'private', 'var', 'folders', 'ab', 'T', 'obs.log'].join('/')}` },
+  'host name with no port': { basis: 'connected to sam-studio.lan' },
+  'escaped Windows home in text': { basis: `saved to C:${BS}${BS}Us${'ers'}${BS}${BS}zelda${BS}${BS}Videos ok` },
   'escaped Windows home in a name': { outputPath: `saved to C:${BS}${BS}Us${'ers'}${BS}${BS}zelda${BS}${BS}Videos ok` },
-  'lower-case Windows home': { comment: 'in c:/us' + 'ers/zelda/x' },
-  'lower-case macOS home': { comment: 'in /us' + 'ers/zelda/x' },
-  'password= in text': { comment: 'login with password=Zq9hunterPW now' },
-  'password: in text': { comment: 'login with password: Zq9hunterPW now' },
+  'lower-case Windows home': { basis: 'in c:/us' + 'ers/zelda/x' },
+  'lower-case macOS home': { basis: 'in /us' + 'ers/zelda/x' },
+  'password= in text': { basis: 'login with password=Zq9hunterPW now' },
+  'password: in text': { basis: 'login with password: Zq9hunterPW now' },
   'token: in text': { note: 'token: Zq9hunterPW' },
-  'key: in a kept text': { comment: 'stream key: Zq9hunterPW' },
+  'key: in a kept text': { basis: 'stream key: Zq9hunterPW' },
   'home path in a key': { [`${HOME.replace('alice', 'zelda')}/file.mov`]: 1 },
   'Windows home in a key': { [`C:/Us${'ers'}/zelda/file.mov`]: 1 },
   'URL with a key in a key': { 'rtmp://live.x.com/app/KEYNAMESEC': 1 },
   'stream key in a plain key': { live_123456789_KEYNAMESEC: 1 },
-  'long token in a kept text': { comment: 'use 9f8e7d6c5b4a39281706 now' },
+  'long token in a kept text': { basis: 'use 9f8e7d6c5b4a39281706 now' },
   'address in a number form': { cpuUsage: LAN },
 };
 for (const [name, value] of Object.entries(MISSED)) {
@@ -113,7 +113,7 @@ test('F-T6-11: the scrub removes every settings and slot string, also one in the
     inputSettings: { pin: '4711', phone: '+1 555-0100', nested: { card: '4111-1111-1111-1111' }, list: ['12:30', '1.2.3'], fps: 30 },
     slotValue: '0042',
     propertyItems: [{ itemName: '5551234567', itemValue: '4111111111111111', itemEnabled: true }],
-    kept: { outputTimecode: '00:00:01.234', obsVersion: '33.0.1', cpuUsage: '4711' },
+    kept: { outputTimecode: '00:00:01.234', obsVersion: '33.0.1' },
   };
   assert.deepEqual(scrub(raw, MACHINE), {
     inputSettings: hidden(['[scrubbed]', '[scrubbed]', hidden(['[scrubbed]']), ['[scrubbed]', '[scrubbed]'], '[scrubbed]']),
@@ -180,14 +180,14 @@ test('F-T6-14: the scrub gives each real UUID a fake one, the same fake in every
   const B = '9F8E7D6C-AAAA-4BBB-8CCC-DDDDEEEEFFFF';
   const F = (n) => `00000000-0000-4000-8000-00000000000${n}`;
   // F(1) is already in the input as a fake, so the first real UUID gets F(2).
-  const reads = { a: { sceneUuid: A }, b: [{ transitionUuid: B }, { sceneUuid: A }], c: { sceneUuid: F(1) }, comment: `scene ${A} ok`, [A]: 1 };
+  const reads = { a: { sceneUuid: A }, b: [{ transitionUuid: B }, { sceneUuid: A }], c: { sceneUuid: F(1) }, basis: `scene ${A} ok`, [A]: 1 };
   const record = { sceneUuid: B.toLowerCase(), inputUuid: 'ffffffff-0000-4000-8000-000000000009' };
   const fakeUuid = uuidFaker(JSON.stringify([reads, record]));
-  assert.deepEqual(scrub(reads, { ...MACHINE, fakeUuid }), { a: { sceneUuid: F(2) }, b: [{ transitionUuid: F(3) }, { sceneUuid: F(2) }], c: { sceneUuid: F(1) }, comment: `scene ${F(2)} ok`, [F(2)]: 1 });
+  assert.deepEqual(scrub(reads, { ...MACHINE, fakeUuid }), { a: { sceneUuid: F(2) }, b: [{ transitionUuid: F(3) }, { sceneUuid: F(2) }], c: { sceneUuid: F(1) }, basis: `scene ${F(2)} ok`, [F(2)]: 1 });
   assert.deepEqual(scrub(record, { ...MACHINE, fakeUuid }), { sceneUuid: F(3), inputUuid: F(4) });
   assert.deepEqual(findLeaks(reads, MACHINE).map((l) => `${l.path}: ${l.rule}`), [
     'a.sceneUuid: UUID of a real OBS', 'b[0].transitionUuid: UUID of a real OBS', 'b[1].sceneUuid: UUID of a real OBS',
-    'comment: UUID of a real OBS', `${F(2)}: key: UUID of a real OBS`,
+    'basis: UUID of a real OBS', `${F(2)}: key: UUID of a real OBS`,
   ]);
   const clean = scrub(reads, MACHINE);
   assert.deepEqual(findLeaks(clean, MACHINE), []);
@@ -197,18 +197,60 @@ test('F-T6-14: the scrub gives each real UUID a fake one, the same fake in every
 test('F-T6-17: the scrub finds a real UUID right after a letter, a digit or "_", and right before one', () => {
   const A = 'a1b2c3d4-1111-4222-8333-444455556666';
   const F = '00000000-0000-4000-8000-000000000001';
-  const raw = { comment: `x_${A} scene${A} 7${A}z`, [`id_${A}`]: 1 };
-  assert.deepEqual(scrub(raw, MACHINE), { comment: `x_${F} scene${F} 7${F}z`, [`id_${F}`]: 1 });
-  assert.deepEqual(findLeaks(raw, MACHINE).map((l) => `${l.path}: ${l.rule}`), ['comment: UUID of a real OBS', `id_${F}: key: UUID of a real OBS`]);
+  const raw = { basis: `x_${A} scene${A} 7${A}z`, [`id_${A}`]: 1 };
+  assert.deepEqual(scrub(raw, MACHINE), { basis: `x_${F} scene${F} 7${F}z`, [`id_${F}`]: 1 });
+  assert.deepEqual(findLeaks(raw, MACHINE).map((l) => `${l.path}: ${l.rule}`), ['basis: UUID of a real OBS', `id_${F}: key: UUID of a real OBS`]);
   const clean = scrub(raw, MACHINE);
   assert.deepEqual(findLeaks(clean, MACHINE), []);
 });
 
 test('the scrub removes the account name and host name of this machine, and a secret of the run, in a text it keeps', () => {
-  const out = scrub({ comment: 'Alice ran OBS', basis: 'on studio-mac', platformDescription: 'macOS 15', outputName: 'hunter22' }, { ...MACHINE, secrets: ['hunter22'] });
-  assert.deepEqual(out, { comment: '[scrubbed]', basis: '[scrubbed]', platformDescription: 'macOS 15', outputName: '[scrubbed]' });
+  const out = scrub({ refused: 'Alice ran OBS', basis: 'on studio-mac', platformDescription: 'macOS 15', outputName: 'hunter22' }, { ...MACHINE, secrets: ['hunter22'] });
+  assert.deepEqual(out, { refused: '[scrubbed]', basis: '[scrubbed]', platformDescription: 'macOS 15', outputName: '[scrubbed]' });
   // A name of 3 letters or fewer is not matched, so that a user called "obs" does not empty every trace.
-  assert.deepEqual(scrub({ comment: 'obs ran' }, { user: 'obs', host: 'pc' }), { comment: 'obs ran' });
+  assert.deepEqual(scrub({ basis: 'obs ran' }, { user: 'obs', host: 'pc' }), { basis: 'obs ran' });
+});
+
+// F-T27-2: the values of the R160 probe that the scrub kept, and more of the same kinds. Each one must go.
+const R160 = {
+  'a spaced name as an output name': { outputName: 'Sam Example' },
+  'a spaced name as a hotkey name': { hotkeyName: 'Sam Example Phone' },
+  'a name with a dot as a hotkey name': { hotkeyName: 'Sam.Example' },
+  'a spaced name as an input kind': { inputKind: 'Sam Example' },
+  'a one-word name as a transition kind': { transitionKind: 'samexample' },
+  'a phone number as an input name': { inputName: '+1-555-867-5309' },
+  'a card number as a scene name': { sceneName: '4111-1111-1111-1111' },
+  'a PIN as a profile name': { profileName: '1234' },
+  'an id form as a scene name': { sceneName: 'adv_file_output' },
+  'an enum form as a scene name': { sceneName: 'OBS_SAM' },
+  'a number in a field that holds no number': { cpuUsage: '4711' },
+  'a PIN as a request type': { requestType: '1234' },
+  'a name as a request type': { requestType: 'SamExample' },
+  'a name as a platform': { platform: 'Sam Example' },
+  'a name in an obs-websocket message': { comment: 'No source was found by the name of Sam Example' },
+  'a name with no space in a comment': { comment: 'SamExample' },
+  'a name as a key': { responseData: { SamExample: 1 } },
+  'a spaced name as a key': { responseData: { 'Sam Example': true } },
+};
+for (const [name, value] of Object.entries(R160)) {
+  test(`F-T27-2: the scan finds, and the scrub removes, ${name}`, () => {
+    assert.equal(findLeaks(value, MACHINE).length, 1);
+    const out = JSON.stringify(scrub(value, MACHINE));
+    assert.match(out, /^\{"\w+":("\[scrubbed\]"|\{"\[scrubbed\]":(1|true)\})\}$/);
+    assert.deepEqual(findLeaks(JSON.parse(out), MACHINE), []);
+  });
+}
+
+test('F-T27-2: the scrub keeps the fixed OBS ids, versions, time codes and messages, each in its own field', () => {
+  const kept = {
+    outputName: 'adv_file_output', hotkeyName: 'OBSBasic.StopRecording', inputKind: 'sck_audio_capture', transitionKind: 'fade_transition',
+    requestType: 'StopRecord', eventType: 'RecordStateChanged', platform: 'macos', imageFormat: 'png', obsVersion: '33.0.1',
+    outputTimecode: '00:00:01.234', outputState: 'OBS_WEBSOCKET_OUTPUT_STOPPED', sourceType: 'OBS_SOURCE_TYPE_INPUT',
+    comment: 'You cannot change stream service settings while streaming.', outputFlags: { OBS_OUTPUT_AUDIO: true }, inputAudioTracks: { 1: true },
+  };
+  assert.deepEqual(scrub(kept, MACHINE), kept);
+  // The same values in the wrong field go.
+  assert.deepEqual(scrub({ sceneName: '33.0.1', inputName: 'OBSBasic.StopRecording', comment: 'StopRecord' }, MACHINE), { sceneName: '[scrubbed]', inputName: '[scrubbed]', comment: '[scrubbed]' });
 });
 
 const traces = loadTraces();
@@ -295,6 +337,36 @@ test('the fake OBS replays the real record stop: STOPPING, then STOPPED 235 ms l
   assert.equal((await c.call('StopRecord')).code, 501);
   await c.obs.disconnect();
   await fake.close();
+});
+
+// F-T27-1: the real record trace was captured with no stream live. Its StopRecord must stop and count in every state
+// of the other outputs, and leave them as they were.
+const OTHER_OUTPUTS = { none: {}, stream: { streaming: true }, 'virtual camera': { virtualCam: true }, 'replay buffer': { replayBuffer: true }, all: { streaming: true, virtualCam: true, replayBuffer: true } };
+for (const [name, others] of Object.entries(OTHER_OUTPUTS)) {
+  test(`F-T27-1: the real StopRecord stops the take and counts the stop with other outputs live: ${name}`, async () => {
+    const fake = await startFakeObs({ recording: true, ...others });
+    const c = await client(fake);
+    const stopped = new Promise((r) => c.obs.on('RecordStateChanged', (d) => d.outputState === 'OBS_WEBSOCKET_OUTPUT_STOPPED' && r()));
+    assert.deepEqual(await c.call('StartRecord'), { code: 500, message: '' });
+    assert.deepEqual(await c.call('StopRecord'), { code: 100, d: { outputPath: '[path]' } });
+    await stopped;
+    assert.deepEqual(fake.stops, [{ requestType: 'StopRecord', cause: 'request' }]);
+    assert.deepEqual(fake.state, { recording: false, streaming: false, virtualCam: false, replayBuffer: false, ...others });
+    assert.equal((await c.call('StopRecord')).code, 501);
+    await c.obs.disconnect();
+    await fake.close();
+  });
+}
+
+test('F-T27-3: the fake OBS replays the real reads in every output state, also during a take with a live stream', async () => {
+  const reads = traces.find((t) => t.file === 'real-reads.json').entries;
+  for (const state of [{}, { recording: true }, { recording: true, streaming: true }, { virtualCam: true }]) {
+    const fake = await startFakeObs(state);
+    const c = await client(fake);
+    for (const e of reads) assert.deepEqual((await c.call(e.requestType)).d, e.responseData, `${e.requestType} in ${JSON.stringify(state)}`);
+    await c.obs.disconnect();
+    await fake.close();
+  }
 });
 
 test('F-T6-3: the fake OBS logs, answers and counts each request of a RequestBatch, so a batched stop counts in the sweep', async () => {

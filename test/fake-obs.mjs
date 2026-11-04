@@ -20,6 +20,19 @@ export const TRACE_DIR = new URL('./traces/', import.meta.url);
 export const loadTraces = (dir = TRACE_DIR) =>
   readdirSync(dir).filter((f) => f.endsWith('.json')).sort().map((file) => ({ file, ...JSON.parse(readFileSync(new URL(file, dir), 'utf8')) }));
 const STORED = loadTraces();
+// A captured trace (real or captured) gives each entry the whole output state of the capture run as its "when", also
+// the outputs that the request does not touch. A field of "when" is a condition only when the entries of the same
+// request type differ on it; a field that all of them share is the state of the run. Matching on it would drop the
+// request, and its effect, in every other state: a StopRecord during a stream would not stop or count (F-T27-1), and a
+// read captured with no output active would not replay during a take (F-T27-3). A simulated trace, written by hand,
+// gives only its conditions.
+const conditionsOf = (t) =>
+  t.source === 'simulated'
+    ? t.entries
+    : t.entries.map((e) => {
+        const same = t.entries.filter((x) => x.requestType === e.requestType);
+        return { ...e, when: Object.fromEntries(Object.entries(e.when ?? {}).filter(([k, v]) => same.some((x) => x.when?.[k] !== v))) };
+      });
 // A trace value matches when each of its fields matches; a field that the trace leaves out matches anything.
 const matches = (want, got) =>
   want === undefined || (want && typeof want === 'object' ? !!got && typeof got === 'object' && Object.entries(want).every(([k, v]) => matches(v, got[k])) : Object.is(want, got));
@@ -50,7 +63,7 @@ export async function startFakeObs(options = {}) {
   const stops = [];
   let crashes = 0;
   const timers = new Set();
-  const entries = (o.traces ?? STORED).flatMap((t) => t.entries);
+  const entries = (o.traces ?? STORED).flatMap(conditionsOf);
   const traceFor = (requestType, requestData) => {
     const now = { ...state, videoActive: Object.values(state).some(Boolean) };
     return entries.find((e) => e.requestType === requestType && matches(e.when, now) && matches(e.requestData, requestData ?? {}));

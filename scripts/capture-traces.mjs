@@ -47,6 +47,8 @@ const url = new URL(args.url);
 if (!/^wss?:$/.test(url.protocol) || !['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)) fail('the URL must be ws:// on a loopback address (127.0.0.1, localhost or [::1]).', 2);
 const settleMs = Number(args['settle-ms']);
 const timeoutMs = Number(args['timeout-ms']);
+// A wait of more than a minute after each request is a typing error, not a plan.
+if (!/^\d+$/.test(args['settle-ms']) || settleMs > 60000) fail('--settle-ms must be a whole number of milliseconds from 0 to 60000.', 2);
 if (!(timeoutMs > 0)) fail('--timeout-ms must be a number above 0.', 2);
 const plan = args.plan
   ? JSON.parse(readFileSync(args.plan, 'utf8'))
