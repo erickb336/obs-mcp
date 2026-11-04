@@ -1,7 +1,7 @@
 // Records obs-websocket traces for the fake OBS: each request, its reply and the events after it, through the
 // trace scrub. Run it only with the owner's consent, against a disposable OBS profile and scene collection.
 //
-//   OBS_WEBSOCKET_PASSWORD=... node scripts/capture-traces.mjs --url ws://127.0.0.1:4455 --out trace.json [--plan plan.json] [--allow-record] [--timeout-ms 10000]
+//   OBS_WEBSOCKET_PASSWORD=... node scripts/capture-traces.mjs --url ws://127.0.0.1:4455 --out trace.json [--plan plan.json] [--allow-record] [--timeout-ms 10000] [--confirm-ms 60000]
 //
 // The password comes from OBS_WEBSOCKET_PASSWORD or a hidden prompt, never from an argument, and it is never written.
 // The script:
@@ -11,9 +11,14 @@
 //   no output active, a profile parameter only from the safe list), and a record start or stop only with --allow-record;
 // - starts a take only when GetRecordStatus, read just before, says that no recording is active, and the last record
 //   event (if any) is STOPPED: a take that is STARTING is not active yet;
-// - stops only its own take: GetRecordStatus, read just before, says that a recording is active, and no record event
-//   came after the STARTED event of its own StartRecord. A take that the user starts at any time is never its own.
-//   When that is not certain, it does not stop. It never sends ToggleRecord;
+// - never stops a take on its own. OBS may answer a user's start, sent a few ms after the capture's StartRecord, with an
+//   ok reply and no events of its own (F-T25-1): then the one STARTED event is the user's take too, and the capture cannot
+//   see it. So before a StopRecord it asks the operator on the terminal, and sends it only when the operator types stop
+//   within --confirm-ms. Only a line typed after the prompt shows counts: a line typed before it, also a late answer to an
+//   earlier prompt, is dropped. No answer, another answer or the end of the input leaves the take running.
+//   Before it asks, and again after the answer, it also checks its own take: GetRecordStatus, read just then, says that a
+//   recording is active, and no record event came after the STARTED event of its own StartRecord. When either check
+//   fails, it does not stop. It never sends ToggleRecord;
 // - stops when OBS closes the connection or gives no reply in --timeout-ms, and then writes the partial trace;
 // - writes the trace only after the scrub.
 // plan.json is a list of { requestType, requestData }. With no plan, it sends each catalogue read that needs no field.
@@ -37,19 +42,21 @@ const fail = (message, code = 1) => {
 if (process.argv.slice(2).some((a) => /^--?[\w-]*(pass|secret|token)/i.test(a))) fail('the password comes from OBS_WEBSOCKET_PASSWORD or a prompt, never from an argument.', 2);
 let args;
 try {
-  args = parseArgs({ options: { url: { type: 'string' }, out: { type: 'string' }, plan: { type: 'string' }, 'allow-record': { type: 'boolean' }, 'settle-ms': { type: 'string', default: '300' }, 'timeout-ms': { type: 'string', default: '10000' } } }).values;
+  args = parseArgs({ options: { url: { type: 'string' }, out: { type: 'string' }, plan: { type: 'string' }, 'allow-record': { type: 'boolean' }, 'settle-ms': { type: 'string', default: '300' }, 'timeout-ms': { type: 'string', default: '10000' }, 'confirm-ms': { type: 'string', default: '60000' } } }).values;
 } catch {
   // The parser's message quotes the argument, and an argument can be a password typed in the wrong place.
-  fail('unknown argument. Options: --url, --out, --plan, --allow-record, --settle-ms, --timeout-ms.', 2);
+  fail('unknown argument. Options: --url, --out, --plan, --allow-record, --settle-ms, --timeout-ms, --confirm-ms.', 2);
 }
 if (!args.url || !args.out) fail('give --url ws://127.0.0.1:<port> and --out <file.json>.', 2);
 const url = new URL(args.url);
 if (!/^wss?:$/.test(url.protocol) || !['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)) fail('the URL must be ws:// on a loopback address (127.0.0.1, localhost or [::1]).', 2);
 const settleMs = Number(args['settle-ms']);
 const timeoutMs = Number(args['timeout-ms']);
+const confirmMs = Number(args['confirm-ms']);
 // A wait of more than a minute after each request is a typing error, not a plan.
 if (!/^\d+$/.test(args['settle-ms']) || settleMs > 60000) fail('--settle-ms must be a whole number of milliseconds from 0 to 60000.', 2);
-if (!(timeoutMs > 0)) fail('--timeout-ms must be a number above 0.', 2);
+// setTimeout fires at once for a wait above 2^31 - 1 ms (about 24.8 days), so a larger wait is refused (F-T25-4).
+for (const [name, ms] of [['--timeout-ms', timeoutMs], ['--confirm-ms', confirmMs]]) if (!(ms > 0 && ms <= 2147483647)) fail(`${name} must be a number of milliseconds above 0 and at most 2147483647.`, 2);
 const plan = args.plan
   ? JSON.parse(readFileSync(args.plan, 'utf8'))
   : CATALOGUE.filter((e) => e.class === 'read' && e.fields.every((f) => f.optional)).map((e) => ({ requestType: e.request }));
@@ -75,6 +82,47 @@ function prompt() {
         return resolve(value);
       }
     });
+  });
+}
+
+/**
+ * The operator's input. With --allow-record, it is read from the connection to the end, so that a complete line (ended
+ * with Enter) typed while no prompt shows (a late answer to an earlier prompt, or a line typed before the first prompt)
+ * is dropped and never answers a prompt (F-T25-2). The input does not keep the process alive. The password prompt pauses the input when it ends, and a data
+ * listener does not resume a paused stream, so the input is resumed here (F-T25-5).
+ */
+const input = { answer: undefined, partial: '', ended: false };
+function readInput() {
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', (chunk) => {
+    const lines = (input.partial + chunk).split(/\r?\n/);
+    input.partial = lines.pop();
+    for (const line of lines) input.answer?.(line);
+  });
+  process.stdin.on('end', () => {
+    input.ended = true;
+    input.answer?.();
+  });
+  process.stdin.resume();
+  process.stdin.unref?.();
+}
+
+/** Asks the operator to confirm a stop. True only when the first line typed after the prompt is "stop" and comes in --confirm-ms. */
+function confirmStop() {
+  // A complete line typed before the prompt was dropped when it came. On piped input, also drop the part of a line that
+  // came before the prompt. On a terminal, the terminal keeps an unfinished line until Enter, so the script cannot see it:
+  // a part typed before the prompt joins the text typed after it, and that line is the operator's answer to this prompt.
+  input.partial = '';
+  process.stderr.write(`capture-traces: the capture started a test take. If you did not start a take yourself, type stop and press Enter to send StopRecord. Waiting ${confirmMs / 1000} s.\n`);
+  return new Promise((resolve) => {
+    const done = (line) => {
+      clearTimeout(timer);
+      input.answer = undefined;
+      resolve(line?.trim() === 'stop');
+    };
+    const timer = setTimeout(done, confirmMs);
+    input.answer = done;
+    if (input.ended) done();
   });
 }
 
@@ -129,6 +177,7 @@ try {
 } catch (e) {
   fail(e.message);
 }
+if (args['allow-record']) readInput();
 const state = { recording: false, streaming: false };
 const entries = [];
 /** Sends one request and keeps it with the events that came before the next request. */
@@ -183,7 +232,12 @@ async function check({ requestType, requestData }) {
       const quiet = (await active()) === false && idle() && (await wait(START_QUIET_MS), (await active()) === false) && !events.slice(from).some(isRecordEvent);
       return quiet ? { data: requestData } : { why: 'a recording is active, or its state is not known: the capture starts a take only when no recording is active.' };
     }
-    return (await active()) === true && ownTake() ? { data: requestData } : { why: 'the active recording is not a take that the capture started, or that is not certain: the capture stops only its own take.' };
+    const own = async () => (await active()) === true && ownTake();
+    const notOwn = { why: 'the active recording is not a take that the capture started, or that is not certain: the capture stops only its own take.' };
+    if (!(await own())) return notOwn;
+    if (!(await confirmStop())) return { why: 'the operator did not type stop at the prompt: the capture stops its own take only when the operator asks. The take is still running: stop it in OBS.' };
+    // The operator can stop the take, and start a new one, while the prompt waits.
+    return (await own()) ? { data: requestData } : notOwn;
   }
   const e = entry(requestType);
   if (!e) return { why: 'it is not in the catalogue of documented requests.' };
@@ -199,7 +253,8 @@ async function check({ requestType, requestData }) {
 }
 
 // The index in events of the STARTED event of the capture's own take. OBS has one record output, so after a StartRecord
-// that succeeded, the next STARTED event is that take. Any later record event (a stop, or another take) ends the claim.
+// that succeeded, the next STARTED event is that take, but it can also be a user's take that OBS joined to it (F-T25-1):
+// so a stop also needs the operator's answer. Any later record event (a stop, or another take) ends the claim.
 let take;
 const isRecordEvent = (ev) => ev.eventType === 'RecordStateChanged';
 const ownTake = () => take !== undefined && events.slice(take + 1).every((ev) => !isRecordEvent(ev) || /_(PAUSED|RESUMED)$/.test(ev.eventData.outputState));

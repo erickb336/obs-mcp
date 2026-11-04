@@ -1,6 +1,6 @@
 // The capture script, against the fake OBS only. SIMULATED: no real OBS.
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,18 +8,30 @@ import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { OBSWebSocket } from 'obs-websocket-js/json';
 import { findLeaks } from '../scripts/trace-scrub.mjs';
-import { startFakeObs } from './fake-obs.mjs';
+import { loadTraces, startFakeObs } from './fake-obs.mjs';
 
 const SCRIPT = fileURLToPath(new URL('../scripts/capture-traces.mjs', import.meta.url));
 const PASSWORD = 'capture-test-password-W3q8';
 
-function run(args, env = {}) {
+const STOP_PROMPT = 'type stop and press Enter';
+/**
+ * Runs the capture. answer is what the operator types at each stop prompt: a string, an async function that gives it, or
+ * null for an open input with no answer. With no answer, the input is empty, as when no one is at the terminal. early is
+ * text that the operator types at once, before any prompt: a line ends with a newline.
+ */
+function run(args, env = {}, answer, early) {
   return new Promise((resolve) => {
     const base = { ...process.env, ...env };
     if (!('OBS_WEBSOCKET_PASSWORD' in env)) delete base.OBS_WEBSOCKET_PASSWORD;
-    const p = spawn(process.execPath, [SCRIPT, ...args], { env: base, stdio: ['ignore', 'pipe', 'pipe'] });
+    const p = spawn(process.execPath, [SCRIPT, ...args], { env: base, stdio: [answer === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'] });
+    if (early !== undefined) p.stdin.write(early);
     let stderr = '';
-    p.stderr.on('data', (d) => (stderr += d));
+    let prompts = 0;
+    p.stderr.on('data', (d) => {
+      stderr += d;
+      const seen = stderr.split(STOP_PROMPT).length - 1;
+      for (; prompts < seen; prompts++) if (answer) Promise.resolve(typeof answer === 'function' ? answer() : answer).then((a) => a !== null && p.stdin.write(`${a}\n`));
+    });
     p.on('close', (code) => resolve({ code, stderr }));
   });
 }
@@ -101,7 +113,7 @@ test('with --allow-record, the capture records a take with its events and its ef
   const fake = await startFakeObs();
   const f = files();
   writeFileSync(f.plan, JSON.stringify([{ requestType: 'StartRecord' }, { requestType: 'GetRecordStatus' }, { requestType: 'StopRecord' }]));
-  const r = await run(['--url', `ws://127.0.0.1:${fake.port}`, '--out', f.out, '--plan', f.plan, '--settle-ms', '0', '--allow-record']);
+  const r = await run(['--url', `ws://127.0.0.1:${fake.port}`, '--out', f.out, '--plan', f.plan, '--settle-ms', '0', '--allow-record'], {}, 'stop');
   await fake.close();
   assert.equal(r.code, 0, r.stderr);
   const take = JSON.parse(readFileSync(f.out, 'utf8')).entries.slice(3);
@@ -126,11 +138,11 @@ test('F-T6-1: during a take that --allow-record started, the capture still refus
     { requestType: 'GetInputPropertiesListPropertyItems', requestData: { inputName: 'Display', propertyName: 'type' } },
     { requestType: 'StopRecord' },
   ]));
-  const r = await run(['--url', `ws://127.0.0.1:${fake.port}`, '--out', f.out, '--plan', f.plan, '--settle-ms', '0', '--allow-record']);
+  const r = await run(['--url', `ws://127.0.0.1:${fake.port}`, '--out', f.out, '--plan', f.plan, '--settle-ms', '0', '--allow-record'], {}, 'stop');
   await fake.close();
   assert.equal(r.code, 0, r.stderr);
-  // Before its own StartRecord (twice) and StopRecord, the capture reads GetRecordStatus again (F-T6-19).
-  assert.deepEqual(fake.log, ['GetVersion', 'GetStreamStatus', 'GetRecordStatus', 'GetRecordStatus', 'GetRecordStatus', 'StartRecord', ...GUARD_READS, 'GetRecordStatus', 'StopRecord']);
+  // Before its own StartRecord (twice), and before and after the stop prompt, the capture reads GetRecordStatus again (F-T6-19, F-T25-1).
+  assert.deepEqual(fake.log, ['GetVersion', 'GetStreamStatus', 'GetRecordStatus', 'GetRecordStatus', 'GetRecordStatus', 'StartRecord', ...GUARD_READS, 'GetRecordStatus', 'GetRecordStatus', 'StopRecord']);
   assert.deepEqual(JSON.parse(readFileSync(f.out, 'utf8')).refused.map((x) => `${x.requestType}: ${x.refused}`), [
     `OpenInputPropertiesDialog: ${NOT_A_READ('change')}`,
     `CallVendorRequest: ${NOT_A_READ('guarded')}`,
@@ -163,6 +175,7 @@ const userAndFake = async (t) => {
 };
 const NOT_OWN = 'the active recording is not a take that the capture started, or that is not certain: the capture stops only its own take.';
 const NOT_IDLE = 'a recording is active, or its state is not known: the capture starts a take only when no recording is active.';
+const NO_ANSWER = 'the operator did not type stop at the prompt: the capture stops its own take only when the operator asks. The take is still running: stop it in OBS.';
 const TAKE_PLAN = [{ requestType: 'GetStats' }, { requestType: 'GetStats' }, { requestType: 'StopRecord' }, { requestType: 'ToggleRecord' }, { requestType: 'StartRecord' }, { requestType: 'StopRecord' }];
 for (const [moment, ready] of [
   // The R154 reproduction: the user starts a take just after the capture's first GetRecordStatus has its reply.
@@ -210,6 +223,205 @@ test('F-T6-19: when the user stops the capture\'s take and starts a new one, the
   assert.deepEqual(JSON.parse(readFileSync(f.out, 'utf8')).refused.map((x) => `${x.requestType}: ${x.refused}`), [`StopRecord: ${NOT_OWN}`]);
 });
 
+// F-T25-1: OBS can answer a user's start, sent a few ms after the capture's StartRecord, with an ok reply and no events of
+// its own, so the one STARTED event is the capture's and the user's take at once. In this simulated trace the user's
+// StartRecord carries a marker field, so that only it gets that reply.
+const LENIENT = { format: 'obs-mcp-trace/1', source: 'simulated', basis: 'SIMULATED: a lenient OBS that merges a second start into the take that is STARTING.', entries: [
+  { requestType: 'StartRecord', requestData: { user: true }, when: { recording: false }, status: { result: true, code: 100 } },
+] };
+test('F-T25-1: when OBS merges a user start into the capture\'s take, the capture never sends StopRecord without the operator\'s answer', async (t) => {
+  const fake = await startFakeObs({ traces: [LENIENT, ...loadTraces()] });
+  const user = new OBSWebSocket();
+  await user.connect(`ws://127.0.0.1:${fake.port}`);
+  t.after(async () => {
+    await user.disconnect();
+    await fake.close();
+  });
+  const f = files();
+  writeFileSync(f.plan, JSON.stringify([{ requestType: 'StartRecord' }, { requestType: 'GetStats' }, { requestType: 'StopRecord' }]));
+  const capture = run(['--url', `ws://127.0.0.1:${fake.port}`, '--out', f.out, '--plan', f.plan, '--settle-ms', '0', '--allow-record']);
+  await until(() => fake.log.includes('StartRecord'));
+  await new Promise((r) => setTimeout(r, 20));
+  // The call throws on a failed status: OBS gave the user's start an ok reply.
+  await user.call('StartRecord', { user: true });
+  const r = await capture;
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(fake.state.recording, true);
+  assert.deepEqual(fake.stops, []);
+  assert.equal(fake.log.includes('StopRecord'), false);
+  assert.deepEqual(JSON.parse(readFileSync(f.out, 'utf8')).refused.map((x) => `${x.requestType}: ${x.refused}`), [`StopRecord: ${NO_ANSWER}`]);
+});
+
+// F-T25-1: the capture sends StopRecord only when the operator types stop. An open input with no answer for
+// --confirm-ms, another answer, or a stop typed after the operator stopped the take and started a new one, sends none.
+for (const [name, answer, act] of [
+  ['the operator gives no answer in --confirm-ms', null],
+  ['the operator types another answer', 'no'],
+  ['the operator stops the take in OBS, starts a new one, then types stop', 'stop', async (user, fake) => {
+    await user.call('StopRecord');
+    await until(() => !fake.state.recording);
+    await user.call('StartRecord');
+    await until(() => fake.state.recording);
+  }],
+]) {
+  test(`F-T25-1: when ${name}, the capture sends no StopRecord and the take keeps running`, async (t) => {
+    const { fake, user } = await userAndFake(t);
+    const f = files();
+    writeFileSync(f.plan, JSON.stringify([{ requestType: 'StartRecord' }, { requestType: 'StopRecord' }]));
+    const reply = act ? async () => (await act(user, fake), answer) : answer;
+    // With no answer, the prompt waits 0.5 s. The operator's own stop and start take about 0.5 s, so the others wait 5 s.
+    const confirmMs = answer === null ? '500' : '5000';
+    const r = await run(['--url', `ws://127.0.0.1:${fake.port}`, '--out', f.out, '--plan', f.plan, '--settle-ms', '0', '--confirm-ms', confirmMs, '--allow-record'], {}, reply);
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(fake.state.recording, true);
+    assert.ok(r.stderr.includes(`type stop and press Enter to send StopRecord. Waiting ${confirmMs / 1000} s.`), r.stderr);
+    // The one StopRecord, if any, is the user's own.
+    assert.equal(fake.log.filter((x) => x === 'StopRecord').length, act ? 1 : 0);
+    assert.deepEqual(JSON.parse(readFileSync(f.out, 'utf8')).refused.map((x) => `${x.requestType}: ${x.refused}`), [`StopRecord: ${act ? NOT_OWN : NO_ANSWER}`]);
+  });
+}
+
+// F-T25-2: only a line typed after the prompt shows answers it. A stop typed while no prompt shows is dropped: a late stop
+// after a prompt timed out, or a stop typed before the first prompt. Each plan has two prompts for the capture's own take.
+const LATE = 'the operator types stop after the first prompt timed out, and gives no answer at the second';
+for (const [name, answer, early] of [
+  [LATE, (() => {
+    let prompt = 0;
+    return async () => (++prompt === 1 ? (await new Promise((r) => setTimeout(r, 700)), 'stop') : null);
+  })()],
+  ['the operator types stop before the first prompt, and gives no answer at the prompts', null, 'stop\n'],
+]) {
+  test(`F-T25-2: when ${name}, the capture sends no StopRecord`, async (t) => {
+    const { fake } = await userAndFake(t);
+    const f = files();
+    // The GetStats between the prompts waits 1.5 s, so the late stop comes while no prompt shows.
+    writeFileSync(f.plan, JSON.stringify([{ requestType: 'StartRecord' }, { requestType: 'StopRecord' }, { requestType: 'GetStats' }, { requestType: 'StopRecord' }]));
+    const r = await run(['--url', `ws://127.0.0.1:${fake.port}`, '--out', f.out, '--plan', f.plan, '--settle-ms', '1500', '--confirm-ms', '300', '--allow-record'], {}, answer, early);
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(r.stderr.split(STOP_PROMPT).length - 1, 2, r.stderr);
+    assert.equal(fake.state.recording, true);
+    assert.deepEqual(fake.stops, []);
+    assert.equal(fake.log.includes('StopRecord'), false);
+    assert.deepEqual(JSON.parse(readFileSync(f.out, 'utf8')).refused.map((x) => `${x.requestType}: ${x.refused}`), [`StopRecord: ${NO_ANSWER}`, `StopRecord: ${NO_ANSWER}`]);
+  });
+}
+
+test('F-T25-2: a stop typed after the second prompt shows still stops the take, after a late line between the prompts', async (t) => {
+  const { fake } = await userAndFake(t);
+  const f = files();
+  writeFileSync(f.plan, JSON.stringify([{ requestType: 'StartRecord' }, { requestType: 'StopRecord' }, { requestType: 'GetStats' }, { requestType: 'StopRecord' }]));
+  let prompt = 0;
+  // A stop typed before the first prompt is dropped, the first prompt times out and gets a late "no", and the second gets stop.
+  const answer = async () => (++prompt === 1 ? (await new Promise((r) => setTimeout(r, 700)), 'no') : 'stop');
+  const r = await run(['--url', `ws://127.0.0.1:${fake.port}`, '--out', f.out, '--plan', f.plan, '--settle-ms', '1500', '--confirm-ms', '5000', '--allow-record'], {}, answer, 'stop\n');
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(fake.state.recording, false);
+  assert.deepEqual(fake.stops, [{ requestType: 'StopRecord', cause: 'request' }]);
+});
+
+// F-T25-6, piped input only (not a terminal): the part of a line that came before the prompt is dropped. "st" with no
+// newline, then "op" after the prompt, is the line "op", not "stop". On a terminal the rule differs: see the pty tests.
+test('F-T25-6: on piped input, a part of a line that came before the prompt does not join the answer after it', async (t) => {
+  const { fake } = await userAndFake(t);
+  const f = files();
+  writeFileSync(f.plan, JSON.stringify([{ requestType: 'StartRecord' }, { requestType: 'StopRecord' }]));
+  const r = await run(['--url', `ws://127.0.0.1:${fake.port}`, '--out', f.out, '--plan', f.plan, '--settle-ms', '0', '--confirm-ms', '5000', '--allow-record'], {}, 'op', 'st');
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(fake.state.recording, true);
+  assert.deepEqual(fake.stops, []);
+  assert.deepEqual(JSON.parse(readFileSync(f.out, 'utf8')).refused.map((x) => `${x.requestType}: ${x.refused}`), [`StopRecord: ${NO_ANSWER}`]);
+});
+
+// F-T25-5: the hidden password prompt pauses the input when it ends. The stop prompt must still get the operator's line.
+test('F-T25-5: when the input is paused before the capture reads it, a stop typed at the prompt still stops the take', async (t) => {
+  const { fake } = await userAndFake(t);
+  const f = files();
+  writeFileSync(f.plan, JSON.stringify([{ requestType: 'StartRecord' }, { requestType: 'StopRecord' }]));
+  // The preload pauses the input, as the end of the password prompt does.
+  const r = await run(['--url', `ws://127.0.0.1:${fake.port}`, '--out', f.out, '--plan', f.plan, '--settle-ms', '0', '--confirm-ms', '5000', '--allow-record'], { NODE_OPTIONS: '--import=data:text/javascript,process.stdin.pause()' }, 'stop');
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(fake.state.recording, false);
+  assert.deepEqual(fake.stops, [{ requestType: 'StopRecord', cause: 'request' }]);
+});
+
+// On a terminal: a pseudo-terminal from the Python standard library (pty) runs the capture, as an operator at a terminal.
+// PTY_STEPS is a list of [cue, text]: the operator types text when cue shows in the output, or at once when cue is empty.
+// A carriage return is Enter. The terminal is in its normal line mode: it gives a line to the script only at Enter.
+const PTY_OPERATOR = `
+import json, os, pty, select, sys, time
+steps = json.loads(os.environ['PTY_STEPS'])
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv(sys.argv[1], sys.argv[1:])
+out, done, deadline = b'', 0, time.time() + 30
+while time.time() < deadline:
+    while done < len(steps) and steps[done][0].encode() in out:
+        os.write(fd, steps[done][1].encode())
+        done += 1
+    if select.select([fd], [], [], 0.1)[0]:
+        try:
+            data = os.read(fd, 4096)
+        except OSError:
+            break
+        if not data:
+            break
+        out += data
+else:
+    os.kill(pid, 9)
+sys.stdout.write(out.decode(errors='replace'))
+sys.exit(os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]))
+`;
+// The pty tests need Unix and Python 3.9 or later (os.waitstatus_to_exitcode). Exit code 3 means an older Python.
+const python = process.platform === 'win32' ? undefined : spawnSync('python3', ['-c', 'import os, pty, sys; sys.exit(0 if hasattr(os, "waitstatus_to_exitcode") else 3)']);
+const noPty = process.platform === 'win32' ? 'no pty on Windows: Python\'s pty module works only on Unix'
+  : python.status === 3 ? 'python3 is older than 3.9: it has no os.waitstatus_to_exitcode'
+  : python.status !== 0 ? 'python3 with its pty module is not on this machine' : false;
+/** Runs the capture on a pseudo-terminal with the operator's steps. A fake OBS without a password needs no password step. */
+async function runOnTerminal(t, steps, { password, confirmMs = '5000' } = {}) {
+  const fake = await startFakeObs(password ? { password } : {});
+  t.after(() => fake.close());
+  const f = files();
+  writeFileSync(f.plan, JSON.stringify([{ requestType: 'StartRecord' }, { requestType: 'StopRecord' }]));
+  const env = { ...process.env, PTY_STEPS: JSON.stringify(steps) };
+  delete env.OBS_WEBSOCKET_PASSWORD;
+  const args = [SCRIPT, '--url', `ws://127.0.0.1:${fake.port}`, '--out', f.out, '--plan', f.plan, '--settle-ms', '0', '--confirm-ms', confirmMs, '--allow-record'];
+  const r = await new Promise((resolve) => {
+    const p = spawn('python3', ['-c', PTY_OPERATOR, process.execPath, ...args], { env, stdio: ['ignore', 'pipe', 'inherit'] });
+    let output = '';
+    p.stdout.on('data', (d) => (output += d));
+    p.on('close', (code) => resolve({ code, output }));
+  });
+  assert.equal(r.code, 0, r.output);
+  assert.equal(r.output.split(STOP_PROMPT).length - 1, 1, r.output);
+  return { fake, output: r.output, refused: JSON.parse(readFileSync(f.out, 'utf8')).refused.map((x) => `${x.requestType}: ${x.refused}`) };
+}
+
+// F-T25-5 on a terminal: the operator types the password at the hidden prompt, then stop at the stop prompt.
+test('F-T25-5: on a terminal, after the hidden password prompt, a stop typed at the stop prompt stops the take once', { skip: noPty }, async (t) => {
+  const { fake, output } = await runOnTerminal(t, [['password:', `${PASSWORD}\r`], [STOP_PROMPT, 'stop\r']], { password: PASSWORD });
+  assert.ok(output.includes('obs-websocket password: '), output);
+  assert.equal(output.includes(PASSWORD), false);
+  assert.equal(fake.state.recording, false);
+  assert.deepEqual(fake.stops, [{ requestType: 'StopRecord', cause: 'request' }]);
+});
+
+// F-T25-7: on a terminal, a complete line typed before the prompt is dropped, so a stop from before the prompt never stops a take.
+test('F-T25-7: on a terminal, a complete stop line typed before the prompt sends no StopRecord', { skip: noPty }, async (t) => {
+  const { fake, refused } = await runOnTerminal(t, [['', 'stop\r']], { confirmMs: '1000' });
+  assert.equal(fake.state.recording, true);
+  assert.deepEqual(fake.stops, []);
+  assert.deepEqual(refused, [`StopRecord: ${NO_ANSWER}`]);
+});
+
+// F-T25-7: on a terminal, an unfinished line is completed by what the operator types after the prompt, and that line is
+// the answer to the prompt that shows: "st" before the prompt, then "op" and Enter after it, is "stop".
+test('F-T25-7: on a terminal, "st" typed before the prompt and "op" with Enter after it stops the take once', { skip: noPty }, async (t) => {
+  const { fake, refused } = await runOnTerminal(t, [['', 'st'], [STOP_PROMPT, 'op\r']]);
+  assert.equal(fake.state.recording, false);
+  assert.deepEqual(fake.stops, [{ requestType: 'StopRecord', cause: 'request' }]);
+  assert.deepEqual(refused, []);
+});
+
 // F-T6-4 and F-T6-9: a crash of OBS or a request with no reply ends the capture with the reason, and the partial trace is written.
 for (const [name, options, reason] of [
   ['OBS closes the connection', { crashOn: 'GetSceneList' }, 'OBS closed the connection (1006) while GetSceneList was in flight.'],
@@ -252,13 +464,24 @@ test('a password argument, a stray argument or a non-loopback URL is refused bef
     await run(['--url', url, '--out', f.out, '--password', PASSWORD]),
     await run(['--url', url, '--out', f.out, PASSWORD]),
     await run(['--url', 'ws://192.0.2.10:4455', '--out', f.out]),
+    await run(['--url', url, '--out', f.out, '--confirm-ms', '0']),
+    // F-T25-4: setTimeout fires at once for a wait above 2147483647 ms.
+    await run(['--url', url, '--out', f.out, '--confirm-ms', '2147483648']),
+    await run(['--url', url, '--out', f.out, '--confirm-ms', 'Infinity']),
+    await run(['--url', url, '--out', f.out, '--timeout-ms', '1e10']),
   ];
   await fake.close();
-  assert.deepEqual(runs.map((r) => r.code), [2, 2, 2]);
+  assert.deepEqual(runs.map((r) => r.code), [2, 2, 2, 2, 2, 2, 2]);
   assert.match(runs[0].stderr, /never from an argument/);
   assert.match(runs[1].stderr, /unknown argument/);
   assert.match(runs[2].stderr, /loopback address/);
+  const tooLong = (name) => `capture-traces: ${name} must be a number of milliseconds above 0 and at most 2147483647.\n`;
+  assert.deepEqual(runs.slice(3).map((r) => r.stderr), [tooLong('--confirm-ms'), tooLong('--confirm-ms'), tooLong('--confirm-ms'), tooLong('--timeout-ms')]);
   assert.equal(runs.some((r) => r.stderr.includes(PASSWORD)), false);
+  // The longest wait passes the check: the script goes on to read the plan.
+  const ok = await run(['--url', url, '--out', f.out, '--confirm-ms', '2147483647', '--timeout-ms', '2147483647', '--plan', '/nonexistent/plan.json']);
+  assert.equal(ok.code, 1);
+  assert.doesNotMatch(ok.stderr, /-ms/);
   assert.equal(fake.connections(), 0);
 });
 
