@@ -234,6 +234,18 @@ export class Journal {
       .filter((id): id is string => !!id && !!this.load(id) && isOpen(this.load(id)!.take));
   }
 
+  /** The take whose last state line is the newest, for a status in a new process. */
+  latest(): Take | undefined {
+    let best: { at: number; take: Take } | undefined;
+    for (const f of this.list()) {
+      const id = /^take-([\w-]+)\.jsonl$/.exec(f)?.[1];
+      const l = id ? this.load(id) : undefined;
+      const at = Number(l?.recs.findLast((r) => r.t === 'state')?.at ?? 0);
+      if (l && (!best || at > best.at)) best = { at, take: l.take };
+    }
+    return best?.take;
+  }
+
   /** G28: removes closed takes older than 30 days, and the oldest closed takes past 100, with their files; and old claims. */
   prune(now = Date.now()) {
     const old = now - RETENTION.days * 864e5;

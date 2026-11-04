@@ -30,20 +30,29 @@ export async function closedPort() {
   return port;
 }
 
-/** port null leaves OBS_WEBSOCKET_PORT unset, so the port comes from the settings file. */
+/**
+ * port null leaves OBS_WEBSOCKET_PORT unset, so the port comes from the settings file. Each server gets a new
+ * temporary take journal folder, so that no test writes to the journal of this machine.
+ */
 export function testEnv(dir, port, extra = {}) {
-  const env = { ...process.env, OBS_STUDIO_CONFIG_DIR: dir, OBS_WEBSOCKET_PORT: String(port), ...extra };
+  const state = join(mkdtempSync(join(tmpdir(), 'obs-mcp-state-')), 'takes');
+  const env = { ...process.env, OBS_STUDIO_CONFIG_DIR: dir, OBS_WEBSOCKET_PORT: String(port), OBS_MCP_STATE_DIR: state, ...extra };
   if (port === null && !('OBS_WEBSOCKET_PORT' in extra)) delete env.OBS_WEBSOCKET_PORT;
   if (!('OBS_WEBSOCKET_PASSWORD' in extra)) delete env.OBS_WEBSOCKET_PASSWORD;
   return env;
 }
 
-/** Starts a server process and connects an SDK client. era: 'legacy' (2025 opening) or 'modern' (2026-07-28). */
-export async function connect(env, { era = 'legacy', command = process.execPath, args = [CLI] } = {}) {
+/**
+ * Starts a server process and connects an SDK client. era: 'legacy' (2025 opening) or 'modern' (2026-07-28).
+ * elicit: the client's answer to each confirm prompt; without it, the client declares no elicitation.
+ */
+export async function connect(env, { era = 'legacy', command = process.execPath, args = [CLI], elicit } = {}) {
   const transport = new StdioClientTransport({ command, args, env, stderr: 'pipe' });
   let stderr = '';
   transport.stderr?.on('data', (d) => (stderr += d));
-  const client = new Client({ name: 'obs-mcp-test', version: '0.0.0' }, era === 'modern' ? { versionNegotiation: { mode: { pin: '2026-07-28' } } } : {});
+  const options = { ...(era === 'modern' ? { versionNegotiation: { mode: { pin: '2026-07-28' } } } : {}), ...(elicit ? { capabilities: { elicitation: { form: {} } } } : {}) };
+  const client = new Client({ name: 'obs-mcp-test', version: '0.0.0' }, options);
+  if (elicit) client.setRequestHandler('elicitation/create', elicit);
   await client.connect(transport);
   const replies = [];
   const call = async (name, args = {}) => {
