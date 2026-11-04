@@ -5,7 +5,7 @@ import { delimiter, join } from 'node:path';
 import { test } from 'node:test';
 import { obsCheck } from '../dist/doctor.js';
 import { listenerCheck } from '../dist/obs.js';
-import { findObs, netstatListeners, onPath, probe, tasklistName, windowsTool } from '../dist/platform.js';
+import { controlLock, findObs, netstatListeners, onPath, probe, tasklistName, windowsTool } from '../dist/platform.js';
 
 // Sample "netstat -ano -p TCP" output. The headers and the state words change with the Windows display language.
 const ENGLISH = `
@@ -94,4 +94,15 @@ test('F-T12-37: OBS not found is a warning when OBS answers, and a failure when 
   assert.equal(obsCheck(null, undefined, true).result, 'warn');
   assert.equal(obsCheck(null, undefined, false).result, 'FAIL');
   assert.equal(obsCheck({ path: '/opt/obs' }, '33.0.1', false).text, 'OBS found at /opt/obs, version 33.0.1');
+});
+
+test('G32: the controller lock is a named pipe on Windows and a short socket path elsewhere, one for each OBS address and user', () => {
+  const url = 'ws://127.0.0.1:4455';
+  assert.match(controlLock(url, { USERNAME: 'a' }, 'win32'), /^\\\\\.\\pipe\\obs-mcp-[0-9a-f]{16}$/);
+  assert.notEqual(controlLock(url, { USERNAME: 'a' }, 'win32'), controlLock(url, { USERNAME: 'b' }, 'win32'), 'another user, another name');
+  assert.notEqual(controlLock(url, {}, 'win32'), controlLock('ws://127.0.0.1:4456', {}, 'win32'), 'another port, another name');
+  if (process.platform === 'win32') return;
+  assert.match(controlLock(url, { XDG_RUNTIME_DIR: '/run/user/1000' }, 'linux'), /^\/run\/user\/1000\/obs-mcp-[0-9a-f]{16}\.sock$/);
+  const long = controlLock(url, { XDG_RUNTIME_DIR: `/${'x'.repeat(120)}` }, 'linux');
+  assert.match(long, /^\/tmp\/obs-mcp-[0-9a-f]{16}\.sock$/, 'a socket path stays under the limit of the OS');
 });

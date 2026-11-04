@@ -14,7 +14,7 @@ import { connect, obsConfigDir, sampleParams, testEnv } from './helpers.mjs';
 const CATALOGUE = JSON.parse(readFileSync(new URL('../dist/catalogue.json', import.meta.url), 'utf8'));
 const CLASS = Object.fromEntries(CATALOGUE.map((e) => [e.request, e.class]));
 // The values that make a request harmful during a take: the record output, the stop hotkey, and a list row that crashes OBS.
-const HARMFUL = { outputName: 'adv_file_output', hotkeyName: 'OBSBasic.StopRecording', inputName: 'App audio', propertyName: 'application' };
+const HARMFUL = { outputName: 'simple_file_output', hotkeyName: 'OBSBasic.StopRecording', inputName: 'App audio', propertyName: 'application' };
 const paramsFor = (e) => Object.fromEntries(Object.entries(sampleParams(e)).map(([k, v]) => [k, HARMFUL[k] ?? v]));
 const UNCLEARED_ROWS = [
   { inputName: 'App audio', propertyName: 'application' },

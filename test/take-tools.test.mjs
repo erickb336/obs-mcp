@@ -1,7 +1,7 @@
-// T7 unit 6: the take tools, the notice channel, the owner rule and the restart rows R1 to R8, on the fake OBS.
+// T7 unit 6: the take tools, the notice channel, the controller rule (G32) and the restart rows R1 to R8, on the fake OBS.
 // SIMULATED: no real OBS. Limits are scaled down (test/take-app.mjs).
 import assert from 'node:assert/strict';
-import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, test } from 'node:test';
 import { Journal } from '../dist/journal.js';
@@ -70,15 +70,16 @@ test('G25, G26: a client with no elicitation gets X2 for a start and X1 for a st
   await w.fake.close();
 });
 
-test('O6, G29: a stop from another client gets X16 with no prompt, and nothing is sent', async () => {
+test('G32: a second copy on the same OBS only reads: X16 for a start and a stop, with no prompt, and its status shows the take', async () => {
   const w = await world();
   const a = await server(w, { elicit: accept, client: 'Claude Code' });
   const b = await server(w, { elicit: accept, client: 'Cursor' });
+  assert.deepEqual([a.app.lock.held, b.app.lock.held], [true, false]);
+  assert.equal((await b.call('obs_record_start', { token: 'reader-token-1' })).text, TEXT.X16);
   await a.call('obs_record_start', { token: 'take-token-1' });
-  const r = await b.call('obs_record_stop');
-  assert.equal(r.text.split('\n').at(-1), TEXT.X16('Claude Code'));
+  assert.equal((await b.call('obs_record_stop')).text, TEXT.X16);
   assert.equal(b.prompts.length, 0);
-  assert.match(await status(b), /^Recording for |^OBS is recording/);
+  assert.match(await status(b), /^Recording for /);
   assert.deepEqual(recordRequests(w.fake), ['StartRecord']);
   await a.kill();
   await b.kill();
@@ -117,17 +118,16 @@ test('F9: a full take with planted secrets leaves no planted secret in the journ
   w.fake.resumeInObs();
   await wait(100);
   // With plant on, the path field of the file output has a planted key, so the same-recording test cannot pass
-  // (check 3 fails to the safe side) and a stop request would only ask again. The take stops in OBS (T20).
+  // (check 3 fails to the safe side). After one dialog the stop refuses with X20 (F-T7-55). The take stops in OBS (T20).
   const asked = await s.call('obs_record_stop');
-  // On the 2025 era the server asks again up to 8 times, then gives X19.
-  assert.match(asked.text, /The recording changed each time you decided, so I did not stop it\./, asked.text);
+  assert.equal(asked.text, TEXT.X20);
+  assert.equal(s.prompts.length, 2, 'the start dialog and one stop dialog');
   assert.deepEqual(recordRequests(w.fake), ['StartRecord']);
   w.fake.stopInObs();
   await wait(400);
   await s.kill();
   // A restart, then the file check runs again (R8).
   const s2 = await server(w, { elicit: accept });
-  await wait(700);
   await s2.call('obs_take_status');
   assert.ok(await until(async () => /^Take closed/.test(await status(s2))), await status(s2));
   const text = readdirSync(w.dir).map((f) => readFileSync(join(w.dir, f), 'utf8')).join('\n');
@@ -139,16 +139,14 @@ test('F9: a full take with planted secrets leaves no planted secret in the journ
   await w.fake.close();
 });
 
-// ---- The restart rows. A journal from a process that died (its beat is old) and OBS in a given state.
+// ---- The restart rows. A journal from a process that died, and OBS in a given state.
 
 async function journalOf(w, state, extra = {}) {
-  const j = new Journal(w.dir, 'Claude Code');
-  j.own('t1', 1);
-  j.append('t1', { t: 'open', v: 1, id: 't1', kind: extra.kind ?? 'normal', client: 'Claude Code', pid: 1 });
+  const j = new Journal(w.dir);
+  j.append('t1', { t: 'open', v: 1, id: 't1', kind: extra.kind ?? 'normal', pid: 1 });
   j.append('t1', { t: 'intent', what: 'start', at: Date.now() - 4000, token: 'ab' });
   const path = w.fake.path();
   j.state('t1', { ...newTake('t1', extra.kind ?? 'normal', state), intentAt: Date.now() - 4000, startedAt: Date.now() - 3000, startBytes: 0, paths: path ? [path] : [], ...extra });
-  writeFileSync(join(w.dir, 'take-t1.beat'), JSON.stringify({ at: Date.now() - 60000 }));
 }
 
 const ROWS = [
@@ -156,7 +154,7 @@ const ROWS = [
   ['R2', 'start_uncertain', {}, /^Take closed: not_started\. OBS shows no recording, so the start did not happen\.$/],
   ['R3', 'recording', { recording: true, elapsedMs: 3000 }, /^Recording for 00:00:0\d \(OBS confirmed it\)\./],
   ['R4', 'paused', { recording: true, elapsedMs: 60000 }, /^OBS is recording/, 'the old take closes not_checked, and a new external take opens'],
-  ['R5', 'recording', {}, /^The recording stopped at about \d\d:\d\d, and nobody asked for it\./],
+  ['R5', 'recording', {}, /^The recording stopped while I did not watch it, and nobody asked for it\./],
   ['R6', 'stopping', { recording: true, elapsedMs: 3000 }, /^I sent the stop at .*, but OBS did not confirm it in 15 s\./],
   ['R7', 'external', { recording: true, elapsedMs: 3000 }, /^OBS is recording \(00:00:0\d/],
   ['R8', 'checking', {}, /^(OBS shows no recording now|Take closed)/],
@@ -169,7 +167,7 @@ describe('T7 unit 6: after a crash of the server, the restart rows R1 to R8 run,
       const s = await server(w, { elicit: accept });
       const text = await status(s);
       assert.ok(text.split('\n').some((l) => want.test(l)), text);
-      const j = new Journal(w.dir, 'x');
+      const j = new Journal(w.dir);
       assert.ok(j.read('t1').some((r) => r.t === 'state' && r.row === row), `the journal has row ${row}`);
       if (row === 'R4') assert.equal(j.load('t1').take.result, 'not_checked');
       assert.deepEqual(recordRequests(w.fake), []);
@@ -183,12 +181,11 @@ test('unit 6 (design test): OBS crashes on StartRecord after the intent; a resta
   const w = await world({ crashOn: 'StartRecord' });
   const s = await server(w, { elicit: accept });
   const r = await s.call('obs_record_start', { token: 'crash-token-1' });
-  assert.match(r.text, /^I lost the connection to OBS at .*I sent the start at .*, but OBS did not confirm it in 5 s\./);
+  assert.equal(r.text, TEXT.X10c); // F-T7-67: not X9, which says that 5 s passed
   await s.kill();
-  const j = new Journal(w.dir, 'x');
+  const j = new Journal(w.dir);
   const id = readdirSync(w.dir).find((f) => f.endsWith('.jsonl')).slice(5, -6);
   assert.deepEqual(j.read(id).filter((x) => ['intent', 'sent'].includes(x.t)).map((x) => x.t), ['intent', 'sent'], 'the intent is on disk before the send');
-  await wait(700); // the beat of the dead process gets old (staleMs 600)
   w.fake.log.length = 0;
   const s2 = await server(w, { elicit: accept });
   assert.match(await status(s2), /^Take closed: not_started\./);

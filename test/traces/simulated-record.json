@@ -1,7 +1,7 @@
 {
   "format": "obs-mcp-trace/1",
   "source": "simulated",
-  "basis": "SIMULATED. Written by hand from the obs-websocket 5.7.6 protocol and the facts of the T4 spike on OBS 33.0.1: STARTING at 13 to 39 ms and STARTED at 21 to 51 ms after a record start; the stop returns at once and STOPPED comes at 1,013 to 1,111 ms; PauseRecord on a paused output gives 502 and ResumeRecord on an output that is not paused gives 503, by reading the obs-websocket 5.7.6 source (RequestHandler_Record.cpp); both give 501 when nothing records. PAUSED at 21 ms with outputActive false, while the output stays active, and RESUMED at 6 ms, are from the R210 probe of a real OBS 33.0.1. The fake models GetOutputSettings of the record output (its path stays after the stop) and the record status. The effects of StopOutput, ToggleOutput and the stop hotkey on the record output are inferred from the source, not measured. Not captured from OBS. StartRecord and StopRecord are real now, in the real record trace.",
+  "basis": "SIMULATED. Written by hand from the obs-websocket 5.7.6 protocol and the facts of the R210 probe of a real OBS 33.0.1 in Simple output mode (hybrid MOV): STARTING about 40 ms and STARTED 60 to 140 ms after a record start; STOPPING at 1 to 2 ms and STOPPED about 230 ms after a stop; the record output is simple_file_output, the only file output of that probe. PauseRecord on a paused output gives 502 and ResumeRecord on an output that is not paused gives 503, by reading the obs-websocket 5.7.6 source (RequestHandler_Record.cpp); both give 501 when nothing records. PAUSED at 21 ms with outputActive false, while the output stays active, and RESUMED at 6 ms, are from the R210 probe of a real OBS 33.0.1. The fake models GetOutputSettings of the record output (its path stays after the stop) and the record status. The effects of StopOutput, ToggleOutput and the stop hotkey on the record output are inferred from the source, not measured. Not captured from OBS. StartRecord and StopRecord are real now, in the real record trace.",
   "obs": { "obsVersion": "33.0.1", "obsWebSocketVersion": "5.7.6", "rpcVersion": 1 },
   "entries": [
     {
@@ -10,8 +10,8 @@
       "status": { "result": true, "code": 100 },
       "responseData": { "outputActive": true },
       "events": [
-        { "delayMs": 25, "eventType": "RecordStateChanged", "eventData": { "outputActive": false, "outputState": "OBS_WEBSOCKET_OUTPUT_STARTING", "outputPath": null } },
-        { "delayMs": 40, "eventType": "RecordStateChanged", "eventData": { "outputActive": true, "outputState": "OBS_WEBSOCKET_OUTPUT_STARTED", "outputPath": "[path]" } }
+        { "delayMs": 40, "eventType": "RecordStateChanged", "eventData": { "outputActive": false, "outputState": "OBS_WEBSOCKET_OUTPUT_STARTING", "outputPath": null } },
+        { "delayMs": 100, "eventType": "RecordStateChanged", "eventData": { "outputActive": true, "outputState": "OBS_WEBSOCKET_OUTPUT_STARTED", "outputPath": "[path]" } }
       ],
       "effect": { "recording": true }
     },
@@ -22,7 +22,7 @@
       "responseData": { "outputActive": false },
       "events": [
         { "delayMs": 1, "eventType": "RecordStateChanged", "eventData": { "outputActive": false, "outputState": "OBS_WEBSOCKET_OUTPUT_STOPPING", "outputPath": null } },
-        { "delayMs": 1050, "eventType": "RecordStateChanged", "eventData": { "outputActive": false, "outputState": "OBS_WEBSOCKET_OUTPUT_STOPPED", "outputPath": "[path]" } }
+        { "delayMs": 230, "eventType": "RecordStateChanged", "eventData": { "outputActive": false, "outputState": "OBS_WEBSOCKET_OUTPUT_STOPPED", "outputPath": "[path]" } }
       ],
       "effect": { "recording": false }
     },
@@ -44,9 +44,9 @@
     },
     { "requestType": "ResumeRecord", "when": { "recording": true, "paused": false }, "status": { "result": false, "code": 503 } },
     { "requestType": "ResumeRecord", "when": { "recording": false }, "status": { "result": false, "code": 501 } },
-    { "requestType": "StopOutput", "requestData": { "outputName": "adv_file_output" }, "when": { "recording": true }, "status": { "result": true, "code": 100 }, "effect": { "recording": false } },
-    { "requestType": "StartOutput", "requestData": { "outputName": "adv_file_output" }, "when": { "recording": true }, "status": { "result": false, "code": 500 } },
-    { "requestType": "ToggleOutput", "requestData": { "outputName": "adv_file_output" }, "when": { "recording": true }, "status": { "result": true, "code": 100 }, "responseData": { "outputActive": false }, "effect": { "recording": false } },
+    { "requestType": "StopOutput", "requestData": { "outputName": "simple_file_output" }, "when": { "recording": true }, "status": { "result": true, "code": 100 }, "effect": { "recording": false } },
+    { "requestType": "StartOutput", "requestData": { "outputName": "simple_file_output" }, "when": { "recording": true }, "status": { "result": false, "code": 500 } },
+    { "requestType": "ToggleOutput", "requestData": { "outputName": "simple_file_output" }, "when": { "recording": true }, "status": { "result": true, "code": 100 }, "responseData": { "outputActive": false }, "effect": { "recording": false } },
     {
       "requestType": "TriggerHotkeyByName",
       "requestData": { "hotkeyName": "OBSBasic.StopRecording" },
@@ -54,7 +54,7 @@
       "status": { "result": true, "code": 100 },
       "events": [
         { "delayMs": 1, "eventType": "RecordStateChanged", "eventData": { "outputActive": false, "outputState": "OBS_WEBSOCKET_OUTPUT_STOPPING", "outputPath": null } },
-        { "delayMs": 1050, "eventType": "RecordStateChanged", "eventData": { "outputActive": false, "outputState": "OBS_WEBSOCKET_OUTPUT_STOPPED", "outputPath": "[path]" } }
+        { "delayMs": 230, "eventType": "RecordStateChanged", "eventData": { "outputActive": false, "outputState": "OBS_WEBSOCKET_OUTPUT_STOPPED", "outputPath": "[path]" } }
       ],
       "effect": { "recording": false }
     }

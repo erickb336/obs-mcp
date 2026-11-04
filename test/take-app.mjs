@@ -25,7 +25,6 @@ export const FAST = {
   reminderFirstMs: 300,
   reminderMs: 500,
   beatMs: 150,
-  staleMs: 600,
   reconnectMs: [50, 100, 200],
 };
 
@@ -43,14 +42,14 @@ export async function world(fakeOptions = {}) {
 export async function server(w, { era = 'legacy', elicit = null, client = 'Claude Code', limits = FAST, manual = false } = {}) {
   const env = { ...process.env, OBS_MCP_RECORDING_DIR: w.rec };
   const app = createApp({ target: () => connectionTarget(obsConfigDir(null), testEnv('', w.fake.port)), limits, dir: w.dir, env });
+  await app.control(); // as at a server start: the first copy on this fake OBS controls, a later one reads (G32)
   const p = await pair(() => createServer(app), { era, elicit, name: client, manual });
   return {
     app,
     ...p,
-    /** Ends the process as a crash would: no notice, no journal line, timers stopped. */
+    /** Ends the process as a crash would: no notice, no journal line, timers stopped, and the controller lock goes. */
     kill: async () => {
-      app.takes.close();
-      await app.obs.close();
+      await app.close();
       await p.close().catch(() => {});
     },
   };

@@ -75,16 +75,15 @@ export function canAsk(server: McpServer, ctx: ServerContext): boolean {
  * Runs a tool that can ask for consent. run gets the answer, and gives the reply or a prompt.
  * - 2026 era: the prompt goes back as inputRequired with one form elicitation, and the client calls again with the answer.
  * - 2025 era: the wire has no such round, so the server sends the prompt to the client itself and waits until the
- *   consent id expires (P15). Then end('expired') gives the reply, and the prompt goes (F-T7-49). After 8 prompts in
- *   one call, as the SDK's own loop, end('rounds') gives the reply.
+ *   consent id expires (P15). Then end() gives the reply, and the prompt goes (F-T7-49). A tool asks at most twice in
+ *   one call (a stop, then one W6), so the loop ends.
  */
-export async function asking<R>(ctx: ServerContext, run: (a: Answer) => Promise<R | Prompt>, end: (why: 'expired' | 'rounds') => R): Promise<R | ReturnType<typeof inputRequired>> {
+export async function asking<R>(ctx: ServerContext, run: (a: Answer) => Promise<R | Prompt>, end: () => R): Promise<R | ReturnType<typeof inputRequired>> {
   let res = await run(answerOf(ctx));
   if (!isPrompt(res)) return res;
   if (ctx.mcpReq.envelope) return inputRequired({ inputRequests: { [KEY]: inputRequired.elicit({ message: res.prompt, requestedSchema: SCHEMA }) }, requestState: res.id });
-  for (let round = 1; isPrompt(res); round++) {
+  while (isPrompt(res)) {
     const p = res;
-    if (round > 8) return end('rounds');
     const stop = new AbortController();
     // The request's own limit is a little longer than the consent life, so that the consent life decides, and a
     // request that nobody answers (a client that closed) still ends.
@@ -96,7 +95,7 @@ export async function asking<R>(ctx: ServerContext, run: (a: Answer) => Promise<
     const a = await Promise.race([answer, p.expired.then(() => undefined)]);
     if (!a) {
       stop.abort();
-      return end('expired');
+      return end();
     }
     res = await run(a);
   }

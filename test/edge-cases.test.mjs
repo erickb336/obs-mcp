@@ -12,7 +12,7 @@ import { recordRequests, server, until, wait, world } from './take-app.mjs';
 
 const status = async (s) => (await s.call('obs_take_status')).text;
 const take = (w) => {
-  const j = new Journal(w.dir, 'x');
+  const j = new Journal(w.dir);
   const id = readdirSync(w.dir).filter((f) => f.endsWith('.jsonl')).map((f) => f.slice(5, -6))[0];
   return { id, ...j.load(id), rows: j.read(id).filter((r) => r.t === 'state').map((r) => r.row) };
 };
@@ -61,13 +61,12 @@ test('E2, F-T7-17: a drop right after StopRecord: stop_uncertain with the text o
   await done(w, s);
 });
 
-test('E3: a server restart during a test take: R3, the gap is reported, and reminder W8 goes on the notice channel', async () => {
+test('E3: a server restart during a test take: R3, the watch starts again, and reminder W8 goes on the notice channel', async () => {
   const { w, s } = await recording({ test: true });
   await s.kill();
-  await wait(700);
   const s2 = await server(w, { elicit: accept });
   const text = await status(s2);
-  assert.match(text, /^OBS still records the take that I started \(00:00:0\d, file .*\)\. The watch had a gap from \d\d:\d\d:\d\d to \d\d:\d\d:\d\d\./);
+  assert.match(text, /^OBS still records the take that I started \(00:00:0\d, file .*\)\. I watch it again from \d\d:\d\d:\d\d\./);
   assert.match(text, /\nA test recording still runs \(/);
   assert.ok(take(w).rows.includes('R3'));
   assert.deepEqual(recordRequests(w.fake), ['StartRecord']);
@@ -108,11 +107,11 @@ test('E6, E11: you pause in OBS; a stop while paused shows W5 and passes the sam
   await done(w, s);
 });
 
-test('E7: two clients: a start from the second client while the take runs is refused (X6); its stop gets X16', async () => {
+test('E7, G32: two clients, each with its own copy: the second copy only reads, so its start and its stop get X16', async () => {
   const { w, s } = await recording();
   const b = await server(w, { elicit: accept, client: 'Cursor' });
-  assert.match((await b.call('obs_record_start', { token: 'other-token-1' })).text, /^OBS already records \(started \d\d:\d\d:\d\d, file .*\)\. I did not send a start\./);
-  assert.equal((await b.call('obs_record_stop')).text, TEXT.X16('Claude Code'));
+  assert.equal((await b.call('obs_record_start', { token: 'other-token-1' })).text, TEXT.X16);
+  assert.equal((await b.call('obs_record_stop')).text, TEXT.X16);
   assert.deepEqual(b.prompts, []);
   assert.deepEqual(recordRequests(w.fake), ['StartRecord']);
   await done(w, s, b);
@@ -222,7 +221,7 @@ test('E15: no answer in time on a 2025-era client: nothing is sent, and X5 goes 
 test('E16: a lost reply to our start: start_uncertain, then recording; the client repeats the start with the same token and nothing is sent again', async () => {
   const w = await world({ closeAfter: ['StartRecord'] });
   const s = await server(w, { elicit: accept });
-  assert.match((await s.call('obs_record_start', { token: 'lost-token-1' })).text, /OBS did not confirm it in 5 s/);
+  assert.equal((await s.call('obs_record_start', { token: 'lost-token-1' })).text, TEXT.X10c); // the connection closed after the send
   assert.ok(await until(() => take(w).rows.includes('T4')));
   assert.match((await s.call('obs_record_start', { token: 'lost-token-1' })).text, /^Recording for /);
   assert.deepEqual(recordRequests(w.fake), ['StartRecord']);
@@ -298,39 +297,6 @@ test('E23, F6: two parallel stop accepts send exactly one StopRecord', async () 
   assert.equal(recordRequests(w.fake).filter((r) => r === 'StopRecord').length, 1);
   assert.ok([a.text, b.text].some((t) => /^The recording stopped at /.test(t)), `${a.text}\n${b.text}`);
   await done(w, s);
-});
-
-test('E24: the starting client restarts: its new process takes the take over after 15 s (scaled) and can stop it; another client still gets X16', async () => {
-  const { w, s } = await recording();
-  await s.kill();
-  await wait(700);
-  const other = await server(w, { elicit: accept, client: 'Cursor' });
-  assert.equal((await other.call('obs_record_stop')).text.split('\n').at(-1), TEXT.X16('Claude Code'));
-  const again = await server(w, { elicit: accept });
-  assert.match((await again.call('obs_record_stop')).text, /^(OBS still records the take that I started .*\n)?The recording stopped at /);
-  assert.equal(new Journal(w.dir, 'x').owner(take(w).id).k, 2);
-  assert.deepEqual(recordRequests(w.fake), ['StartRecord', 'StopRecord']);
-  await done(w, other, again);
-});
-
-test('E25: two processes see one external take: one owner file; the other process gets X16', async () => {
-  const w = await world();
-  const a = await server(w, { elicit: accept, client: 'Claude Code' });
-  const b = await server(w, { elicit: accept, client: 'Cursor' });
-  await status(a);
-  await status(b);
-  w.fake.startInObs();
-  await wait(500);
-  assert.equal(readdirSync(w.dir).filter((f) => /\.owner-\d+$/.test(f)).length, 1);
-  assert.equal(readdirSync(w.dir).filter((f) => f.endsWith('.jsonl')).length, 1);
-  // The process that made the owner file first owns the take; the other gets X16 with no prompt.
-  const ownerName = new Journal(w.dir, 'x').owner(take(w).id).client;
-  const [owner, other] = ownerName === 'Claude Code' ? [a, b] : [b, a];
-  assert.equal((await other.call('obs_record_stop')).text.split('\n').at(-1), TEXT.X16(ownerName, true));
-  assert.deepEqual(other.prompts, []);
-  assert.match((await owner.call('obs_record_stop')).text.split('\n').at(-1), /^The recording stopped at /);
-  assert.deepEqual(recordRequests(w.fake), ['StopRecord']);
-  await done(w, a, b);
 });
 
 test('E26: the server restarts while a prompt is open: the late answer to the new process stops nothing (X17)', async () => {

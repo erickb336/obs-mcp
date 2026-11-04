@@ -1,16 +1,18 @@
-// The MCP server over stdio: four read tools, and the take tools of release 0.1. The process opens no listening socket.
-import { CLIENT_INFO_META_KEY, McpServer, type ServerContext } from '@modelcontextprotocol/server';
+// The MCP server over stdio: four read tools, and the take tools of release 0.1. The process opens no network socket;
+// it listens only on the local controller lock (G32, control.ts).
+import { McpServer, type ServerContext } from '@modelcontextprotocol/server';
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { brief, CATALOGUE, search } from './catalogue.js';
 import { asking, canAsk, Consents, type Answer } from './consent.js';
+import { Control } from './control.js';
 import { Journal } from './journal.js';
 import { connectionTarget, listenerCheck, Obs, ObsError, SETTINGS_FILE_FIX } from './obs.js';
-import { listeners, obsConfigDir, stateDir } from './platform.js';
+import { controlLock, listeners, obsConfigDir, stateDir } from './platform.js';
 import { deleteScreenshots, read } from './read.js';
 import { capped } from './redact.js';
-import { fileName, LIMITS, sameRecording, shown, stateLine, TEXT, type Limits, type Reading } from './take.js';
+import { fileName, LIMITS, newTake, sameRecording, shown, stateLine, TEXT, type Limits, type Reading } from './take.js';
 import { fsCode, Takes, type Check } from './takes.js';
 import { resolveInFolder, verifyFile, VerifyError, visible, type Expected } from './verify.js';
 
@@ -72,14 +74,14 @@ async function status(obs: Obs, target: () => ReturnType<typeof connectionTarget
   }
 }
 
-/** What one server process holds, outside the MCP server factory (E21): the OBS client, the journal and the takes. */
+/** What one server process holds, outside the MCP server factory (E21): the OBS client, the controller lock, the journal and the takes. */
 export function createApp(o: { target?: () => ReturnType<typeof connectionTarget>; limits?: Limits; dir?: string; env?: NodeJS.ProcessEnv } = {}) {
   const env = o.env ?? process.env;
   const target = o.target ?? (() => connectionTarget(obsConfigDir(env), env));
   const limits = o.limits ?? LIMITS;
   const obs = new Obs(target, limits);
-  const journal = new Journal(o.dir ?? stateDir(env), 'unknown client');
-  journal.prune(); // G28 at the server start (F-T7-7)
+  const journal = new Journal(o.dir ?? stateDir(env));
+  const lock = new Control(() => controlLock(target().url, env));
   const folder = () => recordingFolder(obs, env);
   // The closed line (F-T7-25): the length of the file, with a label so that it does not read as a clock time (F-T7-34),
   // and the expected sources with sound, or the count of checks. A failed check or a warning names its check and the
@@ -98,7 +100,7 @@ export function createApp(o: { target?: () => ReturnType<typeof connectionTarget
       : '';
     return { result: v.state, summary: `${length}${what}${why}` };
   };
-  const takes = new Takes(obs, journal, limits, check);
+  const takes = new Takes(obs, journal, limits, check, () => lock.held);
   const servers = new Set<McpServer>();
   takes.notify = (level, data) => {
     for (const s of servers) s.server.sendLoggingMessage({ level, logger: 'obs-mcp', data }).catch(() => {});
@@ -108,9 +110,29 @@ export function createApp(o: { target?: () => ReturnType<typeof connectionTarget
     if (v.kind !== 'stop') return;
     takes.notice(TEXT.X5(await takes.read().catch(() => undefined)));
   });
-  return { obs, journal, takes, consents, limits, target, folder, servers };
+  let becoming: Promise<boolean> | undefined;
+  /**
+   * G32: become the controller of this OBS, at the server start and at each tool call of a reader. A new controller
+   * prunes the journal (G28) and follows its open takes with the restart rows R1 to R8 (D4, F-T7-58).
+   */
+  const control = () =>
+    (becoming ??= (async () => {
+      if (lock.held) return true;
+      if (!(await lock.acquire())) return false;
+      journal.prune();
+      await takes.resume().catch((e) => console.error(`obs-mcp: ${(e as Error).message}`));
+      return true;
+    })().finally(() => (becoming = undefined)));
+  /** Ends the work of this process: nothing is sent to OBS, and the lock goes, so a reader can take it. */
+  const close = async () => {
+    takes.close();
+    lock.close();
+    await obs.close();
+  };
+  return { obs, journal, takes, consents, limits, target, folder, servers, lock, control, close };
 }
-type Ask = { kind: 'start'; token: string; test: boolean } | { kind: 'stop'; id: string; reading: Reading };
+/** again: a W6 prompt, the second one of a stop. A change after it gets X19 (F-T7-55). */
+type Ask = { kind: 'start'; token: string; test: boolean } | { kind: 'stop'; id: string; reading: Reading; again?: boolean };
 export type App = ReturnType<typeof createApp>;
 
 /** The MCP server factory of one app. serveStdio can call it more than once; each server shares the app. */
@@ -119,17 +141,13 @@ export function createServer(app: App) {
   const server = new McpServer({ name: 'obs-mcp', version: VERSION }, { capabilities: { tools: {}, logging: {} } });
   app.servers.add(server);
   server.server.onclose = () => app.servers.delete(server);
-  // The client name, for the owner files and X16: from initialize on the 2025 era, from each request on the 2026 era.
-  const client = (ctx?: ServerContext) => {
-    const env = ctx?.mcpReq.envelope as Record<string, { name?: string } | undefined> | undefined;
-    const name = env?.[CLIENT_INFO_META_KEY]?.name ?? server.server.getClientVersion()?.name;
-    if (name) app.journal.me.client = name.slice(0, 100);
-  };
-  server.server.oninitialized = () => {
-    client();
-    void takes.resume().catch(() => {});
-  };
   const say = (...lines: string[]) => ({ content: [{ type: 'text' as const, text: takes.reply(...lines) }] });
+  /** A read tool's reply, after the waiting notices (rule 6, F-T7-67). */
+  const reply = (o: unknown, isError = false) => {
+    const r = text(o, isError);
+    const top = takes.reply();
+    return top ? { ...r, content: [{ type: 'text' as const, text: top }, ...r.content] } : r;
+  };
   // An OBS error, or a file error of the journal with its code only: its message names the folder (F-T7-41).
   const failed = (e: unknown) => {
     if (e instanceof ObsError) return { ...say(`${e.message} ${e.next}`), isError: true };
@@ -144,7 +162,7 @@ export function createServer(app: App) {
       inputSchema: z.object({}),
       annotations: READ_ONLY,
     },
-    async () => text(await status(obs, target)),
+    async () => (await app.control(), reply(await status(obs, target))),
   );
   server.registerTool(
     'obs_find',
@@ -154,8 +172,9 @@ export function createServer(app: App) {
       annotations: READ_ONLY,
     },
     async ({ query, limit }) => {
+      await app.control();
       const found = search(query, limit ?? 5).map(brief);
-      return text(found.length ? found : { results: [], hint: FIND_HINT });
+      return reply(found.length ? found : { results: [], hint: FIND_HINT });
     },
   );
   server.registerTool(
@@ -169,9 +188,10 @@ export function createServer(app: App) {
       annotations: READ_ONLY,
     },
     async ({ request, params }) => {
+      await app.control();
       const r = await read(obs, request, params);
       // The note comes first, so that a reply cut at its size limit still holds it.
-      return r.ok ? text({ note: UNTRUSTED, request, data: r.data }) : text(r, true);
+      return r.ok ? reply({ note: UNTRUSTED, request, data: r.data }) : reply(r, true);
     },
   );
   server.registerTool(
@@ -196,12 +216,13 @@ export function createServer(app: App) {
       annotations: READ_ONLY,
     },
     async ({ path, expect }) => {
+      await app.control();
       // A name from the folder or from the input can hold an invisible character: the reply and each error show it escaped.
       try {
         const file = resolveInFolder(await app.folder(), path);
-        return text(visible(await verifyFile(file.path, file.name, expect)));
+        return reply(visible(await verifyFile(file.path, file.name, expect)));
       } catch (e) {
-        if (e instanceof VerifyError) return text({ problem: visible(e.message) }, true);
+        if (e instanceof VerifyError) return reply({ problem: visible(e.message) }, true);
         if (e instanceof Error) e.message = visible(e.message);
         throw e;
       }
@@ -215,32 +236,34 @@ export function createServer(app: App) {
       annotations: RECORDS,
     },
     async ({ token, test }, ctx) => {
-      client(ctx);
+      await app.control();
       try {
-        return await asking(ctx, (a) => start(token, test, ctx, a), () => say('No answer in 2 minutes. I did not start a recording. Ask me again to start it.')); // one prompt: no 'rounds'
+        return await asking(ctx, (a) => start(token, test, ctx, a), () => say('No answer in 2 minutes. I did not start a recording. Ask me again to start it.'));
       } catch (e) {
         return failed(e);
       }
     },
   );
   const start = async (token: string, test: boolean | undefined, ctx: ServerContext, a: Answer) => {
+    // An answer spends its consent at once, so that no early reply leaves a live consent behind (F-T7-60).
+    const v = a.action === 'none' ? undefined : a.action === 'accept' ? consents.use(a.id) : (consents.drop(a.id), undefined);
+    if (!app.lock.held) return say(TEXT.X16); // G32: a reader sends no start
     const same = takes.byToken(token);
     if (same) return say(line(same, await takes.read().catch(() => undefined))); // O3, with the time now (F-T7-19)
     // G26: refuse. The read opens the connection, so that the server sees your start in OBS (E9, T22). While OBS
     // records, the refusal says so, and not to click Start Recording (F-T7-48).
     if (!canAsk(server, ctx)) {
       const r = await takes.read().catch(() => undefined);
-      return say((r && (await takes.refusal(r))) || TEXT.X2);
+      return say((r && takes.refusal(r)) || TEXT.X2);
     }
     const r = await takes.read(); // rule 4: before the prompt, and again after the answer
     if (a.action === 'none') {
-      const refused = await takes.refusal(r);
+      const refused = takes.refusal(r);
       if (refused) return say(refused);
       const scene = await obs.call('GetCurrentProgramScene').then((x) => String(x.sceneName ?? x.currentProgramSceneName ?? '') || undefined, () => undefined);
       const dir = await app.folder().catch(() => undefined);
       return consents.ask(test ? TEXT.W2() : TEXT.W1(scene, takes.lastSources, dir), { kind: 'start', token, test: !!test });
     }
-    const v = a.action === 'accept' ? consents.use(a.id) : (consents.drop(a.id), undefined);
     if (a.action !== 'accept') return say('You declined. I did not start a recording.');
     if (!v || v.kind !== 'start' || v.token !== token) return say('That confirm expired after 2 minutes, so I did not start a recording. Ask me again to start it.');
     const out = await takes.start(token, v.test ? 'test' : 'normal', a.id!, r);
@@ -249,30 +272,31 @@ export function createServer(app: App) {
   server.registerTool(
     'obs_record_stop',
     {
-      description: 'Stop the OBS recording after the user confirms in a dialog. Only the client that started it, or first saw it, can stop it. Then the file check runs.',
+      description: 'Stop the OBS recording after the user confirms in a dialog. Then the file check runs.',
       inputSchema: z.object({}),
       annotations: RECORDS,
     },
     async (_args, ctx) => {
-      client(ctx);
+      await app.control();
       try {
         // No answer before the consent life ends: X5 comes as a notice, and it is the reply (F-T7-49).
-        return await asking(ctx, (a) => stop(ctx, a), (why) => (why === 'expired' ? say() : say(TEXT.X19)));
+        return await asking(ctx, (a) => stop(ctx, a), () => say());
       } catch (e) {
         return failed(e);
       }
     },
   );
   const stop = async (ctx: ServerContext, a: Answer) => {
+    // An answer spends its consent at once, so that no early reply leaves it to expire into a false X5 (F-T7-60).
+    const v = a.action === 'none' ? undefined : a.action === 'accept' ? consents.use(a.id) : (consents.drop(a.id), undefined);
+    if (!app.lock.held) return say(TEXT.X16); // G32: a reader sends no stop
     const r = await takes.read(); // read A before the prompt; read B after the answer (rule 4)
-    let cur = await takes.current(r);
-    if (!cur && r.active) {
+    let t = takes.current();
+    if (!t && r.active) {
       await takes.adopt(r);
-      cur = await takes.current(r);
+      t = takes.current();
     }
-    if (!cur) return say(line(undefined));
-    if (!cur.owner) return say(TEXT.X16(cur.client, cur.take.kind === 'external')); // O6, G29
-    const t = cur.take;
+    if (!t) return say(line(undefined));
     if (t.state === 'stopping' || t.state === 'stop_uncertain') return say(line(t, r)); // O7
     if (!canAsk(server, ctx)) return say(TEXT.X1); // G25
     const starting = t.state === 'starting' || t.state === 'start_uncertain';
@@ -282,20 +306,16 @@ export function createServer(app: App) {
       const ask = t.state === 'paused' || r.paused ? TEXT.W5(r) : t.kind === 'external' ? TEXT.W4(r) : TEXT.W3(r);
       return consents.ask(ask, { kind: 'stop', id: t.id, reading: r });
     }
-    if (a.action !== 'accept') {
-      consents.drop(a.id);
-      return say(TEXT.X4(r));
-    }
-    const v = consents.use(a.id);
+    if (a.action !== 'accept') return say(TEXT.X4(r));
     if (!v || v.kind !== 'stop') return say(TEXT.X17(r)); // F3, E15, E26
-    // F-T7-14: the take changed while you decided (a stop and a new start in OBS): ask about the recording now (W6).
-    if (v.id !== t.id) return r.active ? consents.ask(TEXT.W6(r), { kind: 'stop', id: t.id, reading: r }) : say(line(t, r));
-    const now = (await takes.current())?.take ?? t;
-    if (now.state === 'stopping' || now.state === 'stop_uncertain') return say(line(now, r)); // rule 5: another accept won
-    const same = starting ? r.active : sameRecording(v.reading, r, t.paths);
+    // From the read to the stop below nothing waits, so a parallel accept finds the open stop (rule 5, O7).
+    const same = v.id === t.id && (starting ? r.active : sameRecording(v.reading, r, t.paths));
     if (!same || r.conn !== obs.connection) {
-      if (!r.active) return say(line(now, r));
-      return consents.ask(TEXT.W6(r), { kind: 'stop', id: t.id, reading: r }); // W6, a second input round
+      if (!r.active) return say(line(t, r));
+      if (!r.path) return say(TEXT.X20); // no path: no stop can pass check 3 (F-T7-55)
+      if (v.again) return say(TEXT.X19);
+      // F-T7-14: the recording changed while you decided: one more prompt, about the recording now (W6).
+      return consents.ask(TEXT.W6(r), { kind: 'stop', id: t.id, reading: r, again: true });
     }
     const out = await takes.stop(t.id, r, a.id, v.reading);
     return say(out.text ?? line(out.take, r));
@@ -307,8 +327,8 @@ export function createServer(app: App) {
       inputSchema: z.object({}),
       annotations: READ_ONLY,
     },
-    async (_args, ctx) => {
-      client(ctx);
+    async () => {
+      await app.control();
       try {
         let problem: ObsError | undefined;
         const r = await takes.read().catch((e) => {
@@ -316,12 +336,14 @@ export function createServer(app: App) {
           problem = e;
           return undefined;
         });
-        let cur = await takes.current(r);
+        let cur = takes.current();
         if (!cur && r?.active) {
           await takes.adopt(r);
-          cur = await takes.current(r);
+          cur = takes.current();
         }
-        const t = cur?.take ?? takes.last ?? app.journal.latest();
+        // A reader follows no take: a recording that the controller has not seen yet shows as OBS shows it.
+        if (!cur && r?.active && !app.lock.held) cur = { ...newTake('obs', 'external', 'external'), paths: r.path ? [r.path] : [] };
+        const t = cur ?? takes.last ?? app.journal.latest();
         // With OBS unreachable, the reply says so: OBS can record with its WebSocket server off (F-T7-46).
         const unreachable = problem && !cur && `I cannot reach OBS, so I do not know if it records now. ${problem.message} ${problem.next}`;
         if (unreachable) return say(unreachable, ...(t ? [`The last take: ${line(t)}`] : []));
@@ -350,14 +372,13 @@ async function recordingFolder(obs: Obs, env: NodeJS.ProcessEnv): Promise<string
 export function startServer() {
   const app = createApp();
   const handle = serveStdio(() => createServer(app), { onerror: (e) => console.error(`obs-mcp: ${e.message}`) });
-  // D4: with an open take in the journal, connect at once, with reads only.
-  if (app.journal.openTakes().length) app.obs.keepConnected(true);
+  // D4, G32: become the controller at once; with an open take in the journal, it connects with reads only (F-T7-58).
+  void app.control();
   // O2: exit when the client closes input, so that an open OBS socket does not hold the process. Nothing is sent to
   // OBS: a recording goes on, and the journal keeps the take for the next process.
   process.stdin.on('end', async () => {
-    if (app.takes.hasOpen) app.takes.notify('warning', TEXT.X14);
-    app.takes.close();
-    await app.obs.close();
+    if (app.takes.hasOpen) app.takes.notify('warning', TEXT.X14(app.takes.recording));
+    await app.close();
     await handle.close();
     process.exit(0);
   });

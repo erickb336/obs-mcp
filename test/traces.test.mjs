@@ -450,6 +450,11 @@ test('R210: the PAUSED event has outputActive false, and the record status stays
 
 // Unit 1 of T7: the record model of the fake OBS. SIMULATED.
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+/** Waits until test() holds, up to ms. */
+const until = async (test, ms = 3000) => {
+  for (const end = Date.now() + ms; Date.now() < end; await wait(10)) if (await test()) return true;
+  return false;
+};
 const timed = (c) => {
   const t = performance.now();
   const seen = [];
@@ -463,7 +468,7 @@ test('T7 unit 1: the fake OBS replays real-record.json exactly: codes, event ord
   const c = await client(fake);
   const start = timed(c);
   assert.deepEqual(await c.call('StartRecord'), { code: 100, d: {} });
-  await wait(400);
+  assert.ok(await until(() => start.length === 2)); // F-T7-64: wait for the events, not for a fixed time
   const path = fake.path();
   assert.deepEqual(start.map((e) => [e.state, e.path]), [['STARTING', null], ['STARTED', path]]);
   // Each event comes at its delay in the trace (51 and 272 ms), and before the next one.
@@ -472,7 +477,7 @@ test('T7 unit 1: the fake OBS replays real-record.json exactly: codes, event ord
   c.obs.removeAllListeners('RecordStateChanged');
   const stop = timed(c);
   assert.deepEqual(await c.call('StopRecord'), { code: 100, d: { outputPath: path } });
-  await wait(350);
+  assert.ok(await until(() => stop.length === 2));
   assert.deepEqual(stop.map((e) => [e.state, e.path]), [['STOPPING', null], ['STOPPED', path]]);
   real[2].events.forEach((ev, i) => assert.ok(stop[i].ms >= ev.delayMs - 2 && stop[i].ms < ev.delayMs + 100, `${stop[i].state} at ${Math.round(stop[i].ms)} ms`));
   assert.equal((await c.call('StopRecord')).code, 501);
@@ -483,57 +488,66 @@ test('T7 unit 1: the fake OBS replays real-record.json exactly: codes, event ord
 
 test('T7 unit 1, F-T7-1: PauseRecord and ResumeRecord give 501 when nothing records, 502 when already paused and 503 when not paused', async () => {
   const fake = await startFakeObs();
-  const c = await client(fake);
-  const codes = { idle: [(await c.call('PauseRecord')).code, (await c.call('ResumeRecord')).code] };
-  fake.startInObs();
-  await wait(300);
-  codes.recording = [(await c.call('ResumeRecord')).code, (await c.call('PauseRecord')).code];
-  await wait(20);
-  codes.paused = [(await c.call('PauseRecord')).code, (await c.call('ResumeRecord')).code];
-  await wait(20);
-  codes.resumed = [(await c.call('ResumeRecord')).code];
-  assert.deepEqual(codes, { idle: [501, 501], recording: [503, 100], paused: [502, 100], resumed: [503] });
-  assert.deepEqual(c.events, ['OBS_WEBSOCKET_OUTPUT_STARTING', 'OBS_WEBSOCKET_OUTPUT_STARTED', 'OBS_WEBSOCKET_OUTPUT_PAUSED', 'OBS_WEBSOCKET_OUTPUT_RESUMED']);
-  await c.obs.disconnect();
-  await fake.close();
+  try {
+    const c = await client(fake);
+    // F-T7-64: each step waits for its event, not for a fixed time that a slow runner can miss.
+    const seen = (state) => until(() => c.events.includes(`OBS_WEBSOCKET_OUTPUT_${state}`));
+    const codes = { idle: [(await c.call('PauseRecord')).code, (await c.call('ResumeRecord')).code] };
+    fake.startInObs();
+    assert.ok(await seen('STARTED'));
+    codes.recording = [(await c.call('ResumeRecord')).code, (await c.call('PauseRecord')).code];
+    assert.ok(await seen('PAUSED'));
+    codes.paused = [(await c.call('PauseRecord')).code, (await c.call('ResumeRecord')).code];
+    assert.ok(await seen('RESUMED'));
+    codes.resumed = [(await c.call('ResumeRecord')).code];
+    assert.deepEqual(codes, { idle: [501, 501], recording: [503, 100], paused: [502, 100], resumed: [503] });
+    assert.deepEqual(c.events, ['OBS_WEBSOCKET_OUTPUT_STARTING', 'OBS_WEBSOCKET_OUTPUT_STARTED', 'OBS_WEBSOCKET_OUTPUT_PAUSED', 'OBS_WEBSOCKET_OUTPUT_RESUMED']);
+    await c.obs.disconnect();
+  } finally {
+    await fake.close();
+  }
 });
 
 test('T7 unit 1: the record status runs on the clock, stops during a pause, and counts bytes across takes until OBS restarts', async () => {
   const fake = await startFakeObs({ recording: true, elapsedMs: 5000, lagMs: 1000 });
-  const c = await client(fake);
-  const status = async () => (await c.call('GetRecordStatus')).d;
-  const a = await status();
-  assert.ok(a.outputActive && a.outputDuration >= 4000 && a.outputDuration < 4200, JSON.stringify(a));
-  assert.equal(a.outputTimecode, new Date(a.outputDuration).toISOString().slice(11, 23));
-  assert.equal(a.outputBytes, a.outputDuration * 1000);
-  assert.equal(fake.pauseInObs(), true);
-  await wait(40); // PAUSED and its effect land at 21 ms (R210)
-  const p1 = await status();
-  await wait(150);
-  const p2 = await status();
-  assert.deepEqual([p1.outputPaused, p2.outputPaused, p2.outputDuration - p1.outputDuration, p2.outputBytes - p1.outputBytes], [true, true, 0, 0]);
-  assert.equal(fake.pauseInObs(), false, 'OBS refuses a second pause');
-  fake.resumeInObs();
-  await wait(100);
-  const r = await status();
-  assert.ok(r.outputDuration - p2.outputDuration >= 60 && !r.outputPaused, JSON.stringify(r));
-  assert.equal(fake.stopInObs(), true);
-  await wait(300);
-  const idle = await status();
-  assert.deepEqual([idle.outputActive, idle.outputPaused, idle.outputDuration], [false, false, 0]);
-  assert.ok(idle.outputBytes >= r.outputBytes, 'the byte count stays after the stop');
-  fake.startInObs();
-  await wait(300);
-  const next = await status();
-  // The lag of 1 s holds the new take at 0 ms, so its count is where the last take ended, not 0.
-  assert.ok(next.outputActive && idle.outputBytes > 0 && next.outputBytes === idle.outputBytes, 'a new take counts on from the last one');
-  assert.match(fake.path(), / 2\.mov$/, 'a new take gets a new file');
-  fake.restartObs();
-  const d = await client(fake);
-  assert.deepEqual((await d.call('GetRecordStatus')).d, { outputActive: false, outputPaused: false, outputTimecode: '00:00:00.000', outputDuration: 0, outputBytes: 0 });
-  assert.deepEqual(fake.stops.map((s) => s.cause), ['button']);
-  await d.obs.disconnect();
-  await fake.close();
+  try {
+    const c = await client(fake);
+    const status = async () => (await c.call('GetRecordStatus')).d;
+    const a = await status();
+    assert.ok(a.outputActive && a.outputDuration >= 4000 && a.outputDuration < 4200, JSON.stringify(a));
+    assert.equal(a.outputTimecode, new Date(a.outputDuration).toISOString().slice(11, 23));
+    assert.equal(a.outputBytes, a.outputDuration * 1000);
+    assert.equal(fake.pauseInObs(), true);
+    assert.ok(await until(async () => (await status()).outputPaused)); // PAUSED and its effect land at 21 ms (R210)
+    const p1 = await status();
+    await wait(150);
+    const p2 = await status();
+    assert.deepEqual([p1.outputPaused, p2.outputPaused, p2.outputDuration - p1.outputDuration, p2.outputBytes - p1.outputBytes], [true, true, 0, 0]);
+    assert.equal(fake.pauseInObs(), false, 'OBS refuses a second pause');
+    fake.resumeInObs();
+    assert.ok(await until(async () => !(await status()).outputPaused));
+    await wait(100);
+    const r = await status();
+    assert.ok(r.outputDuration - p2.outputDuration >= 60 && !r.outputPaused, JSON.stringify(r));
+    assert.equal(fake.stopInObs(), true);
+    assert.ok(await until(async () => !(await status()).outputActive));
+    const idle = await status();
+    assert.deepEqual([idle.outputActive, idle.outputPaused, idle.outputDuration], [false, false, 0]);
+    assert.ok(idle.outputBytes >= r.outputBytes, 'the byte count stays after the stop');
+    fake.startInObs();
+    assert.ok(await until(async () => (await status()).outputActive));
+    const next = await status();
+    // The lag of 1 s holds the new take at 0 ms, so its count is where the last take ended, not 0.
+    assert.ok(next.outputActive && idle.outputBytes > 0 && next.outputBytes === idle.outputBytes, 'a new take counts on from the last one');
+    assert.match(fake.path(), / 2\.mov$/, 'a new take gets a new file');
+    fake.restartObs();
+    const d = await client(fake);
+    assert.deepEqual((await d.call('GetRecordStatus')).d, { outputActive: false, outputPaused: false, outputTimecode: '00:00:00.000', outputDuration: 0, outputBytes: 0 });
+    assert.deepEqual(fake.stops.map((s) => s.cause), ['button']);
+    await d.obs.disconnect();
+  } finally {
+    await fake.close();
+  }
 });
 
 test('T7 unit 1: closeAfter runs the request and closes before the reply; dropEvents keeps an event back', async () => {
@@ -542,13 +556,14 @@ test('T7 unit 1: closeAfter runs the request and closes before the reply; dropEv
   const closed = new Promise((r) => c.obs.once('ConnectionClosed', r));
   c.obs.call('StartRecord').catch(() => {});
   assert.equal((await closed).code, 1006);
-  await wait(400);
+  await wait(400); // the dropped STARTED: no event says when the start lands (real trace: 272 ms)
   const d = await client(fake);
   assert.equal((await d.call('GetRecordStatus')).d.outputActive, true, 'OBS started the take');
   fake.stopInObs();
-  await wait(300);
+  assert.ok(await until(() => d.events.includes('OBS_WEBSOCKET_OUTPUT_STOPPED')));
   fake.startInObs();
-  await wait(400);
+  assert.ok(await until(() => d.events.includes('OBS_WEBSOCKET_OUTPUT_STARTING')));
+  await wait(400); // STARTED is kept back: nothing more comes
   assert.deepEqual(d.events, ['OBS_WEBSOCKET_OUTPUT_STOPPING', 'OBS_WEBSOCKET_OUTPUT_STOPPED', 'OBS_WEBSOCKET_OUTPUT_STARTING']);
   assert.deepEqual(fake.log, ['StartRecord', 'GetRecordStatus']);
   await d.obs.disconnect();

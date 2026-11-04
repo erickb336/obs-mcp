@@ -16,7 +16,7 @@ function app(lifeMs) {
   const consents = new Consents(lifeMs, (v) => expired.push(v));
   const factory = () => {
     const server = new McpServer({ name: 't', version: '0' }, { capabilities: { tools: {} } });
-    const expiredReply = (why) => ({ content: [{ type: 'text', text: why === 'expired' ? TEXT.X5(R) : 'rounds' }] });
+    const expiredReply = () => ({ content: [{ type: 'text', text: TEXT.X5(R) }] });
     server.registerTool('stop', { inputSchema: z.object({}) }, async (_a, ctx) => asking(ctx, async (a) => {
       if (!canAsk(server, ctx)) return { content: [{ type: 'text', text: TEXT.X1 }] };
       if (a.action === 'none') return consents.ask(TEXT.W3(R), R);

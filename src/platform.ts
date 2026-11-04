@@ -1,9 +1,10 @@
 // The platform layer: every OS-specific path and probe lives here, and nowhere else.
 // Paths come from the OS conventions that OBS itself uses, or from discovery, never from one machine.
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, readdirSync, readlinkSync, statSync, readFileSync } from 'node:fs';
 import type { Listener } from './obs.js';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, join, delimiter, isAbsolute, win32 } from 'node:path';
 
 const OS = process.platform;
@@ -39,6 +40,19 @@ export function stateDir(env: NodeJS.ProcessEnv = process.env, os: string = OS):
   if (os === 'darwin') return join(home, 'Library', 'Application Support', 'obs-mcp', 'takes');
   if (os === 'win32') return join(env.LOCALAPPDATA ?? join(home, 'AppData', 'Local'), 'obs-mcp', 'takes');
   return join(env.XDG_STATE_HOME ?? join(home, '.local', 'state'), 'obs-mcp', 'takes');
+}
+
+/**
+ * The name of the controller lock of one OBS endpoint (G32), for this user: a Windows named pipe, or a Unix domain
+ * socket in the user's runtime or temp folder. A socket path must stay under about 100 bytes, so a longer folder
+ * gives way to /tmp. The user id is in the hash, so two users never share a name there.
+ */
+export function controlLock(endpoint: string, env: NodeJS.ProcessEnv = process.env, os: string = OS): string {
+  const user = os === 'win32' ? (env.USERNAME ?? '') : String(process.getuid?.() ?? '');
+  const name = `obs-mcp-${createHash('sha256').update(`${user}\n${endpoint}`).digest('hex').slice(0, 16)}`;
+  if (os === 'win32') return `\\\\.\\pipe\\${name}`;
+  const path = join(env.XDG_RUNTIME_DIR || tmpdir(), `${name}.sock`);
+  return Buffer.byteLength(path) <= 90 ? path : join('/tmp', `${name}.sock`);
 }
 
 const isFile = (p: string) => {

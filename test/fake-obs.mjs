@@ -53,7 +53,8 @@ const sample = (type) => (type.startsWith('Array') ? [] : SAMPLE[type]);
  * closeAfter (request names: OBS runs the request, then the connection closes before the reply),
  * dropEvents (output states, such as 'OBS_WEBSOCKET_OUTPUT_STARTED', whose events never go out),
  * fileOutput (the kind of the record output: 'mov_output' by default, as R210 found on OBS 33.0.1 in Simple output mode
- * with the hybrid MOV format; 'ffmpeg_muxer' gives the Advanced mode output adv_file_output of T4; any other kind too).
+ * with the hybrid MOV format; 'ffmpeg_muxer' gives the Advanced mode output adv_file_output of T4; any other kind too),
+ * fileName (one file name for every take, as OBS gives with a file name format that has no time in it).
  * The settings of the record output hold only path and muxer_settings, as on real OBS. path keeps the file of the last
  * take after the stop, and an old file before the first take (R210): only an active output has the current file.
  * The record status runs on the clock: outputDuration stops during a pause, and outputBytes (1,000 bytes for each ms recorded) is
@@ -80,7 +81,7 @@ export async function startFakeObs(options = {}) {
     const p = (n) => String(n).padStart(2, '0');
     rec.takes++;
     // OBS names a file by its start time; the take number keeps two takes in one second apart.
-    rec.path = join(recordDir(), `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())} ${rec.takes}.mov`);
+    rec.path = o.fileName ? join(recordDir(), o.fileName) : join(recordDir(), `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())} ${rec.takes}.mov`);
     return rec.path;
   };
   if (state.recording) newPath();

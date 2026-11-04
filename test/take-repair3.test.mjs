@@ -22,7 +22,7 @@ const done = async (w, ...servers) => {
 };
 const takeFile = (w) => join(w.dir, readdirSync(w.dir).find((f) => f.endsWith('.jsonl')));
 const takeOf = (w) => {
-  const j = new Journal(w.dir, 'x');
+  const j = new Journal(w.dir);
   const id = basename(takeFile(w)).slice(5, -6);
   return j.load(id).take;
 };
@@ -77,7 +77,6 @@ test('R210: on a server restart, a mov_output take stays attached (R3), and a st
   const a = await server(w, { elicit: accept });
   await a.call('obs_record_start', { token: 'restart-mov-1' });
   await a.kill();
-  await wait(FAST.staleMs + 100);
   const b = await server(w, { elicit: accept });
   const text = await status(b);
   assert.match(text, /^OBS still records the take that I started/);
@@ -140,16 +139,15 @@ test('F-T7-41: a journal error on a stop gives its code only, no folder, and sen
   await done(w, s);
 });
 
-test('F-T7-41: a journal error at a takeover gives its code only, no folder', { skip: !UNIX }, async () => {
+test('F-T7-41: a journal error at a restart row gives its code only, no folder', { skip: !UNIX }, async () => {
   const w = await world();
   const a = await server(w, { elicit: accept });
   await a.call('obs_record_start', { token: 'readonly-resume-1' });
   await a.kill();
-  await wait(FAST.staleMs + 100);
-  chmodSync(w.dir, 0o500);
+  chmodSync(takeFile(w), 0o400);
   const b = await server(w, { elicit: accept });
   const r = await b.call('obs_take_status');
-  chmodSync(w.dir, 0o700);
+  chmodSync(takeFile(w), 0o600);
   assert.match(r.text, /I could not write the take record on this computer \(EACCES\)\./);
   assert.equal(r.text.includes(w.dir) || logs(b).includes(w.dir), false);
   await done(w, b);
@@ -157,21 +155,21 @@ test('F-T7-41: a journal error at a takeover gives its code only, no folder', { 
 
 // ---- F-T7-39: the journal changes only its own files
 
-test('F-T7-39: in a folder that holds other files, the journal keeps their mode and removes only its own old temp files', { skip: !UNIX }, () => {
+test('F-T7-39: in a folder that holds other files, the journal keeps their mode and removes none of them', { skip: !UNIX }, () => {
   const dir = tmp('shared');
   chmodSync(dir, 0o755);
   const old = new Date(Date.now() - 40 * 864e5);
-  for (const f of ['draft-notes.tmp', 'take-ab12.beat.123.tmp', 'start-1.claim.0a1b2c3d.tmp']) {
+  for (const f of ['draft-notes.tmp', 'notes.txt']) {
     writeFileSync(join(dir, f), 'x');
     utimesSync(join(dir, f), old, old);
   }
-  const j = new Journal(dir, 'Claude Code');
+  const j = new Journal(dir);
   j.prune();
-  assert.equal(j.claim('t1', () => false), true);
+  j.append('t1', { t: 'open', v: 1, id: 't1', kind: 'normal', pid: 1 });
   assert.equal(statSync(dir).mode & 0o777, 0o755, 'the mode of a folder that was there stays');
-  assert.deepEqual(readdirSync(dir).filter((f) => f.endsWith('.tmp')), ['draft-notes.tmp']);
+  assert.deepEqual(readdirSync(dir).sort(), ['draft-notes.tmp', 'notes.txt', 'take-t1.jsonl']);
   const fresh = join(tmp('fresh'), 'takes');
-  new Journal(fresh, 'Claude Code').claim('t1', () => false);
+  new Journal(fresh).append('t1', { t: 'open', v: 1, id: 't1', kind: 'normal', pid: 1 });
   assert.equal(statSync(fresh).mode & 0o777, 0o700, 'a folder that the journal makes is for this user only');
 });
 
@@ -209,12 +207,10 @@ test('F-T7-40, F-T7-47: a path over 4,096 bytes counts as no path, and no reply 
 test('F-T7-42: a damaged state line is skipped: the last good line gives the take, and status and start work', async () => {
   const w = await world();
   mkdirSync(w.dir, { recursive: true });
-  const j = new Journal(w.dir, 'Claude Code');
-  j.own('t1', 1);
-  j.append('t1', { t: 'open', v: 1, id: 't1', kind: 'normal', client: 'Claude Code', pid: 1 });
+  const j = new Journal(w.dir);
+  j.append('t1', { t: 'open', v: 1, id: 't1', kind: 'normal', pid: 1 });
   j.state('t1', { ...newTake('t1', 'normal', 'closed'), result: 'not_checked', row: 'T24' });
   appendFileSync(join(w.dir, 'take-t1.jsonl'), `${JSON.stringify({ t: 'state', state: 'stop_held', marks: 5, paths: 7, k: 1 })}\n`);
-  j.beat('t1');
   assert.deepEqual([j.load('t1').take.state, j.openTakes()], ['closed', []]);
   const s = await server(w, { elicit: accept });
   const r = await s.call('obs_take_status');
@@ -224,15 +220,15 @@ test('F-T7-42: a damaged state line is skipped: the last good line gives the tak
   await done(w, s);
 });
 
-// ---- F-T7-43, F-T7-45: a client restart
+// ---- F-T7-43, F-T7-45, F-T7-58: a client restart
 
-test('F-T7-43: a client that restarts before the old beat is stale takes the take over with no tool call', async () => {
+test('F-T7-43, F-T7-58: a client that restarts follows the take at once, with no tool call', async () => {
   const w = await world();
   const a = await server(w, { elicit: accept });
   await a.call('obs_record_start', { token: 'quick-restart-1' });
   await a.kill();
-  const b = await server(w, { elicit: accept }); // at once: the old beat is fresh
-  assert.ok(await until(() => /OBS still records the take that I started/.test(logs(b)), FAST.staleMs * 4), 'the takeover ran with no tool call');
+  const b = await server(w, { elicit: accept });
+  assert.ok(await until(() => takeOf(w).row === 'R3', 2000), 'R3 ran with no tool call');
   w.fake.stopInObs();
   assert.ok(await until(() => /was stopped in OBS|nobody asked/.test(logs(b)) || takeOf(w).state !== 'recording', 3000));
   assert.notEqual(takeOf(w).state, 'recording', 'the new process watches the take');
@@ -246,10 +242,9 @@ test('F-T7-45: the restart notice of a paused take says that it is paused, not t
   w.fake.pauseInObs();
   await wait(100);
   await a.kill();
-  await wait(FAST.staleMs + 100);
   const b = await server(w, { elicit: accept });
   const text = await status(b);
-  assert.match(text, /^The take that I started is still paused in OBS \(00:00:0\d, file `[^`]+\.mov`\)\. The watch had a gap from /);
+  assert.match(text, /^The take that I started is still paused in OBS \(00:00:0\d, file `[^`]+\.mov`\)\. I watch it again from /);
   assert.doesNotMatch(text, /still records/);
   await done(w, b);
 });

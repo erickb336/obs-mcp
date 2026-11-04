@@ -1,9 +1,8 @@
 // The take journal (T7 design, section 6): one append-only JSONL file per take, synced to disk before each recording
-// request; a beat file; numbered owner files and start claims, each made by one exclusive create. It stays on this
+// request. It keeps the state of a take across restarts; only the controlling process writes it (G32). It stays on this
 // machine. The writer takes typed records with an allow-list of fields, so no free object, request parameter or OBS
 // settings reply can reach the disk.
-import { randomBytes } from 'node:crypto';
-import { chmodSync, closeSync, fsyncSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
+import { chmodSync, closeSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import { isOpen, newTake, STATES, type Take } from './take.js';
 
@@ -11,13 +10,10 @@ export const RETENTION = { days: 30, takes: 100 }; // G28
 // A line holds at most 2 paths of up to 4,096 bytes (the limit of the driver), each up to 6 times longer in JSON (F-T7-40).
 const MAX_LINE = 64 * 1024;
 const MAX_LINES = 1000;
-const CLAIM = /^start-(\d+)\.claim$/;
-/** The temp files of this journal: of create() (a name, a token and .tmp) and of beat(). No other .tmp file is ours (F-T7-39). */
-const TEMP = /^(take-[\w-]+\.(owner-\d+\.[0-9a-f]{8}|beat\.\d+)|start-\d+\.claim\.[0-9a-f]{8})\.tmp$/;
 
 /** The fields that each record type may hold. Every value must be a string, a number, a boolean, or a list of those. */
 const FIELDS: Record<string, string[]> = {
-  open: ['v', 'id', 'kind', 'client', 'pid', 'obs', 'ws'],
+  open: ['v', 'id', 'kind', 'pid', 'obs', 'ws'],
   expect: ['sources'],
   intent: ['what', 'at', 'token', 'consent', 'duration', 'path', 'bytes'],
   sent: ['request', 'seq', 'conn', 'at'],
@@ -29,13 +25,20 @@ const FIELDS: Record<string, string[]> = {
 const SOURCE_FIELDS = ['uuid', 'name', 'kind', 'track', 'backup'];
 export type Source = { uuid?: string; name: string; kind: string; track: number; backup?: number };
 export type Rec = { t: keyof typeof FIELDS; [k: string]: unknown };
-/** The open record of a take: who owns it, and what kind of take it is. */
-export type Meta = { id: string; kind: string; client: string; pid: number };
 
 const scalar = (v: unknown) => ['string', 'number', 'boolean'].includes(typeof v);
+/** Writes every byte, or throws: one writeSync call can write fewer bytes than it gets (F-T7-61). */
+function writeAll(fd: number, buf: Buffer) {
+  for (let done = 0; done < buf.length; ) {
+    const n = writeSync(fd, buf, done);
+    if (n <= 0) throw Object.assign(new Error('journal: the write made no progress'), { code: 'EIO' });
+    done += n;
+  }
+}
+
 /** Throws on a field that is not on the allow-list, or on a free object. */
 function checked(rec: Rec): Rec {
-  const allowed = FIELDS[rec.t];
+  const allowed = Object.hasOwn(FIELDS, rec.t) ? FIELDS[rec.t] : undefined;
   if (!allowed) throw new Error(`journal: unknown record ${rec.t}`);
   for (const [k, v] of Object.entries(rec)) {
     if (k === 't' || k === 'k' || v === undefined) continue;
@@ -49,19 +52,11 @@ function checked(rec: Rec): Rec {
   return rec;
 }
 
-/** Another process took over the take: this one must stop writing and only read (the fence of section 6). */
-export class FencedError extends Error {}
-
 export class Journal {
-  /** This process: its id, the client name it serves, and a random token in its owner files. */
-  readonly me: { pid: number; client: string; token: string };
   private lines = new Map<string, number>();
   private dropped = new Map<string, number>();
-  private owned = new Map<string, number>();
 
-  constructor(readonly dir: string, client: string) {
-    this.me = { pid: process.pid, client, token: randomBytes(16).toString('hex') };
-  }
+  constructor(readonly dir: string) {}
 
   /** Makes the folder, only for this process's user. A folder that is there already keeps its mode: it can hold other files (F-T7-39). */
   private ensure() {
@@ -71,56 +66,6 @@ export class Journal {
 
   private file = (id: string, ext: string) => join(this.dir, `take-${id}.${ext}`);
 
-  /**
-   * Creates a file only when it does not exist: of two processes, exactly one wins. The body goes to a temp file
-   * first, then a hard link gives it its name (the link fails if the name exists), so a reader never sees it empty.
-   */
-  private create(path: string, body: string): boolean {
-    this.ensure();
-    const tmp = `${path}.${this.me.token.slice(0, 8)}.tmp`;
-    const fd = openSync(tmp, 'w', 0o600);
-    try {
-      writeSync(fd, body);
-      fsyncSync(fd);
-    } finally {
-      closeSync(fd);
-    }
-    try {
-      linkSync(tmp, path);
-      return true;
-    } catch (e) {
-      if ((e as { code?: string }).code === 'EEXIST') return false;
-      throw e;
-    } finally {
-      rmSync(tmp, { force: true });
-    }
-  }
-
-  /**
-   * The start claim for take id (section 6, F-T7-13): claim n + 1 after the highest claim n. busy gets the take id and
-   * the age of claim n; while claim n is busy, no process can claim. Of two processes that both find claim n free,
-   * the exclusive create lets one win. So two starts at the same moment send one StartRecord.
-   */
-  claim(id: string, busy: (prev: string | undefined, ageMs: number) => boolean): boolean {
-    const n = this.highest(CLAIM);
-    if (n) {
-      let prev: { id?: string; at?: number } = {};
-      try {
-        prev = JSON.parse(readFileSync(join(this.dir, `start-${n}.claim`), 'utf8'));
-      } catch {
-        // A claim from before this format, or a damaged one: it holds no take.
-      }
-      if (busy(typeof prev.id === 'string' ? prev.id : undefined, Date.now() - (Number(prev.at) || 0))) return false;
-    }
-    return this.create(join(this.dir, `start-${n + 1}.claim`), JSON.stringify({ pid: this.me.pid, id, at: Date.now() }));
-  }
-
-  private highest(re: RegExp): number {
-    let max = 0;
-    for (const f of this.list()) max = Math.max(max, Number(re.exec(f)?.[1] ?? 0));
-    return max;
-  }
-
   private list(): string[] {
     try {
       return readdirSync(this.dir);
@@ -129,67 +74,11 @@ export class Journal {
     }
   }
 
-  /** The owner of a take: the owner file with the highest number. */
-  owner(id: string): { k: number; pid: number; client: string; token: string } | undefined {
-    const esc = id.replace(/[^\w-]/g, '');
-    const k = this.highest(new RegExp(`^take-${esc}\\.owner-(\\d+)$`));
-    if (!k) return undefined;
-    try {
-      return { k, ...JSON.parse(readFileSync(this.file(id, `owner-${k}`), 'utf8')) };
-    } catch {
-      return undefined;
-    }
-  }
-
-  /** Creates owner file k for this process. Exactly one process can create each k. */
-  own(id: string, k: number): boolean {
-    const won = this.create(this.file(id, `owner-${k}`), JSON.stringify(this.me));
-    if (won) this.owned.set(id, k);
-    return won;
-  }
-
-  isOwner(id: string): boolean {
-    const o = this.owner(id);
-    return !!o && o.token === this.me.token;
-  }
-
-  /** The age of the owner's last beat, in ms. With no beat file, the age of the owner file. */
-  beatAge(id: string, now = Date.now()): number {
-    try {
-      return now - JSON.parse(readFileSync(this.file(id, 'beat'), 'utf8')).at;
-    } catch {
-      const o = this.owner(id);
-      return o ? now - statSync(this.file(id, `owner-${o.k}`)).mtimeMs : Infinity;
-    }
-  }
-
-  /** Q1 (E24): a process of the same client takes over a take whose owner has not beaten in staleMs. */
-  takeOver(id: string, staleMs: number): boolean {
-    const o = this.owner(id);
-    if (!o || o.token === this.me.token) return !!o;
-    if (o.client !== this.me.client || this.beatAge(id) <= staleMs) return false;
-    return this.own(id, o.k + 1);
-  }
-
-  /** The heartbeat (P13): a temp file, then a rename, so it never grows and never tears. */
-  beat(id: string, at = Date.now()) {
-    this.fence(id);
-    const tmp = this.file(id, `beat.${this.me.pid}.tmp`);
-    writeFileSync(tmp, JSON.stringify({ at }), { mode: 0o600 });
-    renameSync(tmp, this.file(id, 'beat'));
-  }
-
-  private fence(id: string) {
-    const k = this.owned.get(id);
-    if (k === undefined || this.owner(id)?.k !== k) throw new FencedError(`Another obs-mcp process took over take ${id}.`);
-  }
-
   /**
-   * Appends one record and syncs it to disk. Only the owner writes; a write after a takeover throws FencedError.
-   * Past the line cap, event, reply and sent records are counted, not written (section 6, size).
+   * Appends one record and syncs it to disk. Only the controlling process writes (G32). Past the line cap, event and
+   * reply records are counted, not written (section 6, size).
    */
   append(id: string, rec: Rec) {
-    this.fence(id);
     const known = this.lines.get(id);
     const n = known ?? this.read(id).length;
     // A crash during a write can leave a last line with no end: the new line starts on a line of its own.
@@ -198,11 +87,12 @@ export class Journal {
       this.dropped.set(id, (this.dropped.get(id) ?? 0) + 1);
       return;
     }
-    const line = (torn ? '\n' : '') + JSON.stringify({ ...checked(rec), k: this.owned.get(id) }) + '\n';
+    const line = (torn ? '\n' : '') + JSON.stringify(checked(rec)) + '\n';
     if (Buffer.byteLength(line) > MAX_LINE) throw Object.assign(new Error(`journal: a ${rec.t} line is longer than ${MAX_LINE} bytes`), { code: 'E2BIG' });
+    this.ensure();
     const fd = openSync(this.file(id, 'jsonl'), 'a', 0o600);
     try {
-      writeSync(fd, line);
+      writeAll(fd, Buffer.from(line));
       fsyncSync(fd);
     } finally {
       closeSync(fd);
@@ -244,16 +134,25 @@ export class Journal {
     });
   }
 
-  /** The take and its open record, folded from the file: the last state line gives the state. */
-  load(id: string): { take: Take; meta: Meta; sources: Source[]; recs: Rec[] } | undefined {
+  /**
+   * The take, folded from the file: the last good state line gives the state. Only the fields of a state line are
+   * read, so a hand-edited line with another key (id, __proto__) changes nothing (F-T7-54).
+   */
+  load(id: string): { take: Take; sources: Source[]; recs: Rec[] } | undefined {
     const recs = this.read(id);
     const open = recs.find((r) => r.t === 'open');
     if (!open) return undefined;
-    const meta = { id, kind: String(open.kind), client: String(open.client), pid: Number(open.pid) };
+    const take: Take = newTake(id, KINDS.includes(open.kind as string) ? (open.kind as Take['kind']) : 'normal');
     const last = recs.findLast(validState);
-    const take: Take = { ...newTake(id, meta.kind as Take['kind']), ...(last ? strip(last) : {}) };
-    const sources = (recs.findLast((r) => r.t === 'expect')?.sources as Source[] | undefined) ?? [];
-    return { take, meta, sources, recs };
+    for (const k of TAKE_FIELDS) if (last && Object.hasOwn(last, k) && last[k] !== undefined) (take as Record<string, unknown>)[k] = last[k];
+    const expect = recs.findLast((r) => r.t === 'expect')?.sources;
+    const sources = (Array.isArray(expect) ? expect : []).flatMap((x) => {
+      const s = x as Record<string, unknown>;
+      return s && typeof s.name === 'string' && typeof s.kind === 'string' && Number.isInteger(s.track)
+        ? [{ name: s.name, kind: s.kind, track: s.track as number, ...(Number.isInteger(s.backup) ? { backup: s.backup as number } : {}), ...(typeof s.uuid === 'string' ? { uuid: s.uuid } : {}) }]
+        : [];
+    });
+    return { take, sources, recs };
   }
 
   /** Every take file whose fold is an open take. */
@@ -276,9 +175,9 @@ export class Journal {
   }
 
   /**
-   * G28: removes closed takes older than 30 days, and the oldest closed takes past 100, with their files; old claims,
-   * and temp files a crash left. Best effort: a file that cannot be removed is logged and kept, and prune never throws,
-   * so it never stops the server (F-T7-32). The log names the file only, not the folder.
+   * G28: removes closed takes older than 30 days, and the oldest closed takes past 100, with their files. Best
+   * effort: a file that cannot be removed is logged and kept, and prune never throws, so it never stops the server
+   * (F-T7-32). The log names the file only, not the folder.
    */
   prune(now = Date.now()) {
     try {
@@ -298,19 +197,9 @@ export class Journal {
       .map((x) => ({ id: x.id, at: Number(x.l!.recs.findLast(validState)?.at ?? 0) }))
       .sort((a, b) => b.at - a.at);
     const gone = new Set(closed.filter((x, i) => i >= RETENTION.takes || x.at < old).map((x) => x.id));
-    const top = this.highest(CLAIM);
-    const mtime = (f: string) => {
-      try {
-        return statSync(join(this.dir, f)).mtimeMs;
-      } catch {
-        return now;
-      }
-    };
     for (const f of this.list()) {
       const id = /^take-([\w-]+)\./.exec(f)?.[1];
-      const claim = CLAIM.exec(f);
-      const stale = (claim && Number(claim[1]) !== top && mtime(f) < old) || (TEMP.test(f) && mtime(f) < now - 864e5);
-      if (!((id && gone.has(id)) || stale)) continue;
+      if (!id || !gone.has(id)) continue;
       try {
         rmSync(join(this.dir, f), { force: true });
       } catch (e) {
@@ -338,7 +227,5 @@ const validState = (r: Rec) =>
   ['row', 'result', 'summary'].every((k) => opt(r[k], 'string')) &&
   opt(r.stopSeen, 'boolean');
 
-const strip = (r: Rec): Partial<Take> => {
-  const { t: _t, k: _k, at: _at, ...rest } = r;
-  return rest as Partial<Take>;
-};
+/** The fields of a take that a state line holds. */
+const TAKE_FIELDS = FIELDS.state.filter((k) => k !== 'at');

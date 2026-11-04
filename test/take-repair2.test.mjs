@@ -17,8 +17,8 @@ const done = async (w, ...servers) => {
   await w.fake.close();
 };
 const takes = (w) => {
-  const j = new Journal(w.dir, 'x');
-  return readdirSync(w.dir).filter((f) => f.endsWith('.jsonl')).map((f) => ({ client: j.load(f.slice(5, -6)).meta.client, ...j.load(f.slice(5, -6)).take }));
+  const j = new Journal(w.dir);
+  return readdirSync(w.dir).filter((f) => f.endsWith('.jsonl')).map((f) => j.load(f.slice(5, -6)).take);
 };
 
 /** R196 k.mjs: Claude Desktop follows a recording from the OBS button and dies; OBS stops; Claude Code records; Claude Desktop comes back. */
@@ -46,19 +46,17 @@ async function returning(how) {
 }
 
 for (const how of ['tool', 'button']) {
-  test(`F-T7-27: a returning client does not attach its stale take to the recording of another client (${how})`, async () => {
+  test(`F-T7-27, G32: a returning client does not attach its stale take to the recording of another client (${how})`, async () => {
     const { w, a2, b } = await returning(how);
     await status(a2);
     await wait(300);
     const stop = await a2.call('obs_record_stop');
-    assert.equal(last(stop.text), TEXT.X16('Claude Code', how === 'button'), 'only the client that follows the recording can stop it');
+    assert.equal(stop.text, TEXT.X16, 'the copy that came back only reads: Claude Code controls');
     assert.equal(a2.prompts.length, 0, 'no stop prompt');
     assert.deepEqual(recordRequests(w.fake), how === 'tool' ? ['StartRecord'] : [], 'nothing stopped the recording of Claude Code');
     assert.equal(w.fake.state.recording, true);
-    const open = takes(w).filter((t) => t.state !== 'closed');
-    assert.deepEqual(open.map((t) => t.client), ['Claude Code'], 'one take follows the recording');
-    const old = takes(w).find((t) => t.client === 'Claude Desktop');
-    assert.deepEqual([old.state, old.result, old.row], ['closed', 'not_checked', 'R4']);
+    assert.equal(takes(w).filter((t) => t.state !== 'closed').length, 1, 'one take follows the recording');
+    assert.ok(takes(w).some((t) => t.state === 'closed' && t.kind === 'external'), 'the old take of Claude Desktop is closed');
     assert.match(last(await status(b)), how === 'tool' ? /^Recording for / : /^OBS is recording/);
     await done(w, a2, b);
   });
@@ -84,11 +82,10 @@ test('F-T7-29: a returning client whose external recording ended does not say th
 
 test('F-T7-32: an old journal file that cannot be removed does not stop the server start; the other old files go', async () => {
   const w = await world();
-  const j = new Journal(w.dir, 'Claude Code');
+  const j = new Journal(w.dir);
   const old = Date.now() - 40 * 864e5;
   for (const id of ['old0', 'old1']) {
-    j.own(id, 1);
-    j.append(id, { t: 'open', v: 1, id, kind: 'normal', client: 'Claude Code', pid: 1 });
+    j.append(id, { t: 'open', v: 1, id, kind: 'normal', pid: 1 });
     j.state(id, { ...newTake(id, 'normal', 'closed'), result: 'verified' }, old);
   }
   mkdirSync(join(w.dir, 'take-old0.beat')); // rmSync cannot remove a folder: the delete fails as EPERM or EBUSY would
@@ -116,7 +113,7 @@ test('F-T7-12, F-T7-26, F-T7-30, F-T7-35: each OBS or client name shows in a cod
   const names = ['Scene [x](https://evil.example)\u202E', 'Mic [1](https://evil.example) <b>', 'Evil [x](https://evil.example) app', '\\<https://evil.example\\>'];
   const texts = [
     TEXT.W1(names[0], [{ name: names[1], track: 1 }], '/Movies/<b>evil.example'), TEXT.W3(r), TEXT.W4(r), TEXT.W5(r), TEXT.W6(r), TEXT.X6(r), TEXT.X11(t),
-    TEXT.X15(r, [names[1], names[3]]), TEXT.X16(names[2]), TEXT.X16(names[3], true), TEXT.X18(r), stateLine(t, r, Date.now()), stateLine({ ...t, state: 'external' }, r, Date.now()),
+    TEXT.X15(r, [names[1], names[3]]), TEXT.X18(r), stateLine(t, r, Date.now()), stateLine({ ...t, state: 'external' }, r, Date.now()),
   ];
   for (const text of texts) {
     assert.doesNotMatch(text, /[\u0000-\u001F\u007F\u202A-\u202E\u2066-\u2069]/, text);

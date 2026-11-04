@@ -5,7 +5,7 @@ import { visible } from './verify.js';
 
 export type State = 'idle' | 'starting' | 'start_uncertain' | 'stop_held' | 'external' | 'recording' | 'paused' | 'stopping' | 'stop_uncertain' | 'checking' | 'closed';
 export type Result = 'not_started' | 'verified' | 'verified_with_warnings' | 'failed' | 'not_checked';
-export type Mark = 'offline' | 'stopped_in_obs' | 'unplanned_stop' | 'lost' | 'external' | 'race';
+export type Mark = 'offline' | 'stopped_in_obs' | 'unplanned_stop' | 'lost' | 'external';
 export type Kind = 'normal' | 'test' | 'external';
 
 /** One GetRecordStatus read, with the file path (check 3), the connection number and the count of STARTED, STOPPING and STOPPED events seen on it. */
@@ -42,7 +42,8 @@ export type Input =
   | { type: 'event'; state: 'STARTED' | 'STOPPING' | 'STOPPED' | 'PAUSED' | 'RESUMED'; at: number; path?: string | null }
   | { type: 'file'; path: string }
   | { type: 'reply'; request: 'StartRecord' | 'StopRecord'; code: number; at: number }
-  | { type: 'read'; reading: Reading; same?: boolean }
+  /** prevAt: the time of the last read that showed the take active, the last time that it surely recorded. */
+  | { type: 'read'; reading: Reading; same?: boolean; prevAt?: number }
   | { type: 'timeout'; phase: 'start' | 'hold' | 'stop' | 'gone'; at: number }
   | { type: 'disconnect'; at: number }
   | { type: 'exit'; at: number }
@@ -78,8 +79,7 @@ export const LIMITS = {
   reminderFirstMs: 10000, // P11
   reminderMs: 60000,
   raceMs: 2000, // P14
-  beatMs: 5000, // P13, also the watch read
-  staleMs: 15000, // P16
+  beatMs: 5000, // P13: the watch read
   reconnectMs: [500, 1000, 2000, 4000, 8000, 10000], // P8
 };
 export type Limits = typeof LIMITS;
@@ -89,6 +89,8 @@ const OPEN: State[] = ['starting', 'start_uncertain', 'stop_held', 'external', '
 export const STATES: State[] = ['idle', ...OPEN, 'closed'];
 export const isOpen = (t: Take) => OPEN.includes(t.state);
 const STOPS: State[] = ['stopping', 'stop_uncertain'];
+/** The states of a take that OBS records. */
+export const RECORDS: State[] = ['recording', 'paused', 'external'];
 
 /** The take that a new intent starts from, or that the server opens for a recording it did not start. */
 export const newTake = (id: string, kind: Kind, state: State = 'idle'): Take => ({ id, kind, state, marks: [], paths: [] });
@@ -116,7 +118,8 @@ const withPath = (paths: string[], p?: string | null) => (!p || paths.includes(p
 const mark = (t: Take, ...m: Mark[]) => [...new Set([...t.marks, ...m])];
 const unmark = (t: Take, m: Mark) => t.marks.filter((x) => x !== m);
 const close = (take: Take, result: Result, row: string, extra: Partial<Take> = {}) => to(take, 'closed', row, { result, ...extra });
-const checking = (take: Take, row: string, at: number, ...marks: Mark[]) => to(take, 'checking', row, { marks: mark(take, ...marks), endedAt: at });
+/** at: when the recording ended, or undefined when nobody knows (R5). */
+const checking = (take: Take, row: string, at: number | undefined, ...marks: Mark[]) => to(take, 'checking', row, { marks: mark(take, ...marks), endedAt: at });
 
 /** One input on one take. Inputs with no row for the state change nothing. */
 export function step(take: Take, input: Input): Step {
@@ -184,7 +187,8 @@ export function step(take: Take, input: Input): Step {
       if (input.phase === 'hold' && s === 'start_uncertain') return close(take, 'not_started', 'T6');
       if (input.phase === 'hold' && s === 'stop_held') return close(take, 'not_started', 'T12');
       if (input.phase === 'stop' && s === 'stopping') return to(take, 'stop_uncertain', 'T16');
-      if (input.phase === 'gone' && (s === 'recording' || s === 'paused')) return { ...checking(take, 'T21', input.at, 'lost'), notice: { id: 'X11', level: 'error' } };
+      // The recording surely ran until the drop, and OBS has not answered since (X11 gives that time, F-T7-67).
+      if (input.phase === 'gone' && (s === 'recording' || s === 'paused')) return { ...checking(take, 'T21', take.offlineAt ?? input.at, 'lost'), notice: { id: 'X11', level: 'error' } };
       return same;
 
     case 'disconnect': {
@@ -208,8 +212,10 @@ export function step(take: Take, input: Input): Step {
         return to(t, 'external', 'T5', { kind: 'external', paths: r.path ? [r.path] : [] });
       }
       if (s === 'stop_held' && r.active) return { ...to(t, 'external', 'T11', { kind: 'external', paths: r.path ? [r.path] : [] }), notice: { id: 'X18', level: 'warning' } };
-      if ((s === 'recording' || s === 'paused') && !r.active) return { ...checking(t, 'T21', r.at, 'unplanned_stop'), notice: { id: 'X11', level: 'error' } };
-      if ((s === 'recording' || s === 'paused') && input.same === false) return { ...close(t, 'not_checked', 'T24'), spawn: true };
+      // The recording ended after the last read that showed it, or after the drop (X11 gives that time, F-T7-67).
+      if ((s === 'recording' || s === 'paused') && !r.active) return { ...checking(t, 'T21', take.offlineAt ?? input.prevAt ?? r.at, 'unplanned_stop'), notice: { id: 'X11', level: 'error' } };
+      // After a reconnect, a take follows only the recording that it followed: an external take too (F-T7-65).
+      if ((s === 'recording' || s === 'paused' || s === 'external') && input.same === false) return { ...close(t, 'not_checked', 'T24'), spawn: true };
       if (s === 'recording' && r.paused) return to(t, 'paused', 'T13', { pausedAt: r.at });
       if (s === 'paused' && r.active && !r.paused) return to(t, 'recording', 'T13', { pausedAt: undefined });
       if (s === 'external' && !r.active) return checking(t, 'T23', r.at, 'external');
@@ -227,8 +233,14 @@ export function step(take: Take, input: Input): Step {
 
     case 'restart': {
       // A row keeps a take only on the recording that the journal names. A take is never attached to another
-      // recording, which can be the take of another client: it closes, and that recording gets its own take (F-T7-27).
+      // recording, which can be a recording that someone else started: it closes, and that recording gets its own take (F-T7-27).
       const r = input.reading;
+      // P9: a take lost after the gone limit comes back when OBS answers again with the same recording (F-T7-59).
+      if (take.marks.includes('lost') && (s === 'checking' || s === 'closed')) {
+        if (!r.active || !input.same) return same;
+        const marks = take.marks.filter((m) => m !== 'lost' && m !== 'offline');
+        return to(take, r.paused ? 'paused' : 'recording', 'R3', { marks, result: undefined, summary: undefined, endedAt: undefined, offlineAt: undefined });
+      }
       if (s === 'starting' || s === 'start_uncertain' || s === 'stop_held') {
         if (!r.active) return close(take, 'not_started', 'R2');
         // R1: no STARTED came before the crash, so no path ties this recording to the take.
@@ -237,7 +249,7 @@ export function step(take: Take, input: Input): Step {
       if (s === 'checking') return to(take, 'checking', 'R8');
       if (isOpen(take) && r.active && !input.same) return { ...close(take, 'not_checked', STOPS.includes(s) ? 'T19' : 'R4'), spawn: true };
       if (s === 'recording' || s === 'paused') {
-        if (!r.active) return { ...checking(take, 'R5', input.at, 'unplanned_stop'), notice: { id: 'X11', level: 'error' } };
+        if (!r.active) return { ...checking(take, 'R5', undefined, 'unplanned_stop'), notice: { id: 'X11', level: 'error' } };
         return to(take, r.paused ? 'paused' : 'recording', 'R3');
       }
       if (STOPS.includes(s)) return to(take, 'stop_uncertain', 'R6');
@@ -301,29 +313,32 @@ export const TEXT = {
   X5: (r?: Reading) => `No answer in 2 minutes. I did not stop the recording.${r ? ` ${still(r)}` : ''}`,
   /** ours: an obs-mcp take, of this process or another one (F-T7-15). */
   X6: (r: Reading, ours = false) =>
-    `OBS already records (started ${clock(r.at - r.duration)}, file ${fileName(r.path)}). I did not send a start. ${ours ? 'obs-mcp started this recording.' : 'obs-mcp did not start this recording.'}`,
+    `${r.paused ? `OBS already has a paused recording (paused at ${hms(r.duration)}, file ${fileName(r.path)}).` : `OBS already records (started ${clock(r.at - r.duration)}, file ${fileName(r.path)}).`} I did not send a start. ${ours ? 'obs-mcp started this recording.' : 'obs-mcp did not start this recording.'}`,
   /** P14 with no recording now: a record event came in the last 2 s (F-T7-15). */
   X6b: 'OBS started or stopped a recording in the last 2 s. I did not send a start. Ask again in a few seconds.',
   X7: 'OBS is still finishing the last recording. I did not send a start. Ask again in a few seconds.',
-  /** Another process won the start claim (F-T7-24). */
-  X7b: 'Another obs-mcp process is starting a recording now. I did not send a start. Ask again in a few seconds.',
   X8: (t: Take) => `I sent the stop at ${clock(t.stopAt ?? 0)}, but OBS did not confirm it in ${LIMITS.stopMs / 1000} s. I will not send it again, because a second stop can cut the file short. ${STOP_OBS}`,
   X9: (t: Take) => `I sent the start at ${clock(t.intentAt ?? 0)}, but OBS did not confirm it in ${LIMITS.startMs / 1000} s. I will not send it again. OBS may still start. In OBS, look at the Controls dock: if the button reads Stop Recording, OBS records.`,
-  X10: (at: number) => `I lost the connection to OBS at ${clock(at)}. OBS keeps recording on its own. I reconnect, and I send no recording request.`,
+  /** recording: OBS recorded at the drop. Otherwise the text does not say that OBS records (F-T7-67). */
+  X10: (at: number, recording = true) => `I lost the connection to OBS at ${clock(at)}.${recording ? ' OBS keeps recording on its own.' : ''} I reconnect, and I send no recording request.`,
   /** The connection dropped right after the stop went out (7.1, F-T7-17). */
   X10b: 'I lost the connection to OBS right after I sent the stop. I will not send it again. I reconnect and read what OBS shows.',
-  X11: (t: Take) => `The recording stopped at about ${clock(t.endedAt ?? 0).slice(0, 5)}, and nobody asked for it. OBS may show an error dialog. I am checking the file that OBS wrote: ${fileName(t.paths.at(-1))}.`,
+  /** The connection dropped right after the start went out (F-T7-67). */
+  X10c: 'I lost the connection to OBS right after I sent the start. I will not send it again. OBS may still start. I reconnect and read what OBS shows.',
+  /** The time is the last time that OBS surely recorded (F-T7-67); after a restart (R5) nobody knows it. */
+  X11: (t: Take) => `The recording stopped ${t.endedAt === undefined ? 'while I did not watch it' : `at about ${clock(t.endedAt).slice(0, 5)}`}, and nobody asked for it. OBS may show an error dialog. I am checking the file that OBS wrote: ${fileName(t.paths.at(-1))}.`,
   X12: (t: Take) => `The recording was stopped in OBS at ${clock(t.endedAt ?? 0)}. I am checking the file.`,
-  X13: (t: Take) => `OBS started the recording at ${clock(t.startedAt ?? 0)}. If you also clicked Start Recording in OBS just then, this is the same recording.`,
-  X14: 'obs-mcp is closing. OBS keeps recording. I did not stop it.',
+  /** recording: a take that records. Otherwise the text does not say that OBS records (F-T7-67). */
+  X14: (recording = true) => (recording ? 'obs-mcp is closing. OBS keeps recording. I did not stop it.' : 'obs-mcp is closing. I did not send a stop.'),
   X15: (r: Reading, sources: string[]) =>
     `OBS started a recording at ${clock(r.at - r.duration)} (file ${fileName(r.path)}). obs-mcp did not start it, and it does not stop it. ${sources.length ? `I watch ${list(sources)}, and I check the file when it ends.` : `I check the file when it ends. No expected sources. ${PREFLIGHT}`}`,
-  /** external: the recording started outside obs-mcp, and that client's obs-mcp follows it (F-T7-20). */
-  X16: (client: string, external = false) =>
-    `I did not stop the recording. ${external ? `It started outside obs-mcp. ${shown(client)} follows it, and` : `${shown(client)} started it, and`} in this version only that client can stop it. Ask there, or click Stop Recording in the Controls dock of OBS.`,
-  X17: (r: Reading) => `That confirm expired after 2 minutes, so I did not stop the recording. ${still(r)} Ask me again to stop it.`,
-  /** Eight W6 prompts in one call: the recording changed each time (the 2025 era). */
+  /** G32: a process that does not control recording. One text for every recording request. */
+  X16: 'I did not send it. Another obs-mcp copy controls recording in this OBS, and this copy only reads. To start or stop, click Start Recording or Stop Recording in the Controls dock of OBS.',
+  X17: (r: Reading) => `That confirm expired after 2 minutes, so I did not stop the recording. ${still(r)}${r.active ? ' Ask me again to stop it.' : ''}`,
+  /** A second change after W6: the recording changed each time. */
   X19: 'The recording changed each time you decided, so I did not stop it. To stop it, click Stop Recording in the Controls dock of OBS.',
+  /** OBS gave no file path, so no stop can pass check 3 (F-T7-55). */
+  X20: 'I did not stop the recording. OBS gives me no file path for it, so I cannot tell that it is the recording you saw. To stop it, click Stop Recording in the Controls dock of OBS.',
   /** A file error of the journal: only its code, because the message names the folder (F-T7-38, F-T7-41). */
   J1: (code: string) => `I could not write the take record on this computer (${code}).`,
   X18: (r: Reading) => `A recording started in OBS after you asked me to stop (running ${hms(r.duration)}, file ${fileName(r.path)}). I did not stop it. To stop it, ask me again, or click Stop Recording in OBS.`,
@@ -345,6 +360,8 @@ export function stateLine(take: Take | undefined, r: Reading | undefined, now: n
       line = `I asked OBS to start at ${clock(take.intentAt ?? now)}. Waiting for OBS to confirm.`;
       break;
     case 'start_uncertain':
+      // The row of the drop: T3 with the offline mark (F-T7-67). A later drop is O1, and keeps the X10 line.
+      if (take.row === 'T3' && take.marks.includes('offline')) return TEXT.X10c + (take.kind === 'test' ? TEST_MARK : '');
       line = TEXT.X9(take);
       break;
     case 'stop_held':
@@ -380,9 +397,8 @@ export function stateLine(take: Take | undefined, r: Reading | undefined, now: n
       line = `Take closed: ${take.result}.${take.summary ? ` ${take.summary}` : (CLOSED[take.row ?? '']?.(take) ?? '')}`;
       break;
   }
-  if (take.marks.includes('offline') && isOpen(take)) line = `${TEXT.X10(take.offlineAt ?? now)} ${line}`;
+  if (take.marks.includes('offline') && isOpen(take)) line = `${TEXT.X10(take.offlineAt ?? now, RECORDS.includes(take.state))} ${line}`;
   if (take.kind === 'test' && isOpen(take) && !STOPS.includes(take.state) && take.state !== 'checking') line += TEST_MARK;
-  if (take.marks.includes('race') && isOpen(take)) line += ` ${TEXT.X13(take)}`;
   return line;
 }
 
