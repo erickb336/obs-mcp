@@ -1,12 +1,12 @@
 # obs-mcp
 
-**obs-mcp is a local MCP server that gives an AI agent safe read access to OBS Studio, through obs-websocket, on any machine.**
+**obs-mcp is a local MCP server that gives an AI agent safe read access to OBS Studio, through obs-websocket, on any machine, and lets it start and stop a recording only after you confirm.**
 
-An agent can find any of the 147 documented obs-websocket requests and run the reads. A read can never change OBS, stop a recording or send a request that is known to crash OBS.
+An agent can find any of the 147 documented obs-websocket requests and run the reads. A read can never change OBS, stop a recording or send a request that is known to crash OBS. A recording starts or stops only after you confirm in a dialog of your MCP client, and the server never sends a start or a stop twice.
 
 [![CI](https://github.com/erickb336/obs-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/erickb336/obs-mcp/actions/workflows/ci.yml) [![Licence: MIT](https://img.shields.io/github/license/erickb336/obs-mcp)](LICENSE)
 
-> **Status: pre-release 0.0. Not yet published to npm.** All tests run against a fake OBS that replays stored traces ([The fake OBS and its traces](#the-fake-obs-and-its-traces)):
+> **Status: pre-release, on the way to 0.1. Not yet published to npm.** The take tools are not yet tested on a real OBS. All tests run against a fake OBS that replays stored traces ([The fake OBS and its traces](#the-fake-obs-and-its-traces)):
 >
 > - **Real traces:** the default reads, and `StartRecord` and `StopRecord`. They were captured from a real OBS 33.0.1 on macOS, then scrubbed.
 > - **Simulated behaviour:** `ToggleRecord`, pause and resume, `StopOutput`, `ToggleOutput`, the stop hotkey, the live-output blocks and the crash of a list request. These traces are written by hand, so the stop-rule sweep runs against a simulated take.
@@ -17,8 +17,9 @@ Contents: [Quick start](#quick-start) · [Usage](#usage) · [Tools](#tools) · [
 
 ```mermaid
 flowchart LR
-  A[MCP client] -- stdio --> S[obs-mcp<br/>obs_status, obs_find, obs_read, obs_verify_file]
-  S -- reads only, 127.0.0.1 --> O[OBS + obs-websocket 5]
+  A[MCP client] -- stdio --> S[obs-mcp<br/>obs_status, obs_find, obs_read, obs_verify_file<br/>obs_record_start, obs_record_stop, obs_take_status]
+  S -- reads, and a record start or stop after you confirm, 127.0.0.1 --> O[OBS + obs-websocket 5]
+  S -- take journal --> J[(local folder)]
   S -. refuses changes, guarded and unknown requests .-> X[not sent]
 ```
 
@@ -70,13 +71,15 @@ Ask your agent in plain words. Examples:
 | "What is the volume of my mic?" | `obs_find` "input volume", then `obs_read` `GetInputVolume` | The fader value of that input |
 | "Show me the scene list" | `obs_read` `GetSceneList` | The scenes and the current program scene |
 | "Did my last recording get both voices?" | `obs_verify_file` with the file name, and the expected sources: for example the mic on track 1 and the call on track 2 | One verdict per source, with the timecode of each silent gap |
-| "Stop the recording" | `obs_find` shows `StopRecord` as guarded | A refusal. 0.0 never sends it. |
+| "Record the interview" | `obs_record_start` | A confirm dialog in your client, then "Recording for 00:00:01 (OBS confirmed it). File: ..." |
+| "Stop the recording" | `obs_record_stop` | A confirm dialog, then "The recording stopped at 15:42:56 (OBS confirmed it). I am checking the file ..." |
+| "Is it still recording?" | `obs_take_status` | The state of the take, its time and file, and the file check result after the stop |
 
 With OBS closed, `obs_status` answers with the problem and the next step, for example: "No answer from OBS on 127.0.0.1:4455. OBS is closed, its WebSocket server is off, or it uses another port."
 
 ## Tools
 
-The list has 4 tools. Its size is about 690 tokens (method: compact JSON of `tools/list`, counted with cl100k_base through js-tiktoken 1.0.21, an approximation; target: 1,200 or fewer; a test checks it).
+The list has 7 tools. Its size is about 967 tokens (method: compact JSON of `tools/list`, counted with cl100k_base through js-tiktoken 1.0.21, an approximation; target for release 0.1: under 1,000; a test checks it).
 
 | Tool | What it does | Effect |
 | --- | --- | --- |
@@ -84,6 +87,23 @@ The list has 4 tools. Its size is about 690 tokens (method: compact JSON of `too
 | `obs_find` | Searches the catalogue of 147 documented requests by words. An exact request name comes first, then the requests that `obs_read` runs, then the rest. Returns exact names, the effect, the fields, and whether `obs_read` runs each one. | Read |
 | `obs_read` | Runs one read request, or one of the 3 guarded reads behind its check. Checks the fields first: one of a name and UUID pair (for example `inputName` or `inputUuid`) is required, and a text value has 1,000 characters or fewer. | Read |
 | `obs_verify_file` | Checks a saved recording in the recording folder: each audio track, over the full timeline. See [the file check](#the-file-check). | Read |
+| `obs_record_start` | Starts a recording after you confirm in a dialog, and replies when OBS confirms. The same `token` again returns the same take. `test: true` makes a test take, which never stops by itself and reminds you. See [takes](#takes). | Records, after you confirm |
+| `obs_record_stop` | Stops the recording after you confirm in a dialog, and replies when OBS confirms. Then the file check runs. | Records, after you confirm |
+| `obs_take_status` | The take: its state, time, file, notices and the file check result. | Read |
+
+### Takes
+
+A take is one recording that the server follows, from the start to the file check. It has 11 states (for example `starting`, `recording`, `paused`, `stopping`, `stop_uncertain`, `checking` and `closed`), and every move between them is a numbered row of the T7 design. Each tool reply starts with one line about the state, for example "Recording for 00:12:04 (OBS confirmed it). File: 2026-11-03 15-30-50.mov."
+
+- **You confirm each start and each stop** in a dialog of your client (MCP form elicitation). In a client that cannot show a dialog, the server refuses and sends nothing: you press Start Recording or Stop Recording in OBS, and the server sees it, follows the recording and checks the file. A client permission click alone does not count.
+- **The prompt shows what you stop**: the time and the file. After your answer the server reads OBS again. If the recording changed while you decided (another file, a new OBS process, or a start or stop event in between), it does not stop, and asks you again with the new reading. A paused take still passes.
+- **One send, never a second one.** The server writes the intent to its journal and syncs it to disk before it sends `StartRecord` or `StopRecord`, and sends each one once. When OBS does not confirm in time (5 s for a start, 15 s for a stop), the take goes to an uncertain state: the server only reads and tells you what to look for in OBS, because a second stop can cut the file short.
+- **A recording that the server did not start** (you pressed the OBS button, or it ran before) is an external take. The server reports it, checks its file when it ends, and stops it only when you ask and confirm.
+- **One copy of obs-mcp controls recording for each OBS.** The first server process for an OBS address holds a lock: it listens on a TCP port of 127.0.0.1 only, one of 8 ports from 49152 to 65535 that a hash of the OBS address gives. The lock leaves no file, does not depend on the environment, and the operating system frees it when that process exits, also after a crash. The listener only sends a short line that names the OBS address hash and the process, then closes the connection. It reads nothing, and it closes any connection that is not from 127.0.0.1. A port that another program holds, or that the operating system reserves (Windows reserves ranges of these ports), is passed. Another copy (for example a second MCP client) only reads: it shows OBS and the take, and refuses each start and stop with a text that points to the OBS button. When the controlling copy exits, the next tool call of a reading copy takes the lock, and that copy follows the open take of the journal. Another program on this computer that answers with the same line can keep each copy a reader; it cannot make one send a request.
+- **Notices.** When something happens outside a tool call (a recording appears, a recording stops with no request, a test take still runs), the server sends an MCP log notification and puts the same text at the top of the next tool reply. Which clients show a log notification is not verified.
+- **A confirm lives 120 s.** A late answer stops nothing. On a 2025-era client the SDK holds the tool call open while the dialog shows, so one stop call can take about 140 s.
+
+The journal is one file for each take in the take folder (see [Settings](#settings)): the intent, each request sent, each reply and event, and the state after each step. It holds file paths, source names, times and the hash of the start token. It never holds the password, a stream key, an OBS settings reply or your answer text. The folder is 0700 and each file 0600 (POSIX). The server keeps closed takes for 30 days, and at most 100. Expected sources come from `obs_preflight`, which comes in release 0.1 after this change; until then a take has no expected sources, and the file check judges each track.
 
 ### The file check
 
@@ -117,7 +137,7 @@ The sound is `not_checked`, with the reason, for a track with a sample rate belo
 
 The file must be inside the recording folder: the folder that OBS records to, or `OBS_MCP_RECORDING_DIR`. The check refuses a path with `..`, a path or a link that leads out of the folder, and anything that is not a regular file. It refuses a path outside the folder by its text, before it reads anything at that path: so a UNC path (`\\host\share`) or an automount never reaches the network, and the refusal is the same whether the file exists or not. ffmpeg runs with an argument list, never a shell, reads only local files, and stops at one time limit for the whole check.
 
-The check never refuses a name for its characters, and it opens the file by its real name. A reply never holds an invisible character: each name in a reply or an error shows every control, format, private-use, unassigned or surrogate code point, U+2028, U+2029, every tag character (U+E0000 to U+E007F) and every variation selector as `\u{hex}`. For example, a text direction control U+202E shows as `\u{202E}`, and an emoji sequence shows its joiners as `\u{200D}`. A backslash that starts `\u{` in a real name shows as `\u{5C}`, so each `\u{...}` in a reply is an escape; any other backslash stays as it is.
+The check never refuses a name for its characters, and it opens the file by its real name. A reply never holds an invisible character: each name in a reply or an error shows every control, format, private-use, unassigned or surrogate code point, U+2028, U+2029, every tag character (U+E0000 to U+E007F) and every variation selector as `\u{hex}`. For example, a text direction control U+202E shows as `\u{202E}`, and an emoji sequence shows its joiners as `\u{200D}`. A backslash that starts `\u{` in a real name shows as `\u{5C}`, so each `\u{...}` in a reply is an escape; any other backslash stays as it is. In the texts of the record tools and in their notices, each name from OBS or from a client (a file, scene, source or client name) shows in a code span, so no link or emphasis can form in it. A backtick in a name shows as the look-alike U+02CB.
 
 Two limits remain, and both need write access to the recording folder. A hard link in the folder to a file outside it is a regular file in the folder, so the check reads it. A file that another program swaps after the path check is read as it is when ffmpeg opens it.
 
@@ -134,10 +154,10 @@ What `obs_read` runs in 0.0, from the class table in [`catalogue/classes.json`](
 
 ## Safety rules
 
-- **During a stream or a recording, the AI may do only what OBS itself allows then.** The server refuses everything else. 0.0 is read only, so today this rule applies to one request: the list request below.
-- **The server never stops a recording unless you ask.** In 0.0 it sends no change at all: no start, no stop, no setting.
+- **During a stream or a recording, the AI may do only what OBS itself allows then.** The server refuses everything else. `obs_read` sends no change, so today this rule applies to one request: the list request below.
+- **The server never stops a recording unless you ask.** Only `obs_record_stop`, after you confirm, sends `StopRecord`. No timeout, restart, end of input or test take sends one. When the client closes, OBS keeps recording, and the next server process reads the journal. The server sends no other change: no setting.
 - **Listener exposure.** When the obs-websocket server is on, OBS listens on all network interfaces. It has no option to listen on localhost only. Other devices on your network can reach it, unless a firewall blocks them. Keep a password set. `obs_status` and the doctor report what listens on the port, and the program that listens. The doctor warns when that program is not OBS.
-- **obs-mcp opens no port.** It speaks MCP over stdio only, and it connects to OBS on 127.0.0.1 only.
+- **obs-mcp opens no port for requests.** It speaks MCP over stdio only, and it connects to OBS on 127.0.0.1 only. Its one listener is the controller lock on 127.0.0.1 (see [Takes](#takes)): it sends one line, reads nothing and runs no command.
 - **The password** comes from the obs-websocket settings file, or from `OBS_WEBSOCKET_PASSWORD`. Never give it as an argument: OBS writes its own command line to its log. No reply, log or doctor line shows it.
 - **Secrets in replies.** Settings can hold a stream key, password or token in any text. So the AI gets settings text only when it is on a short allow-list. See [what the AI sees](#what-the-ai-sees). The debug log of obs-websocket-js prints raw replies, so the server turns it off, also when `DEBUG` names it.
 - **List requests can crash OBS.** `GetInputPropertiesListPropertyItems` runs only on a row that was tested on real OBS. Today there is one row: property `type` of a `screen_capture` input, on macOS, OBS 33.0.1. Before each list request the server reads the recording state, the stream state and the state of every output in `GetOutputList` (replay buffer, virtual camera and plugin outputs too). During any active output, whoever started it, the request is refused and not sent. When a state is not known, or its read fails, the request is refused too. The request goes to OBS by the input UUID that the check found, so another client cannot swap the input in between.
@@ -179,6 +199,7 @@ All are optional.
 | `OBS_WEBSOCKET_PORT` | The port, in place of the one in the settings file (default 4455). It must be a whole number from 1 to 65535; any other value, an empty one too, is an error that `obs_status` and the doctor report |
 | `OBS_STUDIO_CONFIG_DIR` | The OBS settings folder, for a portable or custom install |
 | `OBS_MCP_RECORDING_DIR` | The recording folder for `obs_verify_file`, in place of the folder that OBS gives. It lets the check work with OBS closed |
+| `OBS_MCP_STATE_DIR` | The take folder, in place of the default: `~/Library/Application Support/obs-mcp/takes` on macOS, `$XDG_STATE_HOME/obs-mcp/takes` (or `~/.local/state/obs-mcp/takes`) on Linux, `%LOCALAPPDATA%\obs-mcp\takes` on Windows. A folder that obs-mcp makes is for your user only; a folder that is there already keeps its mode, and obs-mcp changes only its own files in it |
 | `OBS_MCP_FFMPEG` | The full path of ffmpeg, with ffprobe in the same folder. Without it, both come from `PATH` |
 | `OBS_MCP_VOICE_GAP_S` | The gap limit of a `voice` source, in seconds (default 30) |
 | `OBS_MCP_CONTINUOUS_GAP_S` | The gap limit of a `continuous` source, in seconds (default 2) |
@@ -203,7 +224,9 @@ All tests run against a fake OBS (`test/fake-obs.mjs`). It replays the stored tr
 The traces are of two kinds:
 
 - **Real** (`real-*.json`): captured from a running OBS 33.0.1 with obs-websocket 5.7.6 on macOS, then scrubbed. `real-reads.json` holds the reads of the default capture plan that the fake does not answer from its own model. `real-record.json` holds `StartRecord` and `StopRecord`, each when idle and while recording, from one test recording. Names and settings are `[scrubbed]`, and each file's `basis` says what was left out.
-- **Simulated** (`simulated-*.json`): written by hand from the protocol and from facts measured on real OBS 33.0.1 (for example, `SetVideoSettings` gives code 500 during any output). These are the requests that the capture does not send to a real OBS: `ToggleRecord`, pause and resume, `StopOutput`, `ToggleOutput`, the stop hotkey, `GetOutputSettings` and the live-output blocks.
+- **Simulated** (`simulated-*.json`): written by hand from the protocol and from facts measured on real OBS 33.0.1 (for example, `SetVideoSettings` gives code 500 during any output). These are the requests that the capture does not send to a real OBS: `ToggleRecord`, pause and resume (code 502 for a pause of a paused output, 503 for a resume of an output that is not paused, 501 when nothing records, by reading the obs-websocket 5.7.6 source), `StopOutput`, `ToggleOutput`, the stop hotkey and the live-output blocks.
+
+The fake also models the record output on a clock: `GetRecordStatus` gives a duration that stops during a pause and a byte count that grows across takes, as T4 measured on real OBS. Each take gets a new file path, which replaces the `[path]` placeholder of a trace and is the path of `GetOutputSettings` for the file output while it records. A test can also play what a person does with the OBS buttons, close the connection after a request, keep back an event, or restart OBS.
 
 | Tool | What it does |
 | --- | --- |

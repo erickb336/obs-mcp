@@ -15,7 +15,7 @@ const PASSWORD = 'fake-obs-password-7Qx2';
 
 for (const era of ['legacy', 'modern']) {
   describe(`tools on the ${era} protocol era`, () => {
-    test('tools/list has the 4 tools, all read-only, within 1,200 tokens', async () => {
+    test('tools/list has the 7 tools of 0.1, only the two record tools not read-only, within 1,000 tokens (R41)', async () => {
       // Method: compact JSON of the tools array, tokens by cl100k_base through js-tiktoken 1.0.21.
       // cl100k_base is an approximation: it is not the tokenizer of any Claude model.
       const s = await connect(testEnv(obsConfigDir(null), await closedPort()), { era });
@@ -24,13 +24,13 @@ for (const era of ['legacy', 'modern']) {
       await s.close();
       if (era === 'modern') assert.equal(version, '2026-07-28');
       else assert.notEqual(version, '2026-07-28');
-      assert.deepEqual(tools.map((t) => t.name).sort(), ['obs_find', 'obs_read', 'obs_status', 'obs_verify_file']);
-      assert.ok(tools.every((t) => t.annotations.readOnlyHint === true));
+      assert.deepEqual(tools.map((t) => t.name).sort(), ['obs_find', 'obs_read', 'obs_record_start', 'obs_record_stop', 'obs_status', 'obs_take_status', 'obs_verify_file']);
+      assert.deepEqual(tools.filter((t) => t.annotations.readOnlyHint !== true).map((t) => [t.name, t.annotations.destructiveHint]), [['obs_record_start', true], ['obs_record_stop', true]]);
       // F-T12-40: obs_read says what it does with guarded requests, as obs_find's in_0_0 does.
       assert.match(tools.find((t) => t.name === 'obs_read').description, /It runs the reads, and 3 guarded reads behind a check; it refuses changes and the other guarded requests/);
       const tokens = getEncoding('cl100k_base').encode(JSON.stringify(tools)).length;
       console.log(`tools/list (${era}, protocol ${version}): ${Buffer.byteLength(JSON.stringify(tools))} bytes, ${tokens} cl100k_base tokens`);
-      assert.ok(tokens <= 1200, `${tokens} tokens`);
+      assert.ok(tokens < 1000, `${tokens} tokens`);
     });
   });
 }

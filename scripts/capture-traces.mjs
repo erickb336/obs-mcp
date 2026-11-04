@@ -192,8 +192,9 @@ async function record(requestType, requestData) {
   while (performance.now() < deadline && !(RECORD.includes(requestType) && events.slice(from).some(final))) await wait(20);
   const after = events.slice(from).map((ev) => ({ delayMs: Math.round(ev.at - t), eventType: ev.eventType, eventData: ev.eventData }));
   for (const ev of after) {
-    if (ev.eventType === 'RecordStateChanged' && /_(STARTED|STOPPED)$/.test(ev.eventData.outputState)) state.recording = ev.eventData.outputActive;
-    if (ev.eventType === 'StreamStateChanged' && /_(STARTED|STOPPED)$/.test(ev.eventData.outputState)) state.streaming = ev.eventData.outputActive;
+    // The state name gives the state: PAUSED comes with outputActive false while the output stays active (R210).
+    if (ev.eventType === 'RecordStateChanged' && /_(STARTED|STOPPED)$/.test(ev.eventData.outputState)) state.recording = /_STARTED$/.test(ev.eventData.outputState);
+    if (ev.eventType === 'StreamStateChanged' && /_(STARTED|STOPPED)$/.test(ev.eventData.outputState)) state.streaming = /_STARTED$/.test(ev.eventData.outputState);
   }
   const effect = Object.fromEntries(Object.entries(state).filter(([k, v]) => when[k] !== v));
   entries.push({

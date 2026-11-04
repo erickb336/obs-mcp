@@ -95,3 +95,4 @@ test('F-T12-37: OBS not found is a warning when OBS answers, and a failure when 
   assert.equal(obsCheck(null, undefined, false).result, 'FAIL');
   assert.equal(obsCheck({ path: '/opt/obs' }, '33.0.1', false).text, 'OBS found at /opt/obs, version 33.0.1');
 });
+

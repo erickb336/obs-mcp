@@ -1,4 +1,4 @@
-// Secret scan (A8), no listening socket, doctor with OBS closed, and the machine-neutral scan of the repository.
+// Secret scan (A8), the one listening socket (the controller lock on 127.0.0.1), doctor with OBS closed, and the machine-neutral scan of the repository.
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -6,6 +6,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSy
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { lockPorts } from '../dist/control.js';
 import { startFakeObs } from './fake-obs.mjs';
 import { CLI, closedPort, connect, obsConfigDir, runDoctor, sampleParams, testEnv } from './helpers.mjs';
 
@@ -89,8 +90,9 @@ test('F-T12-18: the packed package holds npm-shrinkwrap.json, so npx installs th
   assert.equal(shrinkwrap.packages['node_modules/debug'].version, '4.4.3');
 });
 
-test('the server process opens no listening socket', { skip: process.platform === 'win32' && 'uses lsof' }, async () => {
-  const s = await connect(testEnv(obsConfigDir(null), await closedPort()));
+test('G32: the server process listens only on one controller lock port of 127.0.0.1', { skip: process.platform === 'win32' && 'uses lsof' }, async () => {
+  const port = await closedPort();
+  const s = await connect(testEnv(obsConfigDir(null), port));
   await s.call('obs_status');
   let out = '';
   try {
@@ -101,7 +103,9 @@ test('the server process opens no listening socket', { skip: process.platform ==
   const anyOpen = execFileSync('lsof', ['-nP', '-a', '-p', String(s.pid()), '-d', '0-2'], { encoding: 'utf8' });
   await s.close();
   assert.match(anyOpen, /\d/, 'lsof can read the server process');
-  assert.equal(out.trim(), '');
+  const listening = out.split('\n').slice(1).filter(Boolean).map((l) => /\sTCP (\S+) \(LISTEN\)/.exec(l)?.[1]);
+  assert.equal(listening.length, 1, out);
+  assert.ok(lockPorts(`ws://127.0.0.1:${port}`).ports.map((p) => `127.0.0.1:${p}`).includes(listening[0]), out);
 });
 
 const hashDir = (dir) => {

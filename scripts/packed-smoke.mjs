@@ -56,7 +56,8 @@ const check = (ok, what) => {
 // 1. OBS closed.
 const closed = await session('session with OBS closed', testEnv(obsConfigDir(null), await closedPort(), { OBS_MCP_RECORDING_DIR: mkdtempSync(join(tmpdir(), 'obs-mcp-smoke-rec-')) }));
 const { tools } = await closed.client.listTools();
-check(tools.map((t) => t.name).sort().join() === 'obs_find,obs_read,obs_status,obs_verify_file', 'tools/list has obs_find, obs_read, obs_status, obs_verify_file');
+const names = 'obs_find,obs_read,obs_record_start,obs_record_stop,obs_status,obs_take_status,obs_verify_file';
+check(tools.map((t) => t.name).sort().join() === names, `tools/list has ${names.replaceAll(',', ', ')}`);
 const status = await call(closed, 'obs_status');
 check(status.connected === false && /OBS is closed/.test(status.problem), 'obs_status says that OBS is closed');
 check(/has "\.\."/.test((await call(closed, 'obs_verify_file', { path: '../outside.mov' })).problem), 'obs_verify_file refuses a path with ".."');
