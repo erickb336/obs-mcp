@@ -297,6 +297,36 @@ test('the fake OBS replays the real record stop: STOPPING, then STOPPED 235 ms l
   await fake.close();
 });
 
+// F-T27-1: the real record trace was captured with no stream live. Its StopRecord must stop and count in every state
+// of the other outputs, and leave them as they were.
+const OTHER_OUTPUTS = { none: {}, stream: { streaming: true }, 'virtual camera': { virtualCam: true }, 'replay buffer': { replayBuffer: true }, all: { streaming: true, virtualCam: true, replayBuffer: true } };
+for (const [name, others] of Object.entries(OTHER_OUTPUTS)) {
+  test(`F-T27-1: the real StopRecord stops the take and counts the stop with other outputs live: ${name}`, async () => {
+    const fake = await startFakeObs({ recording: true, ...others });
+    const c = await client(fake);
+    const stopped = new Promise((r) => c.obs.on('RecordStateChanged', (d) => d.outputState === 'OBS_WEBSOCKET_OUTPUT_STOPPED' && r()));
+    assert.deepEqual(await c.call('StartRecord'), { code: 500, message: '' });
+    assert.deepEqual(await c.call('StopRecord'), { code: 100, d: { outputPath: '[path]' } });
+    await stopped;
+    assert.deepEqual(fake.stops, [{ requestType: 'StopRecord', cause: 'request' }]);
+    assert.deepEqual(fake.state, { recording: false, streaming: false, virtualCam: false, replayBuffer: false, ...others });
+    assert.equal((await c.call('StopRecord')).code, 501);
+    await c.obs.disconnect();
+    await fake.close();
+  });
+}
+
+test('F-T27-3: the fake OBS replays the real reads in every output state, also during a take with a live stream', async () => {
+  const reads = traces.find((t) => t.file === 'real-reads.json').entries;
+  for (const state of [{}, { recording: true }, { recording: true, streaming: true }, { virtualCam: true }]) {
+    const fake = await startFakeObs(state);
+    const c = await client(fake);
+    for (const e of reads) assert.deepEqual((await c.call(e.requestType)).d, e.responseData, `${e.requestType} in ${JSON.stringify(state)}`);
+    await c.obs.disconnect();
+    await fake.close();
+  }
+});
+
 test('F-T6-3: the fake OBS logs, answers and counts each request of a RequestBatch, so a batched stop counts in the sweep', async () => {
   const fake = await startFakeObs({ recording: true });
   const c = await client(fake);

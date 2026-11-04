@@ -1,7 +1,7 @@
 {
   "format": "obs-mcp-trace/1",
   "source": "real",
-  "basis": "REAL. Captured on 2026-11-03 with the trace capture script and --allow-record from a running OBS 33.0.1, obs-websocket 5.7.6, on macOS, then scrubbed: one test recording of 17 s, deleted after. StartRecord when idle, StartRecord while recording (code 500), StopRecord while recording, StopRecord when idle (code 501). STOPPED came 235 ms after StopRecord in this run; the T4 spike measured 1013 to 1111 ms.",
+  "basis": "REAL. Captured on 2026-11-03 with the trace capture script and --allow-record from a running OBS 33.0.1, obs-websocket 5.7.6, on macOS, then scrubbed, and stored in commit a66af60: one test recording of 17 s, deleted after, with no stream live. StartRecord when idle, StartRecord while recording (code 500), StopRecord while recording, StopRecord when idle (code 501). STOPPED came 235 ms after StopRecord in this run; the T4 spike measured 1013 to 1111 ms.",
   "obs": {
     "obsVersion": "33.0.1",
     "obsWebSocketVersion": "5.7.6",
