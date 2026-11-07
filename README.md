@@ -6,6 +6,12 @@ An agent can find any of the 147 documented obs-websocket requests and run the r
 
 [![CI](https://github.com/erickb336/obs-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/erickb336/obs-mcp/actions/workflows/ci.yml) [![Licence: MIT](https://img.shields.io/github/license/erickb336/obs-mcp)](LICENSE)
 
+> **Status: parked (November 2026).** This project is paused and not maintained right now.
+>
+> - **What works on `main`:** read-only OBS tools, the `doctor` setup check, and `obs_verify_file`, which checks a recording for silent or missing tracks, gaps and cut-off files.
+> - **Not finished:** safe start and stop of recordings (open pull request #9). The package is not published on npm.
+> - Issues and pull requests may not get a reply while the project is parked.
+
 > **Status: pre-release 0.0. Not yet published to npm.** All tests run against a fake OBS that replays stored traces ([The fake OBS and its traces](#the-fake-obs-and-its-traces)):
 >
 > - **Real traces:** the default reads, and `StartRecord` and `StopRecord`. They were captured from a real OBS 33.0.1 on macOS, then scrubbed.
